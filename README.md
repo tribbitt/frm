@@ -97,5 +97,6 @@ local leaderboard proxy (pretrain on `a2_kaggle`, adapt on ARC-AGI-2 evaluation)
 
 ## Status
 
-Built and verified on CPU (tests, smoke, learnability). Not yet run on GPU; next steps are the Kelvin tiers T1–T3 in
-`docs/EXPERIMENTS.md`, which need the user's approval for anything beyond the default limits.
+Built and verified on CPU (tests, smoke, learnability) and on Kelvin's MI300X (ROCm venv, smoke incl. SIGTERM/resume,
+benchmark: `trm` ≈238, FRM K=4 ≈224–227 TFLOP/s compiled). Pilot P1 (`trm_a1` vs `frm_a1`, 18,000 PFLOP each) is
+running; decision rules in `docs/EXPERIMENTS.md` §4.
