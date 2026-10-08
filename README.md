@@ -31,6 +31,7 @@ split per bucket, per-pass activation checkpointing of children, FLOP-budgeted t
 | [`docs/LINEAGE.md`](docs/LINEAGE.md) | audit of frmv1, tiny, tinyv2.2, tinyabstractor, frmv2, TRM, ARM: reuse / avoid |
 | [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | arms, pre-registered decision rules, compute budget |
 | [`kelvin/README.md`](kelvin/README.md) | running on Kelvin2 |
+| [`scripts/monitor.md`](scripts/monitor.md) | the live monitor: what every number means, good and bad readings |
 
 ## Layout
 
@@ -42,9 +43,10 @@ frm/objective.py       the objective
 frm/train.py           trainer (per-bucket ACT carries, EMA, checkpoints, SIGTERM-safe, FLOP budget)
 frm/evaluate.py        per-round voting, pass@k, fork/depth instruments, counterfactuals
 frm/adapt.py           Kaggle adaptation -> submission.json
+frm/monitor/           the live monitor's source (Kelvin over the ssh master), run state, charts, pages
 configs/                  pilots trm_a1, frm_a1, frm2_a1, frm_a1_arc; optional trm_h2_a1, nest_a1; final frm_a2_kaggle
 kelvin/                   Kelvin2 job kit
-scripts/                  fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py
+scripts/                  fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py, monitor.py
 tests/                    unit tests + the end-to-end smoke
 ```
 
@@ -82,6 +84,7 @@ python -m frm.adapt --ckpt runs/frm_a1/best.pt --challenges data/raw/adev_challe
 python -m frm.evaluate --run_dir runs/frm_a1 --split test --final                       # the reported number
 python scripts/compare.py runs/frm_a1/eval.jsonl runs/trm_a1/eval.jsonl --split dev [--match samples]
 python scripts/bench.py --config configs/frm_a1.json --arms "trm:model.K=0" "frm2:model.K=2" "frm4:"
+kelvin/k2 monitor                                       # live: every active run on Kelvin2 (scripts/monitor.md)
 ```
 
 ## Kaggle (ARC Prize 2026, ARC-AGI-2 track)

@@ -7,6 +7,8 @@ dependencies = ["torch>=2.5", "numpy>=1.26"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+# scripts/monitor.py (laptop side): plotext 6 replaced the 5.x API the chart engine draws with
+monitor = ["plotext>=5.3,<6"]
 
 [tool.setuptools.packages.find]
 include = ["frm*"]

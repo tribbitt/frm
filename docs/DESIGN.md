@@ -488,12 +488,16 @@ frm/
   train.py             CLI: python -m frm.train --config cfg.json --run_dir runs/X [--resume auto] [key=value ...]
   evaluate.py          CLI + evaluate_split: per-round voting, pass@k, instruments, counterfactuals, submission
   adapt.py             CLI: Kaggle adaptation (build, re-initialised ids, fine-tune, predict, write submission)
+  monitor/             the live monitor (laptop side, no torch): source.py (Kelvin2 over the ssh master, incremental
+                       reads; local dirs), run.py (live pass, rates, eta, liveness, alerts), charts.py, view.py
 configs/               trm_a1, frm_a1, frm2_a1, frm_a1_arc (pilots); trm_h2_a1, nest_a1 (optional); frm_a2_kaggle (final);
                        smoke; learn (CPU check)
-kelvin/                k2 helper (incl. push-external), submit.sh (approval thresholds), jobs/{env.sh, setup_env, data,
-                       smoke, bench, train, eval}
-scripts/               fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py (paired bootstrap + McNemar)
-tests/                 test_data, test_external, test_composite, test_model, test_objective, test_evaluate, test_train_smoke
+kelvin/                k2 helper (incl. push-external, monitor), submit.sh (approval thresholds), jobs/{env.sh, setup_env,
+                       data, smoke, bench, train, eval}
+scripts/               fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py (paired bootstrap + McNemar),
+                       monitor.py (live monitor; every reading explained in monitor.md)
+tests/                 test_data, test_external, test_composite, test_model, test_objective, test_evaluate, test_train_smoke,
+                       test_monitor
 ```
 
 `Batch` (all torch tensors on device unless noted): `inputs` int [B, S²], `labels` int [B, S²] (−100 = ignore),
