@@ -29,7 +29,7 @@ from frm.model.refiner import Carry, Refiner
 from frm.objective import Objective, tau_at
 
 ROUND_METRICS = (
-    "exact", "ce", "q_loss", "q_acc", "wta", "sub", "child_exact_any", "child_ce_min", "parent_mass", "join_entropy",
+    "exact", "ce", "q_loss", "q_acc", "set", "child_exact_any", "child_ce_min", "parent_mass", "join_entropy",
     "distinct", "sub_coverage",
 )
 

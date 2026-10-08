@@ -143,16 +143,20 @@ def sham_perm(tasks: list[str], device: torch.device) -> torch.Tensor:
 
 
 @torch.no_grad()
-def run_rounds(model: Refiner, inputs, ids, rounds: int, dtype, cf=None, perm=None, reset_at=None) -> list[RoundOut]:
+def run_rounds(
+    model: Refiner, inputs, ids, rounds: int, dtype, cf=None, perm=None, reset_at=None, seed: int = 0
+) -> list[RoundOut]:
     """Run ``rounds`` rounds from the init carry; one RoundOut per round, without its carry (only the next round needs
-    it, and 16 kept carries would cost ~16x the state memory)."""
+    it, and 16 kept carries would cost ~16x the state memory). Children's noise comes from a generator seeded with
+    ``seed``, so a batch evaluates identically every time and its counterfactual reruns see the same noise."""
     S = int(round(inputs.shape[1] ** 0.5))
     carry = model.init_carry(inputs.shape[0], S, inputs.device, dtype)
+    gen = torch.Generator(device=inputs.device).manual_seed(seed)
     outs = []
     for r in range(1, rounds + 1):
         if reset_at is not None and r == reset_at:
             carry = model.init_carry(inputs.shape[0], S, inputs.device, dtype)
-        out = model.round(carry, inputs, ids, cf=cf, sham_perm=perm)
+        out = model.round(carry, inputs, ids, cf=cf, sham_perm=perm, gen=gen)
         carry = out.carry
         outs.append(dataclasses.replace(out, carry=None))
     return outs
@@ -193,14 +197,15 @@ def evaluate_split(
     for S in buckets:
         rows = _rows_per_batch(model, S, ecfg)
         cf_done = 0
-        for batch in eval_batches(ds, split, S, rows, ecfg.max_versions, set(tasks)):
+        for bi, batch in enumerate(eval_batches(ds, split, S, rows, ecfg.max_versions, set(tasks))):
             keys = batch["keys"]
             n = len(keys)
+            seed = S * 1_000_003 + bi  # reproducible noise per batch, shared by its counterfactual reruns
             inputs = _pad(torch.from_numpy(batch["inputs"]).long().to(device), rows)
             ids = _pad(torch.from_numpy(batch["puzzle_ids"]).long().to(device), rows)
             labels = torch.from_numpy(batch["labels"]).long().to(device)
             labeled = (labels != -100).any(-1)
-            outs = [_trim(o, n) for o in run_rounds(model, inputs, ids, R, dtype)]
+            outs = [_trim(o, n) for o in run_rounds(model, inputs, ids, R, dtype, seed=seed)]
             n_rows += n
             n_labeled += int(labeled.sum())
             exact = torch.stack([row_exact(o.logits, labels) & labeled for o in outs])  # [R, n]
@@ -255,7 +260,7 @@ def evaluate_split(
                 perm = sham_perm([k[0] for k in keys] + [keys[0][0]] * (rows - n), device)
                 variants = (("nofork", {"cf": "nofork"}), ("sham", {"cf": "sham", "perm": perm}), ("reset@4", {"reset_at": 4}))
                 for name, kw in variants:
-                    o = _trim(run_rounds(model, inputs, ids, R, dtype, **kw)[-1], n)
+                    o = _trim(run_rounds(model, inputs, ids, R, dtype, seed=seed, **kw)[-1], n)
                     cf_acc[name] += float((row_exact(o.logits, labels) & labeled).sum())
 
     res: dict = {"split": split, "rows": n_rows, "rounds": R}

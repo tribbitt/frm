@@ -28,6 +28,11 @@ class ModelCfg:
     code_rank: int = 64
     code_init_std: float = 0.5
     join_dim: int = 64
+    # Fresh per-round, per-child latent noise xi ~ N(0, I) mapped into the child code (IMLE-style stochastic children):
+    # without it, children are a deterministic function of the parent state and repeat themselves at a parent fixed
+    # point. 0 disables. The map is learned; noise_init is the initial RMS of its output.
+    noise_dim: int = 16
+    noise_init: float = 0.25
     # Gradient window of the K=0 control (TRM = 1 cycle; trm_h2 = 2).
     grad_cycles: int = 1
     grad_ckpt_children: bool = False

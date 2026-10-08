@@ -71,6 +71,8 @@ class Refiner(nn.Module):
             self.join_q = CastedLinear(D, cfg.join_dim)
             self.join_k = CastedLinear(D, cfg.join_dim)
             self.join_beta = nn.Parameter(torch.zeros(()))
+            if cfg.noise_dim:
+                self.code_noise = CastedLinear(cfg.noise_dim, D, std=cfg.noise_init / math.sqrt(cfg.noise_dim))
         self._cycle_fn = self._cycle
 
     # ------------------------------------------------------------------ basics
@@ -126,10 +128,15 @@ class Refiner(nn.Module):
         return y, z
 
     # ------------------------------------------------------------------ fork / join
-    def _child_codes(self, z: torch.Tensor, c: torch.Tensor | None) -> torch.Tensor:
-        """[B, L, D] -> codes [B, K, L, D]: static per-child code + parent-conditioned per-cell code."""
-        u = self.code_down(rms_norm(z, self.cfg.rms_eps))  # [B, L, r]
+    def _child_codes(self, z: torch.Tensor, c: torch.Tensor | None, gen: torch.Generator | None) -> torch.Tensor:
+        """[B, L, D] -> codes [B, K, L, D]: static per-child code + parent-conditioned per-cell code + a fresh noise
+        sample per child and row (broadcast over cells), so a parent at a fixed point still gets new proposals."""
+        cfg = self.cfg
+        u = self.code_down(rms_norm(z, cfg.rms_eps))  # [B, L, r]
         codes = torch.einsum("blr,krd->bkld", u, self.code_up.to(u.dtype)) + self.codes.to(u.dtype)[None, :, None, :]
+        if cfg.noise_dim:
+            xi = torch.randn(z.shape[0], cfg.K, cfg.noise_dim, device=z.device, generator=gen)
+            codes = codes + self.code_noise(xi.to(u.dtype))[:, :, None, :]
         if c is not None:
             codes = codes + c[:, None]
         return codes
@@ -157,19 +164,19 @@ class Refiner(nn.Module):
         ent = -(grid_alpha.clamp_min(1e-9).log() * grid_alpha).sum(1).mean(-1)
         return y_new, z_new, grid_alpha.mean(-1), ent
 
-    def _node(self, y, z, x, c, depth: int, cos, sin, cf, sham_perm=None):
+    def _node(self, y, z, x, c, depth: int, cos, sin, cf, sham_perm=None, gen=None):
         """Fork K children (each a node one level deeper), join them, run the post cycle. Returns children too.
 
         Counterfactual modes apply to the root join only (depth 0)."""
         cfg = self.cfg
         B, L, D = y.shape
         K = cfg.K
-        codes = self._child_codes(z, c).reshape(B * K, L, D)
+        codes = self._child_codes(z, c, gen).reshape(B * K, L, D)
         yk = y[:, None].expand(B, K, L, D).reshape(B * K, L, D)
         zk = z[:, None].expand(B, K, L, D).reshape(B * K, L, D)
         xk = x[:, None].expand(B, K, L, D).reshape(B * K, L, D)
         if depth + 1 < cfg.fork_depth:
-            yk, zk, _ = self._node(yk, zk, xk, codes, depth + 1, cos, sin, None)
+            yk, zk, _ = self._node(yk, zk, xk, codes, depth + 1, cos, sin, None, gen=gen)
         else:
             n_child = cfg.child_L_cycles or cfg.L_cycles
             ckpt = cfg.grad_ckpt_children and torch.is_grad_enabled()
@@ -195,11 +202,13 @@ class Refiner(nn.Module):
         puzzle_ids: torch.Tensor,
         cf: str | None = None,
         sham_perm: torch.Tensor | None = None,
+        gen: torch.Generator | None = None,
     ) -> RoundOut:
         """One deep-supervision round. Gradient flows only if grad mode is enabled by the caller.
 
         ``cf``: None, "nofork" (root join forced onto the parent slot) or "sham" (root join reads the children of row
-        ``sham_perm[b]``; default: the next row)."""
+        ``sham_perm[b]``; default: the next row). ``gen``: generator for the children's noise (None = global RNG);
+        evaluation passes a seeded one so results are reproducible and counterfactuals see the same noise."""
         assert cf in CF_MODES
         cfg = self.cfg
         S = int(round(math.sqrt(inputs.shape[1])))
@@ -219,7 +228,7 @@ class Refiner(nn.Module):
                 for _ in range(cfg.H_cycles - 2):
                     y, z = self._cycle_fn(y, z, x, None, cos, sin, n)
                 pre_logits = self._logits(y)
-            y, z, (ys, child_q, alpha, ent) = self._node(y, z, x, None, 0, cos, sin, cf, sham_perm)
+            y, z, (ys, child_q, alpha, ent) = self._node(y, z, x, None, 0, cos, sin, cf, sham_perm, gen)
             child_logits = self._logits(ys)
         return RoundOut(
             logits=self._logits(y),

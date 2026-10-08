@@ -64,6 +64,18 @@ An objective for frm has to:
 - **Collapse** is the default without these: tiny's two children with zero-init codes, zero-init arbitration and the same
   target collapsed onto child 0 [M: `tiny/results/fork_probe.json`]. A diversity bonus would be R5-gameable (produce
   garbage to differ); MCL-family objectives create diversity only where it lowers the best loss.
+- **WTA's blind spot.** With one deterministic target per row, min-over-children pulls the winner to y* and leaves the
+  losers where they are; nothing moves them *apart*. Two literature answers apply. **IMLE** (Li & Malik,
+  [1809.09087](https://arxiv.org/abs/1809.09087)): draw fresh noise for every sample at every step and pull only the
+  sample nearest the target — equivalent to maximum likelihood under conditions, and it cannot drop modes, because every
+  data point keeps pulling its nearest sample. **Set prediction with bipartite matching** (DETR, Carion et al.,
+  [2005.12872](https://arxiv.org/abs/2005.12872)): when there are several distinct targets, match them one-to-one to the
+  predictions, which "forces unique predictions". frm uses both (§3.2).
+- **Noise as escape from fixed points.** PTRM (Sghaier, Parviz & Jolicoeur-Martineau — TRM's author —
+  [2605.19943](https://arxiv.org/abs/2605.19943)): TRM's "deterministic recursion can lead to convergence at suboptimal
+  solutions, without escape mechanism"; Gaussian noise at each recursion step, parallel trajectories and selection by the
+  Q head lift Sudoku-Extreme 87.4% → 98.75% *without retraining*. frm trains the noise in rather than adding it at
+  test time.
 
 ### 2.3 Credit for detours
 
@@ -96,26 +108,48 @@ training was the only neural lever with measured gains in the lineage [M: frmv1 
 
 ## 3. The objective
 
-Per round, per row, then averaged over the rows of the step (a step = one bucket's carry for one round):
+### 3.0 Written out
+
+For a step on bucket S (B rows, the carry of each row at its own round r_b; one optimizer step per round, carry detached
+between rounds, as in TRM), the loss is the mean over rows:
 
 $$
-\mathcal{L} \;=\; \underbrace{\mathrm{CE}(\hat y_{\text{parent}}, y^\*)}_{\text{deep supervision}}
-\;+\; \lambda_{\text{wta}} \sum_{k=1}^{K} w_k\, \mathrm{CE}(\hat y_k, y^\*)
-\;+\; \lambda_{\text{sub}}\, \frac{1}{|G|}\sum_{g\in G} \sum_{k=1}^{K} v_{gk}\, \mathrm{CE}(\hat y_k, g)
-\;+\; \lambda_q \Big[\mathrm{BCE}(q, e) + \tfrac{1}{K}\textstyle\sum_k \mathrm{BCE}(q_k, e_k)\Big]
+\mathcal{L} \;=\; \frac{1}{B}\sum_{b=1}^{B}\Big[\;
+\underbrace{\mathrm{CE}(\hat y_b, y_b)}_{\text{(1) parent}}
+\;+\;\underbrace{\lambda_{\mathrm{wta}}\Big((1-\varepsilon)\sum_{\pi\in\Pi_b} w_{b\pi}\,c_{b\pi}
+\;+\;\frac{\varepsilon}{K}\sum_{k=1}^{K}\mathrm{CE}(\hat y_{bk}, y_b)\Big)}_{\text{(2) children: annealed set matching}}
+\;+\;\underbrace{\lambda_q\Big(\mathrm{BCE}(q_b, e_b) + \frac{1}{K}\sum_{k=1}^{K}\mathrm{BCE}(q_{bk}, e_{bk})\Big)}_{\text{(3) stop / score heads}}
+\;\Big]
 $$
 
+with, for an assignment π (a one-to-one map of row b's targets onto distinct children),
+
 $$
-w = (1-\varepsilon)\,\mathrm{softmax}\!\big(-\mathrm{CE}(\hat y_{1..K}, y^\*)/\tau\big) + \varepsilon/K,\qquad
-v_{g\cdot} = \mathrm{softmax}\!\big(-\mathrm{CE}(\hat y_{1..K}, g)/\tau\big),\qquad w, v\ \text{without gradient}
+c_{b\pi} \;=\; \mathrm{CE}\big(\hat y_{b,\pi(\star)},\, y_b\big) \;+\; \frac{\lambda_{\mathrm{sub}}}{\lambda_{\mathrm{wta}}}
+\cdot\frac{1}{|T_\pi|}\sum_{t\in T_\pi}\mathrm{CE}\big(\hat y_{b,\pi(t)},\, g_{bt}\big),
+\qquad
+w_{b\pi} \;=\; \frac{\exp(-c_{b\pi}/\tau)}{\sum_{\pi'\in\Pi_b}\exp(-c_{b\pi'}/\tau)}\quad(\text{no gradient})
 $$
 
-- CE = TRM stablemax cross-entropy, token-mean per row over non-PAD labels (EOS supervised, so size is predicted).
-- ŷ_parent = readout after the join and the post-join cycle; ŷ_k = child k's readout after its cycle; e, e_k = exact match.
-- G = intermediate grids of the row (composites only; empty otherwise).
-- τ anneals log-linearly from 1.0 to 0.02 nats/token over the first 30% of the compute budget, then stays.
+Symbols:
 
-Defaults: λ_wta = 0.5, λ_sub = 0.5, λ_q = 0.5 (TRM's q weight), ε = 0.05.
+| symbol | meaning |
+|---|---|
+| y_b | the row's target canvas (colour tokens + EOS border; PAD ignored) |
+| ŷ_b | parent readout after fork → join → post-join cycle; ŷ_bk: child k's readout after its cycle |
+| CE(ŷ, y) | TRM stablemax cross-entropy, mean over the row's supervised tokens: −(1/N)Σ_i log s(ŷ_i)[y_i] / Σ_c s(ŷ_i)[c], s(x) = x+1 for x ≥ 0, 1/(1−x) for x < 0 |
+| g_bt | intermediate grid t of a composite row (t = 1..k−1 for a depth-k program); none on ARC/BARC/RE-ARC rows |
+| Π_b | assignments that match the final target ⋆ to one child and min(#intermediates, K−1) intermediates T_π to other, distinct children. Plain rows: Π_b = {⋆ → k : k = 1..K} |
+| τ | temperature, log-linear from 1.0 to 0.02 nats/token over the first 30% of the run's budget, then constant |
+| e_b, e_bk | 1 if the parent / child k canvas is exactly right (every supervised token), else 0 |
+| q_b, q_bk | stop/score logits read from position 0 of y (parent / child k) |
+
+Defaults: λ_wta = 0.5, λ_sub = 0.5, λ_q = 0.5 (TRM's value), ε = 0.05, K = 4. With no intermediates, term (2) reduces
+exactly to annealed relaxed winner-takes-all: child k's gradient is λ_wta·[(1−ε)·softmin_τ(CE)_k + ε/K]·∇CE_k
+(`tests/test_objective.py::test_children_gradient_is_weighted_ce_gradient`).
+
+Implementation: `frm/objective.py` (`set_match`, `Objective.__call__`); Π is enumerated once per (K, M) — 136
+assignments at K = 4 with up to 3 intermediates — and evaluated as one gather per step.
 
 ### 3.1 Term 1 — parent deep supervision (R1, R2, R3)
 
@@ -127,85 +161,88 @@ detour itself. The credit horizon is two cycles along the fork path (TRM: one), 
 Uniform weight across rounds: reweighting changed nothing in three lineage attempts and decaying weights push toward early
 exit (DEPTH.md §4). No term multiplies the CE by a round-dependent factor.
 
-### 3.2 Term 2 — annealed relaxed WTA over children (R4, R3, R7)
+### 3.2 Term 2 — children: annealed set matching (R3, R4, R7)
 
-- *Why WTA.* Children are the same tied network with different codes. Grading all of them against y* makes them
-  identical (collapse); grading only the best makes them cover different answers — exactly the "multiple guesses" that
-  escape spurious fixed points (DEPTH.md M2) and the two attempts ARC allows.
-- *Why annealed.* Early in training no child is meaningfully better; a hard WTA would hand one child every win and starve
-  the rest. τ = 1 nat/token makes w ≈ uniform (every child learns the task); τ → 0.02 makes it a hard WTA (specialise).
-  Annealed MCL shows this schedule avoids WTA's bad minima [L].
-- *Why ε.* A floor of ε/K per child keeps every code on a gradient (Rupprecht) — the instrument `fork/win_rate[k]`
-  checks it.
-- *Why it drives depth.* When the parent is already right, the children agree with it and the term equals the parent's CE
-  — no extra pressure, no wasted gradient. When the parent is stuck at a wrong fixed point, the child that moved closest
-  to y* *from the current state* takes the gradient, and the parent's own term trains the join to adopt it. The training
-  signal therefore concentrates exactly on the rows and rounds where a single trajectory stalls (the hard tail at later
-  rounds), without any round-dependent weight.
-- *Detours and WTA do not conflict much.* A child that serves as a detour usually loses the WTA; it then feels only the
-  ε share pulling it toward y*, while the parent's term pays it for being useful.
+What makes children *non-identical* — five mechanisms, each with a different job:
 
-### 3.3 Term 3 — sub-goal set matching (R3, R4; composites only)
+1. **Distinct static codes** e_k (N(0, 0.5²), never zero): breaks the exact symmetry that collapsed tiny's children.
+2. **Parent-conditioned per-cell codes** A_k·B·rms(z): lets the parent give each child a different job per region.
+3. **Fresh noise every round** (model, not loss): c_k += W_ξ ξ_k, ξ_k ~ N(0, I₁₆) drawn per row, per child, per round
+   (`ModelCfg.noise_dim`, learned W_ξ with initial output RMS 0.25; seeded at evaluation for reproducibility). Children
+   become samples of a learned proposal distribution instead of fixed functions of the parent state. Two consequences:
+   min-over-children training is IMLE, which cannot collapse modes (§2.2); and a parent stuck at a fixed point still
+   receives *new* proposals each round — without noise the whole round, fork included, is a deterministic map with the
+   same fixed point (DEPTH.md M2; PTRM).
+4. **One-to-one matching on composite rows**: the final answer and the intermediates go to *different* children, so
+   two near-identical children are pushed apart, one toward each grid
+   (`test_set_match_sends_distinct_targets_to_distinct_children`). This is diversity pressure with ground truth — it
+   cannot be gamed by producing garbage, because every matched child is graded against a real grid. The matching is over
+   a set, so the program's step order does not matter (frmv1's ordered trace supervision lost −2.9σ because orderings are
+   not unique); the parent is never graded on intermediates, so "produce the intermediate, let the parent finish" is
+   what minimises terms 1 + 2 together.
+5. **Annealed relaxed WTA on plain rows**: only the best child (in the soft sense) is pulled to y*; where the model is
+   uncertain, different children win on different rows. τ = 1 starts with every child learning the task (no early
+   monopoly); τ → 0.02 specialises (annealed MCL); ε/K per child keeps every code on a gradient (no dead children).
 
-Every intermediate grid g of a composite row must be produced by *some* child: each g is matched to children by a
-softmin over their CE against g, so any child may claim it, in any order, and a child may claim several. This is DIS's
-"per-step targets" idea with two differences that answer the lineage's failures: targets come from the actual program
-(detours included, not a monotone corruption schedule) and they are a *set* (frmv1's ordered trace supervision lost
-because orderings are not unique). The parent is never graded on intermediates — it keeps y* — so "produce the
-intermediate, let the parent finish" is the behaviour that minimises terms 1 + 3 together.
+Why it drives depth: when the parent is already right, children agree and the term costs nothing extra. When the parent is
+stuck, the child whose noise sample moved it closest to y* takes the gradient and term 1 trains the join to adopt it — so
+the gradient concentrates on the stuck rows at later rounds without any round-dependent weight.
 
-### 3.4 Term 4 — stop/score heads (R7, R1)
+### 3.3 Term 3 — stop/score heads (R7, R1)
 
 BCE(q, exact) for the parent (TRM) and for every child. Uses: training-time halting (row turnover), detached input to the
 join (prefer children predicted correct), vote tie-break at inference. Children's q heads are the "scoring head" of
 resilient MCL. Nothing rewards stopping early; evaluation always runs 16 rounds.
 
-### 3.5 Gradient-flow table
+### 3.4 Gradient-flow table
 
-| parameter | term 1 | term 2 | term 3 | term 4 |
-|---|---|---|---|---|
-| shared blocks f | ✓ (parent post cycle + children via join) | ✓ (children) | ✓ | ✓ |
-| fork codes e_k, A_k, B | ✓ via join | ✓ | ✓ | ✓ |
-| join W_q, W_k, β | ✓ | — | — | — (q enters detached) |
-| lm_head | ✓ | ✓ | ✓ | — |
-| q_head | — | — | — | ✓ |
-| puzzle embedding | ✓ | ✓ | ✓ | ✓ |
-| pre-fork parent cycle | no grad by design (TRM) — it has no parameters of its own | | | |
+| parameter | term 1 | term 2 | term 3 |
+|---|---|---|---|
+| shared blocks f | ✓ (parent post cycle + children via join) | ✓ (children) | ✓ |
+| fork codes e_k, A_k, B, noise map W_ξ | ✓ via join | ✓ | ✓ |
+| join W_q, W_k, β | ✓ | — | — (q enters detached) |
+| lm_head | ✓ | ✓ | — |
+| q_head | — | — | ✓ |
+| puzzle embedding | ✓ | ✓ | ✓ |
+| pre-fork parent cycle | no grad by design (TRM) — it has no parameters of its own | | |
 
 `tests/test_model.py::test_fork_gate` asserts the first column from term 1 alone; `test_every_param_gets_grad` asserts that
 no parameter is left out.
 
-### 3.6 Normalisation
+### 3.5 Normalisation
 
 Token-mean CE per row makes rows of different sizes comparable; the per-step mean over rows makes step gradients
 comparable across buckets whose row counts differ by 10×. TRM sums per-row means and divides by the global batch size,
-which is the same thing at a fixed batch.
+which is the same thing at a fixed batch. In c_bπ the intermediates are averaged, so a depth-4 composite row weighs the
+same as a depth-2 one.
 
 ## 4. How the objective incentivises depth — the argument in one place
 
-1. **New information every round.** K children with distinct codes produce K proposals from the current state; WTA keeps
-   them distinct while the answer is uncertain. Later rounds can therefore improve the answer without the input changing
-   (DEPTH.md M2).
+1. **New information every round, even at a fixed point.** K children with fresh noise produce K new proposals each
+   round; set matching keeps them distinct where it matters. Later rounds can improve the answer without the input
+   changing (DEPTH.md M2).
 2. **Credit for setting up the answer.** Term 1's gradient reaches the children's computation, so a round that spends a
-   child on an intermediate state the parent can finish is rewarded (M1). Term 3 teaches that move explicitly where the
+   child on an intermediate state the parent can finish is rewarded (M1). Term 2 teaches that move explicitly where the
    ground truth exists.
-3. **Gradient where single trajectories stall.** Term 2 adds gradient only on rows whose children disagree in quality —
+3. **Gradient where single trajectories stall.** Term 2 adds gradient only on rows whose children differ in quality —
    the stuck, later-round rows (M2, M4).
-4. **Demand.** Composites with k ≤ 4 and ≥50% genuine detours make later rounds necessary on a quarter of the data (M4).
+4. **Demand.** Composites with k ≤ 4 and ≥50% genuine detours make later rounds necessary on part of the data (M4).
 5. **No early-exit bias.** No discounting, no geometric priors, fixed 16-round evaluation (M5).
 
 None of these terms can be satisfied by making an earlier round worse (R5): no term compares two model-controlled
-losses; WTA weights and sub-goal assignments are computed without gradient.
+losses; assignment weights are computed without gradient.
 
 ## 5. Considered and rejected
 
 | idea | why not |
 |---|---|
-| diversity/disagreement bonus between children | R5: gameable by producing garbage; MCL creates diversity only where it lowers the best loss |
-| load balancing across children (MoE-style) | forces equal use when one child is legitimately better; WTA + ε already prevents dead children |
+| diversity/disagreement bonus between children | R5: gameable by producing garbage; noise + set matching create diversity only where a real grid or a lower best loss rewards it |
+| load balancing across children (MoE-style) | forces equal use when one child is legitimately better; ε already prevents dead children |
+| per-target independent softmin for intermediates (this repo's first version) | one child could claim the final answer *and* every intermediate, leaving the others identical — replaced by one-to-one matching |
+| noise only at test time (PTRM) | trained-in noise lets the codes learn *how* to use it; test-time-only noise perturbs a model that never saw it |
 | learned "whether to fork" gate (soft or discrete) | frmv1's soft gate learned the cycle index (98.9% of its variance) [M]; discrete decisions need REINFORCE-style variance on top of a weak signal |
 | TD value potential with gradient into the state | unstable critic exploitation at this scale [I]; revisit only if the fork path's credit proves too short |
-| canvas-improvement reward or hinge | telescopes (no signal) or reweights stalled rows (already done by WTA without a round-dependent factor) |
+| canvas-improvement reward or hinge | telescopes (no signal) or reweights stalled rows (already done by set matching without a round-dependent factor) |
 | final-round-only grading | frmv1: detours appear but are never rewarded; loses TRM's training-time benefit of dense grading |
 | per-step targets from a corruption schedule (DIS) | enforces monotone improvement, forbids detours |
 | CTM min-over-ticks loss | needs all rounds in one graph; incompatible with TRM's online carry |
@@ -214,19 +251,18 @@ losses; WTA weights and sub-goal assignments are computed without gradient.
 
 ## 6. Defaults and what deserves a sweep
 
-Only two choices are expensive to get wrong and cheap to compare: **K** (cost grows 15 units per child, `DESIGN.md` §9)
-and **λ_wta** (how hard children are pushed toward y* versus left free to serve the parent). Everything else keeps TRM's
-value or a literature value with no reason to deviate. `EXPERIMENTS.md` compares K ∈ {2, 4} at matched compute and
-leaves λ_wta at 0.5 unless the fork instruments show collapse (raise ε, slow τ) or irrelevance (raise λ_wta). No seed
-sweeps: single-seed arms, paired per-task statistics, seed choice at the end.
+Only K is both expensive to get wrong and cheap to compare (each child adds ≈20 pass-units per row-round,
+`DESIGN.md` §9); `EXPERIMENTS.md` compares K ∈ {2, 4} at matched compute. λ_wta, λ_sub, ε, τ and the noise scale keep
+the values above unless an instrument in §7 fires; then the listed response is applied, not a sweep. No seed sweeps:
+single-seed arms, paired per-task statistics, seed choice at the end.
 
 ## 7. Failure signatures of the objective
 
 | signature | meaning | response |
 |---|---|---|
-| `fork/win_rate[k]` ≈ 0 for some k | dead child | raise ε; slow the τ anneal |
-| `fork/distinct` → 1 while dev exact is low | collapse under uncertainty | per-child code noise; check `codes` norms |
-| `fork/parent_mass` → 1, `cf/sham` ≈ 0 | parent ignores children | raise λ_wta; join-dropout of the parent slot (p = 0.25) |
-| `sub/coverage` ≈ 0 after τ has annealed | children never produce intermediates | raise λ_sub; check composite detour rate |
+| `win{k}` ≈ 0 for some k after the τ anneal | dead child | raise ε; slow the τ anneal |
+| `distinct` → 1 while dev exact is low | collapse under uncertainty | check the learned noise scale (‖W_ξ‖); raise `noise_init` |
+| `parent_mass` → 1, `cf.sham` ≈ 0 | parent ignores children | raise λ_wta; join-dropout of the parent slot (p = 0.25) |
+| `sub_coverage` ≈ 0 after τ has annealed | children never produce intermediates | raise λ_sub; check composite detour rate |
 | q accuracy high but q never > 0 | halting never fires (all rows run 16 rounds) | expected early; if persistent, compare throughput with the control |
-| child CE ≪ parent CE | join failing to adopt good children | inspect β and `fork/adopt`; more join capacity |
+| `child_ce_min` ≪ `ce` | join failing to adopt good children | inspect β and `fork.adopt`; more join capacity |

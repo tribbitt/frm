@@ -154,12 +154,30 @@ def test_inference_equals_training_forward():
     m = make(K=4)
     x, ids, _ = inputs()
     carry = m.init_carry(B, S, torch.device("cpu"), torch.float32)
-    train_out = m.round(carry, x, ids)
+    train_out = m.round(carry, x, ids, gen=torch.Generator().manual_seed(7))
     m.eval()
     with torch.no_grad():
-        eval_out = m.round(carry, x, ids)
+        eval_out = m.round(carry, x, ids, gen=torch.Generator().manual_seed(7))
     torch.testing.assert_close(train_out.logits.detach(), eval_out.logits)
     torch.testing.assert_close(train_out.child_logits.detach(), eval_out.child_logits)
+
+
+def test_children_get_fresh_noise_each_round():
+    """At a fixed parent state, deterministic children would repeat themselves; the noise makes every round's
+    proposals new, while a seeded generator keeps evaluation reproducible."""
+    m = make(K=4)
+    x, ids, _ = inputs()
+    carry = m.init_carry(B, S, torch.device("cpu"), torch.float32)
+    with torch.no_grad():
+        gen = torch.Generator().manual_seed(3)
+        a, b = m.round(carry, x, ids, gen=gen).child_logits, m.round(carry, x, ids, gen=gen).child_logits
+        again = m.round(carry, x, ids, gen=torch.Generator().manual_seed(3)).child_logits
+    assert not torch.allclose(a, b), "same parent state, new round: children must differ"
+    torch.testing.assert_close(a, again)
+    quiet = make(K=4, noise_dim=0)
+    with torch.no_grad():
+        r1, r2 = (quiet.round(carry, x, ids).child_logits for _ in range(2))
+    torch.testing.assert_close(r1, r2)  # without noise the fork is a deterministic map of the parent state
 
 
 @pytest.mark.parametrize("K,depth", [(0, 1), (4, 1), (2, 2)])
@@ -183,11 +201,13 @@ def test_counterfactual_modes():
     m = make(K=4)
     x, ids, _ = inputs()
     carry = m.init_carry(B, S, torch.device("cpu"), torch.float32)
+
+    def run(**kw):
+        return m.round(carry, x, ids, gen=torch.Generator().manual_seed(0), **kw).logits
+
     with torch.no_grad():
-        base = m.round(carry, x, ids).logits
-        nofork = m.round(carry, x, ids, cf="nofork").logits
-        sham = m.round(carry, x, ids, cf="sham").logits
+        base, nofork, sham = run(), run(cf="nofork"), run(cf="sham")
         m.codes.add_(1.0)
-        nofork_moved = m.round(carry, x, ids, cf="nofork").logits
+        nofork_moved = run(cf="nofork")
     torch.testing.assert_close(nofork, nofork_moved)  # with the join on the parent slot, children cannot matter
     assert not torch.allclose(base, nofork) and not torch.allclose(base, sham)

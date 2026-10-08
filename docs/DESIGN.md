@@ -46,9 +46,11 @@ test input out), submittable to the ARC Prize 2026 ARC-AGI-2 Kaggle track with o
 1. *Forking makes depth useful.* A single deterministic recursion converges to a fixed point (often the wrong one) within
    a few rounds and then repeats itself; this is what "no progress after depth ~4" is [M: TRM 38.25→40.38→40.13→40.50% by
    step, arXiv 2512.11847; L: "Reasoning or Guessing?" 2601.10679 — trajectories plateau at spurious fixed points]. A round
-   that forks K children with distinct codes, trains them as competing hypotheses, and lets the parent read them,
-   injects *new information into every round*. Depth paid off in the lineage only when new information arrived between
-   segments [M: frmv2 `p2_c` checker arm, s1→s3 gain +0.023 vs ≈0 in every other arm].
+   that forks K children with distinct codes **and fresh noise each round**, trains them as competing hypotheses, and
+   lets the parent read them, injects *new information into every round* — even when the parent's state has stopped
+   moving (without the noise the fork would be a deterministic function of that state and repeat itself). Depth paid
+   off in the lineage only when new information arrived between segments [M: frmv2 `p2_c` checker arm, s1→s3 gain
+   +0.023 vs ≈0 in every other arm].
 2. *Forking permits detours.* TRM grades every round's canvas against the final answer through a one-cycle gradient
    window with a detached carry, so a step that makes the canvas worse in order to make the answer reachable is
    penalised and never credited [L: TRM 2510.04871; M: frmv1 final-only supervision produced detours that were never
@@ -70,10 +72,10 @@ sham-children counterfactual costs nothing. A negative result means redesign of 
 | D3 | positions | 2D RoPE (row/col halves of each head), prefix tokens unrotated | needed for size buckets; 1D RoPE over a variable stride was a measured frmv1 bug [M: `frmv1/models/layers.py:44-52`] | TRM 1D RoPE over 30×30 |
 | D4 | canvas | size buckets {8,12,16,20,24,30}, chosen from demo grids + test input + a demo-verified size rule; never from the test output | token cost 0.32–0.49 of 30×30 on ARC-AGI-1 sets, 0.82 on ARC-AGI-2 eval; overflow 2/419 a1 eval, 1/172 a2 eval [M: computed from `trm-samsung/kaggle/combined`, see §3.3] | fixed 30×30 (2–3× more tokens) |
 | D5 | fork structure | **fixed-structure**: every round forks K children (default K=4) at the middle cycle; no learned "whether to fork" gate | learned gates collapse to schedules [M: frmv1 gate 98.9% cycle-index variance]; discrete decisions add high-variance gradients [L: research C10] | learned fork gate, REINFORCE/Gumbel fork decisions |
-| D6 | child symmetry breaking | non-zero, distinct learned fork codes injected at **every** child z-update (inside the gradient window), plus a parent-conditioned per-cell code | tiny's zero-init codes + zero-init arbitration collapsed onto child 0 (w=0.993) [M: `tiny/results/fork_probe.json`]; anything only on a no-grad path never trains [M: tinyv2.2 `init_state`, ARM latents] | zero-init codes, seeds only in warm-up |
+| D6 | child symmetry breaking and diversity | non-zero, distinct learned fork codes injected at **every** child z-update (inside the gradient window), a parent-conditioned per-cell code, and **fresh per-round noise** through a learned map | tiny's zero-init codes + zero-init arbitration collapsed onto child 0 (w=0.993) [M: `tiny/results/fork_probe.json`]; anything only on a no-grad path never trains [M: tinyv2.2 `init_state`, ARM latents]; deterministic recursion has no escape from a wrong fixed point [L: PTRM 2605.19943]; IMLE cannot drop modes [L: 1809.09087] | zero-init codes, seeds only in warm-up, deterministic children |
 | D7 | child information | children start from the full parent state (y, z) and see the full input x; nothing is masked | masked/starved children equalled random shams [M: tinyabstractor I-9, children right 0.13 vs base 0.74 on disagreements] | crop/masked-plane children |
 | D8 | join | per-cell softmax attention over {parent, child₁..child_K} on (y, z), with gradient; parent slot lets the parent ignore children | detached joins train nothing [M: tinyabstractor `fork_in` detaches all; frmv2 "nothing learned through the merge" removed forks]; merge forms carried the decomposition solver's gains (21-0) while branch-only forms were null [M: decomposition-solver-arc ladder] | detached claim join, inference-only selection |
-| D9 | child objective | annealed, relaxed winner-takes-all over children (+ sub-goal set matching on synthetic composites) | MCL/rWTA/annealed MCL [L: 1606.07839, 1612.00197, 2407.15580]; same-target CE on all children → collapse [M: tiny] | per-child CE to the final target, diversity bonuses |
+| D9 | child objective | one-to-one set matching of {final answer} ∪ {composite intermediates} onto distinct children, annealed and relaxed; on plain rows this is annealed relaxed winner-takes-all | MCL/rWTA/annealed MCL [L: 1606.07839, 1612.00197, 2407.15580]; bipartite set matching forces unique predictions [L: DETR 2005.12872]; same-target CE on all children → collapse [M: tiny] | per-child CE to the final target, diversity bonuses, per-target independent softmin (one child can claim every target) |
 | D10 | depth demand | synthetic composite tasks f_k∘…∘f_1 (k = 1..4) with intermediate grids, mixed with ARC; per-round metrics by k | corpora without detour tasks cannot test the thesis [M: tinyabstractor `synth/compose.py:29-32` refused "second step hides the first"; frmv1 branching factor 1 in 100% of tasks] | ARC only |
 | D11 | deep supervision regime | TRM's online carry: one optimizer step per round, halted rows replaced, per-bucket carries | TRM's regime is what produced 40%+; frmv1/frmv2 replaced it with unrolled graphs and lost TRM's behaviour [M] | unrolled multi-segment graph per step |
 | D12 | optimizer | AdamW (0.9, 0.95), lr 1e-4, wd 0.1, warm-up 2k, constant; puzzle embedding SignSGD lr 1e-2 wd 0.1; EMA 0.999 | TRM `cfg_pretrain.yaml` (AdamATan2 replaced by AdamW: no CUDA extension to build on Kelvin) | Muon (misrouted in tiny [M]) |
@@ -193,7 +195,7 @@ no_grad: 2 × cycle(y, z, x, 0)
 ```
 no_grad: (H−2) × cycle(y, z, x, 0)                              # pre-fork parent cycle
 for k in 1..K (batched):                                         # fork
-    c_k   = e_k + A_k · B · rms(z)                               # fork code, per child, per cell
+    c_k   = e_k + A_k · B · rms(z) + W_ξ ξ_k,  ξ_k ~ N(0, I₁₆) fresh   # fork code: per child, per cell, per round
     y_k, z_k = cycle(y, z, x, c_k)            with grad          # children: same tied f
 y, z = join(y, z, {y_k, z_k, q_k})             with grad          # §4.4
 y, z = cycle(y, z, x, 0)                       with grad          # post-join parent cycle
@@ -211,6 +213,11 @@ intermediate state is what TRM lacks (§1 claim 2).
   `A_k` zero-initialised (the static `e_k` already breaks symmetry; `A_k` still receives gradient because `B·rms(z) ≠ 0`).
   The per-cell term lets the parent hand each child a different job per region (a soft "argument": region, object, layer),
   learned end to end.
+- **Noise.** `ξ_k ~ N(0, I₁₆)` is drawn per row, per child, per round and mapped by a learned `W_ξ: 16→512` (initial
+  output RMS 0.25, `ModelCfg.noise_dim`/`noise_init`), broadcast over cells. Training uses the global RNG; evaluation
+  seeds a generator per batch (reproducible, and counterfactual reruns see the same noise). Rationale: IMLE-style
+  min-over-samples training cannot collapse modes, and a parent at a fixed point still gets new proposals
+  (`OBJECTIVE.md` §3.2; PTRM 2605.19943). Gated by `test_children_get_fresh_noise_each_round`.
 - **Injection.** c_k is added to the z-update input at **every** child z-update, so codes are always inside the gradient
   window.
 - **Batching.** Children are a batch expansion [B, K, L, D] → [B·K, L, D]. No separate buckets, no separate episodes
@@ -261,18 +268,21 @@ table: `n_ids × 512` fp32, outside the dense count (≈ 289k rows for `arc1` at
 
 ## 5. Objective (summary — derivation in `OBJECTIVE.md`)
 
-Per round, per row (mean over rows):
+Per round, per row (mean over rows); written out symbol by symbol in `OBJECTIVE.md` §3.0:
 
 ```
-L = CE(parent)                                      # deep supervision on the post-join readout
-  + λ_wta · Σ_k w_k · CE(child_k)                    # annealed relaxed WTA, w = (1−ε)·softmin_τ(CE) + ε/K, sg(w)
-  + λ_sub · mean_t softmin-match_k CE(child_k, g_t)  # composites only: each intermediate grid claimed by some child
-  + λ_q   · [BCE(q_parent, exact_parent) + mean_k BCE(q_k, exact_k)]
+L = CE(parent, y*)                                                      # deep supervision on the post-join readout
+  + λ_wta · [(1−ε) · Σ_π w_π · c_π  +  ε · mean_k CE(child_k, y*)]       # children: annealed one-to-one set matching
+  + λ_q   · [BCE(q_parent, exact_parent) + mean_k BCE(q_k, exact_k)]     # stop / score heads
+
+c_π = CE(child_π(final), y*) + (λ_sub/λ_wta) · mean_{t matched} CE(child_π(t), g_t)    # g_t: composite intermediates
+w   = softmax_π(−c / τ) over one-to-one assignments of {y*} ∪ intermediates to distinct children, no gradient
 ```
 
 CE is TRM's stablemax cross-entropy, token-mean per row over non-PAD labels. Defaults: λ_wta = 0.5, λ_sub = 0.5,
-λ_q = 0.5, ε = 0.05, τ annealed log-linearly 1.0 → 0.02 over the first 30% of steps. Uniform weight per round (no
-discounting). No term rewards a difference between two model-controlled quantities.
+λ_q = 0.5, ε = 0.05, τ annealed log-linearly 1.0 → 0.02 over the first 30% of the budget. Plain rows (no intermediates)
+reduce to annealed relaxed winner-takes-all. Uniform weight per round (no discounting). No term rewards a difference
+between two model-controlled quantities.
 
 ---
 
