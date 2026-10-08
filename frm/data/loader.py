@@ -228,6 +228,20 @@ class TrainStream:
         self.pending_vid = np.asarray(d["pending_vid"], dtype=np.int64)
 
 
+def eval_versions(d, t: int, max_versions: int | None, trained: np.ndarray | None) -> np.ndarray:
+    """Identifiers of task ``t``'s versions that vote, in version order (identity first), at most ``max_versions``.
+
+    With ``trained`` (bool per identifier), only versions whose embedding row was trained vote — an untrained row tells
+    the model nothing about its task, and a crowd of such blind rows outvotes the informed ones. If no version of the
+    task is trained, the identity version alone makes a blind attempt."""
+    v0 = int(d.vstart[t])
+    vids = np.arange(v0, v0 + int(d.vcount[t]))
+    if trained is not None:
+        hit = vids[trained[vids]]
+        vids = hit if len(hit) else vids[:1]
+    return vids if max_versions is None else vids[:max_versions]
+
+
 def eval_batches(
     ds: Dataset,
     split: str,
@@ -235,9 +249,10 @@ def eval_batches(
     batch_rows: int,
     max_versions: int | None = None,
     tasks: set[str] | None = None,
+    trained: np.ndarray | None = None,
 ) -> Iterator[dict]:
-    """Untranslated rows of ``split`` in ``bucket``: every eval pair x the task's versions (identity first, at most
-    ``max_versions``), ordered by task, pair index, version; only tasks in ``tasks`` when given (batches stay full).
+    """Untranslated rows of ``split`` in ``bucket``: every eval pair x the task's voting versions (``eval_versions``),
+    ordered by task, pair index, version; only tasks in ``tasks`` when given (batches stay full).
     Yields nothing if the bucket has no such split."""
     if not ds.has_split(bucket, split):
         return
@@ -246,8 +261,7 @@ def eval_batches(
     for t, task_id in enumerate(d.tasks):
         if tasks is not None and task_id not in tasks:
             continue
-        nv = int(d.vcount[t]) if max_versions is None else min(int(d.vcount[t]), max_versions)
-        vids = range(int(d.vstart[t]), int(d.vstart[t]) + nv)
+        vids = eval_versions(d, t, max_versions, trained).tolist()
         for e in range(int(d.ex_start[t]), int(d.ex_start[t + 1])):
             for v in vids:
                 ex_l.append(e)

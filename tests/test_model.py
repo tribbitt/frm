@@ -6,6 +6,7 @@ import torch
 from frm.config import ModelCfg, ObjectiveCfg
 from frm.model.refiner import Refiner
 from frm.objective import Objective, row_ce
+from frm.train import load_pretrained
 
 B, S = 3, 6
 
@@ -211,3 +212,48 @@ def test_counterfactual_modes():
         nofork_moved = run(cf="nofork")
     torch.testing.assert_close(nofork, nofork_moved)  # with the join on the parent slot, children cannot matter
     assert not torch.allclose(base, nofork) and not torch.allclose(base, sham)
+
+
+def test_join_parent_dropout_forces_children_in_training_only():
+    """A dropped row's joined state comes from the children alone (identical children -> exactly their state) and is
+    left out of the join statistics; evaluation never drops."""
+    m = make(K=4, join_drop_parent=1.0)
+    L, D = m.cfg.prefix_len + S * S, m.cfg.hidden
+    g = torch.Generator().manual_seed(3)
+    y, z = torch.randn(B, L, D, generator=g), torch.randn(B, L, D, generator=g)
+    cy, cz = torch.randn(B, 1, L, D, generator=g), torch.randn(B, 1, L, D, generator=g)
+    ys, zs, q, qc = cy.expand(B, 4, L, D), cz.expand(B, 4, L, D), torch.zeros(B), torch.zeros(B, 4)
+    y_new, z_new, mass, ent = m._join(y, z, ys, zs, q, qc, None, None)
+    torch.testing.assert_close(y_new, cy[:, 0])
+    torch.testing.assert_close(z_new, cz[:, 0])
+    assert torch.isnan(mass).all() and torch.isnan(ent).all()
+    m.eval()
+    _, _, mass_eval, _ = m._join(y, z, ys, zs, q, qc, None, None)
+    assert not torch.isnan(mass_eval).any() and bool((mass_eval[:, 0] > 0).all())
+
+
+def test_puzzle_embedding_counts_updates_and_reads_old_checkpoints():
+    m = make(K=0)
+    x, ids, labels = inputs()
+    out = m.round(m.init_carry(B, S, torch.device("cpu"), torch.float32), x, ids)
+    row_ce(out.logits, labels).mean().backward()
+    m.puzzle_emb.step(1e-2, 0.1)
+    assert m.puzzle_emb.visits.tolist() == [0, 1, 1, 1, 0, 0, 0, 0]
+    legacy = {k: v for k, v in m.state_dict().items() if k != "puzzle_emb.visits"}  # written before the counter
+    m2 = make(K=0)
+    m2.load_state_dict(legacy)
+    assert m2.puzzle_emb.trained().tolist() == m.puzzle_emb.trained().tolist()
+
+
+def test_load_pretrained_resets_new_rows_to_mean_of_trained_rows(tmp_path):
+    """Never-trained (zero) rows must not dilute the reset-to-mean: arms differ in how many rows they trained."""
+    src = make(K=0)
+    with torch.no_grad():
+        src.puzzle_emb.table[1] = 1.0
+        src.puzzle_emb.table[2] = 3.0
+        src.puzzle_emb.visits[1:3] = 5
+    torch.save({"model": src.state_dict()}, tmp_path / "ck.pt")
+    dst = Refiner(src.cfg, num_ids=5)
+    load_pretrained(dst, str(tmp_path / "ck.pt"), torch.device("cpu"))
+    assert bool((dst.puzzle_emb.table[1:] == 2.0).all()) and bool((dst.puzzle_emb.table[0] == 0).all())
+    assert int(dst.puzzle_emb.visits.sum()) == 0  # the new identifiers are untrained until adaptation updates them

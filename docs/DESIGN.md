@@ -267,6 +267,12 @@ the ASSEMBLE/COMBINE forms that carried the decomposition solver [M]), *detour* 
 intermediate state and finishes it). The parent slot makes "ignore the children" representable, so usage is
 measurable instead of forced. q_j enters detached so selection pressure cannot miscalibrate the halting head.
 
+**Parent-slot dropout** (`ModelCfg.join_drop_parent`, training only; 0.25 in the FRM pilot configs since P1's first run,
+`EXPERIMENTS.md` §4): per row and round, the parent slot is masked with probability p, so the post-join cycle must build
+on the children and the parent's loss reaches them at full strength. Without it the join learned to ignore the
+children within the first 3% of training (parent mass 0.39 → 0.95) and the gradient into them shrank with their weight.
+Dropped rows are excluded from the training join statistics (NaN); evaluation never drops.
+
 ### 4.5 Nested forks (`fork_depth ≥ 2`)
 
 `_node(y, z, depth)`: at `depth < fork_depth` the node forks K children, each `_node(·, depth+1)`, joins them and runs a
@@ -285,7 +291,7 @@ table: `n_ids × 512` fp32, outside the dense count (≈ 600k rows for the `a1` 
 2. Children's cycles run with grad; the pre-fork cycle runs without.
 3. The carry is detached: a round's loss sends no gradient into the previous round.
 4. `trm` control reproduces TRM's structure: (H−1) no-grad cycles, one grad cycle, same op order.
-5. Inference forward == training forward (same function, no grad).
+5. Inference forward == training forward (same function, no grad), except the training-only parent-slot dropout.
 6. No parameter is reachable only through a no-grad path (`test_every_param_gets_grad`).
 
 ---
@@ -350,6 +356,17 @@ hash. Vote per test input: rank distinct grids by (vote count, mean σ(q)) over 
 (`trm-samsung/evaluators/arc.py:107-177`), with children optionally contributing votes at weight `child_vote_weight`
 (default 0; a pre-registered variant in `EXPERIMENTS.md`). Top-2 → `attempt_1`, `attempt_2`. Score = mean over tasks of the
 fraction of test inputs with a correct attempt (official ARC metric).
+
+**Only trained versions vote** (`loader.eval_versions`): up to `eval.max_versions` versions of a task whose
+puzzle-embedding row has been updated at least once (`PuzzleEmbedding.visits`), identity first, then version order; a
+task with no trained version gets one blind attempt from its identity version. TRM trains every version it votes with
+(≈400 row-rounds per identifier); a budgeted run does not, and an untrained row (zero in pretraining, the reset-to-mean
+row in adaptation) carries no task information. Measured in P1 at 3,400 PF: FRM had trained 15% of its dev voting
+versions, `trm` 54%, so most FRM votes were blind and outvoted the informed ones. Every eval result carries
+`versions` = {coverage (fraction of the evaluated tasks' versions trained), voters (mean versions voting per task),
+blind_tasks}; `scripts/compare.py` refuses records without it. The same rule scores adaptation and the Kaggle
+submission. Adaptation's new rows start at the mean of the checkpoint's *trained* rows (`train.load_pretrained`);
+averaging in the never-trained zero rows would shrink them by the checkpoint's coverage.
 
 ### 7.2 Fork instruments (each can fail in the direction of the failure)
 
@@ -452,12 +469,13 @@ one pass of transients, ≈0.6 MB per parent token in total. At 80 GB that bound
   `test_nested_fork_gate`, `test_trm_mode_matches_reference_structure` (K=0 equals an independent restatement of TRM's
   round), carry detached and reset, `test_every_param_gets_grad`, inference == training forward,
   `test_children_get_fresh_noise_each_round`, `test_child_checkpointing_is_exact`, pass accounting == executed passes,
-  counterfactual modes.
+  counterfactual modes, parent-slot dropout (children only in training, never at eval), embedding visit counts (and
+  their derivation for checkpoints written before the counter), reset-to-mean over trained rows only.
 - `test_objective.py`: stablemax normalised, NaN-free gradients and non-zero gradients at zero logits; PAD ignored;
   assignment table one-to-one; set matching reduces to annealed WTA, sends distinct targets to distinct children and
   respects masks/spare children; each child's gradient = w_k × its own CE gradient; mixed composite/plain batches.
-- `test_evaluate.py`: official scoring and per-task outcomes, vote ranking, submission shape, sham children from other
-  tasks.
+- `test_evaluate.py`: official scoring and per-task outcomes, vote ranking, only trained versions vote (identity first,
+  capped, blind fallback), submission shape, sham children from other tasks.
 - `test_train_smoke.py`: build → train → SIGTERM → resume (step count continues) → DONE → evaluate → `--final` guard →
   adapt → valid `submission.json`.
 
@@ -513,7 +531,7 @@ tests/                 test_data, test_external, test_composite, test_model, tes
 
 | risk | detection | response | available today? |
 |---|---|---|---|
-| parent ignores children | `parent_mass → 1`, `cf/sham ≈ 0` | raise `objective.lambda_wta`; join-dropout (mask the parent slot with p=0.25 in training); more pre-fork cycles (`H_cycles=4`) so children start from a better state | λ_wta, H_cycles: config. join-dropout: a code change |
+| parent ignores children | `parent_mass → 1`, `cf/sham ≈ 0` | raise `objective.lambda_wta`; join-dropout (mask the parent slot with p=0.25 in training); more pre-fork cycles (`H_cycles=4`) so children start from a better state | all config (`model.join_drop_parent`, applied from P1's rerun) |
 | children collapse | `distinct → 1`, win rates degenerate | raise `objective.wta_eps`, slow the τ anneal (`tau_anneal_frac`), per-child noise on codes | ε, τ: config. noise: a code change |
 | fork costs more than it returns | matched-FLOP dev pass@2 below `trm` | K=2; cheaper children (`child_L_cycles=2`); fork only on alternate rounds | K, child_L_cycles: config. alternate rounds: a code change |
 | depth still unused | `late_gain ≈ 0` on dev and composites | raise composite fraction/depth (`data.source_weights`, generator `--depth_max`); inspect `cf/reset@4`; more rounds trained (`halt_explore`) | config |

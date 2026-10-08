@@ -75,20 +75,27 @@ class EMA:
 def load_pretrained(model: Refiner, path: str, device: torch.device) -> None:
     """Load dense weights and fixed buffers from a checkpoint (EMA weights when present).
 
-    The puzzle-embedding table belongs to the new dataset's identifiers: every row except the blank becomes the mean
-    trained row of the checkpoint (TRM's reset-to-mean, applied only to the new table).
+    The puzzle-embedding table belongs to the new dataset's identifiers: every row except the blank becomes the mean of
+    the checkpoint's *trained* rows (TRM's reset-to-mean, applied only to the new table; averaging the never-trained
+    zero rows too would shrink it by the checkpoint's coverage, which differs between arms). New rows start untrained.
     """
     ck = torch.load(path, map_location=device, weights_only=False)
     state = dict(ck["model"])
     if "ema" in ck:
         state.update(ck["ema"])
     old = state.pop("puzzle_emb.table")
+    old_visits = state.pop("puzzle_emb.visits", None)
+    trained = (old_visits > 0) if old_visits is not None else (old != 0).any(-1)
+    trained[0] = False  # the blank identifier
     missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing != ["puzzle_emb.table"] or unexpected:
+    if sorted(missing) != ["puzzle_emb.table", "puzzle_emb.visits"] or unexpected:
         raise ValueError(f"checkpoint/model mismatch: missing {missing}, unexpected {unexpected}")
+    if not bool(trained.any()):
+        raise ValueError(f"{path}: no trained puzzle-embedding row to initialise the new table from")
     with torch.no_grad():
-        model.puzzle_emb.table.copy_(old[1:].mean(0).expand_as(model.puzzle_emb.table))
+        model.puzzle_emb.table.copy_(old[trained].mean(0).expand_as(model.puzzle_emb.table))
         model.puzzle_emb.table[0].zero_()
+        model.puzzle_emb.visits.zero_()
 
 
 @dataclass
@@ -401,6 +408,8 @@ class Trainer:
                     {
                         "model": self.model.state_dict(),
                         "step": self.step,
+                        "flops": self.flops,
+                        "row_rounds": self.row_rounds,
                         "cfg": self.cfg.to_dict(),
                         "num_ids": self.ds.num_ids,
                         "score": score,

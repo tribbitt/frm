@@ -153,6 +153,10 @@ class Refiner(nn.Module):
         q_all = torch.cat([q_parent[:, None], q_children], dim=1).detach()  # [B, K+1]
         s = torch.einsum("bld,bkld->bkl", qv, kv).float() / math.sqrt(qv.shape[-1])
         s = s + self.join_beta * q_all[:, :, None]
+        drop = None
+        if self.training and self.cfg.join_drop_parent > 0 and cf is None:
+            drop = torch.rand(s.shape[0], device=s.device) < self.cfg.join_drop_parent  # rows that must use children
+            s = torch.cat([s[:, :1].masked_fill(drop[:, None, None], float("-inf")), s[:, 1:]], dim=1)
         alpha = s.softmax(dim=1)  # [B, K+1, L]
         if cf == "nofork":
             alpha = torch.zeros_like(alpha)
@@ -162,7 +166,11 @@ class Refiner(nn.Module):
         P = self.cfg.prefix_len
         grid_alpha = alpha[:, :, P:].detach()
         ent = -(grid_alpha.clamp_min(1e-9).log() * grid_alpha).sum(1).mean(-1)
-        return y_new, z_new, grid_alpha.mean(-1), ent
+        mass = grid_alpha.mean(-1)
+        if drop is not None:  # forced rows say nothing about the join's choice: NaN is skipped by the training logs
+            mass = mass.masked_fill(drop[:, None], float("nan"))
+            ent = ent.masked_fill(drop, float("nan"))
+        return y_new, z_new, mass, ent
 
     def _node(self, y, z, x, c, depth: int, cos, sin, cf, sham_perm=None, gen=None):
         """Fork K children (each a node one level deeper), join them, run the post cycle. Returns children too.

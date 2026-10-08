@@ -33,6 +33,10 @@ class ModelCfg:
     # point. 0 disables. The map is learned; noise_init is the initial RMS of its output.
     noise_dim: int = 16
     noise_init: float = 0.25
+    # Training only: probability per row and round that the join's parent slot is masked, so the post-join cycle must
+    # build on the children and the parent's loss reaches them at full strength (OBJECTIVE.md §7, response to
+    # parent_mass -> 1). Evaluation never drops. 0 disables.
+    join_drop_parent: float = 0.0
     # Gradient window of the K=0 control (TRM = 1 cycle; trm_h2 = 2).
     grad_cycles: int = 1
     grad_ckpt_children: bool = False

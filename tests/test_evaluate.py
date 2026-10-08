@@ -1,9 +1,20 @@
-"""Evaluation helpers: official scoring, submission shape, sham children from other tasks."""
+"""Evaluation helpers: official scoring, submission shape, sham children from other tasks, which versions vote."""
+
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
+from frm.data.loader import eval_versions
 from frm.evaluate import Votes, attempts, score, sham_perm
+
+
+def test_only_trained_versions_vote_identity_first():
+    d = SimpleNamespace(vstart=np.array([0, 5]), vcount=np.array([5, 3]))
+    trained = np.array([0, 1, 0, 1, 1, 0, 0, 0], dtype=bool)
+    assert eval_versions(d, 0, None, trained).tolist() == [1, 3, 4]
+    assert eval_versions(d, 0, 2, trained).tolist() == [1, 3]  # the cap keeps version order
+    assert eval_versions(d, 1, 32, trained).tolist() == [5]  # nothing trained: the identity alone, a blind attempt
 
 
 def test_score_official_metric_and_per_task():

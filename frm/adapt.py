@@ -77,7 +77,8 @@ def main(argv: list[str] | None = None) -> int:
     res = evaluate_split(trainer.model, ds, "test", cfg.eval, trainer.device, trainer.dtype, keep_attempts=True)
     trainer.ema.swap(trainer.model)
     Path(args.submission).write_text(json.dumps(res.pop("attempts")))
-    summary = {"steps": trainer.step, "pflops": trainer.flops / 1e15, "submission": args.submission}
+    summary = {"steps": trainer.step, "pflops": trainer.flops / 1e15, "submission": args.submission,
+               "versions": res["versions"]}
     if args.solutions:
         summary.update({k: res[k] for k in ("pass@1", "pass@2", "n_tasks", "per_task")})
         summary["pass@2_by_round"] = res["by_round"]["pass@2"]  # per_task feeds scripts/compare.py (paired adev tests)

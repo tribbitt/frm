@@ -262,7 +262,7 @@ single-seed arms, paired per-task statistics, seed choice at the end.
 |---|---|---|
 | `win{k}` ≈ 0 for some k after the τ anneal | dead child | raise ε; slow the τ anneal |
 | `distinct` → 1 while dev exact is low | collapse under uncertainty | check the learned noise scale (‖W_ξ‖); raise `noise_init` |
-| `parent_mass` → 1, `cf.sham` ≈ 0 | parent ignores children | raise λ_wta; join-dropout of the parent slot (p = 0.25) |
+| `parent_mass` → 1, `cf.sham` ≈ 0 | parent ignores children | raise λ_wta; join-dropout of the parent slot (p = 0.25; `model.join_drop_parent`, applied after P1's first run hit parent mass 0.95–0.98) |
 | `sub_coverage` ≈ 0 after τ has annealed | children never produce intermediates | raise λ_sub; check composite detour rate |
 | q accuracy high but q never > 0 | halting never fires (all rows run 16 rounds) | expected early; if persistent, compare throughput with the control |
 | `child_ce_min` ≪ `ce` | join failing to adopt good children | inspect β and `fork.adopt`; more join capacity |

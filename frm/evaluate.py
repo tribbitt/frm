@@ -5,7 +5,10 @@
 Voting follows TRM (trm-samsung/evaluators/arc.py:107-177): each version's prediction is cropped, de-augmented and
 hashed; candidates rank by (votes, mean sigmoid(q)); the top two are the attempts. Score = mean over tasks of the
 fraction of their test inputs with a correct attempt (official ARC metric). Reading split ``test`` needs ``--final``.
-Per-task outcomes are stored so arms can be compared with paired statistics (``scripts/compare.py``).
+Only versions whose puzzle-embedding row was trained vote (``loader.eval_versions``): TRM trains every version it votes
+with, while a budgeted run trains a fraction of them, and the untrained rest would vote blind (the result's
+``versions`` block reports coverage and voters). Per-task outcomes are stored so arms can be compared with paired
+statistics (``scripts/compare.py``).
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ import torch
 from frm.config import Cfg, EvalCfg
 from frm.data.augment import Version
 from frm.data.encode import crop
-from frm.data.loader import Dataset, eval_batches
+from frm.data.loader import Dataset, eval_batches, eval_versions
 from frm.model.refiner import Refiner, RoundOut
 from frm.objective import row_exact
 
@@ -194,10 +197,20 @@ def evaluate_split(
     cf_rows = 0
     buckets = [S for S in ds.buckets if ds.has_split(S, split)]
     cf_budget = ecfg.cf_rows // max(1, len(buckets))  # counterfactual rows per bucket: every canvas size is represented
+    trained = model.puzzle_emb.trained().cpu().numpy()
+    coverage, voters, blind = [], [], 0  # per evaluated task: fraction of its versions trained, versions that vote
+    for S in buckets:
+        d = ds.split_data(S, split)
+        for t, tid in enumerate(d.tasks):
+            if tid in tasks:
+                v0, nv = int(d.vstart[t]), int(d.vcount[t])
+                coverage.append(float(trained[v0 : v0 + nv].mean()))
+                voters.append(len(eval_versions(d, t, ecfg.max_versions, trained)))
+                blind += not trained[v0 : v0 + nv].any()
     for S in buckets:
         rows = _rows_per_batch(model, S, ecfg)
         cf_done = 0
-        for bi, batch in enumerate(eval_batches(ds, split, S, rows, ecfg.max_versions, set(tasks))):
+        for bi, batch in enumerate(eval_batches(ds, split, S, rows, ecfg.max_versions, set(tasks), trained)):
             keys = batch["keys"]
             n = len(keys)
             seed = S * 1_000_003 + bi  # reproducible noise per batch, shared by its counterfactual reruns
@@ -268,6 +281,13 @@ def evaluate_split(
     final = scored[-1]
     res.update({k: final[k] for k in ("pass@1", "pass@2", "n_tasks")})
     res["per_task"] = {"pass@2": final["per_task"]}
+    res["versions"] = {  # the vote rule's inputs: compare arms only on records that carry this block
+        "rule": "trained",
+        "max": ecfg.max_versions,
+        "coverage": float(np.mean(coverage)) if coverage else float("nan"),
+        "voters": float(np.mean(voters)) if voters else float("nan"),
+        "blind_tasks": int(blind),
+    }
     lab = max(n_labeled, 1)
     res["by_round"] = {
         "pass@1": [s["pass@1"] for s in scored],
@@ -355,7 +375,8 @@ def main(argv: list[str] | None = None) -> int:
     res = evaluate_split(model, ds, args.split, cfg.eval, device, dtype, cfg.eval.counterfactuals, bool(args.submission))
     if args.submission:
         Path(args.submission).write_text(json.dumps(res.pop("attempts")))
-    res["ckpt"], res["step"] = str(ckpt), ck.get("step")
+    res["ckpt"], res["step"], res["row_rounds"] = str(ckpt), ck.get("step"), ck.get("row_rounds")
+    res["pflops"] = ck["flops"] / 1e15 if "flops" in ck else None
     out = run_dir / "eval" / f"{args.split}_step{ck.get('step')}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(res, indent=1))

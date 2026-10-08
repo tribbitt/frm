@@ -95,11 +95,13 @@ python -m frm.adapt --ckpt runs/frm_a2_kaggle/best.pt --challenges arc-agi_test_
 ```
 
 Builds the hidden tasks, gives their augmented versions fresh embedding rows, fine-tunes all weights on their demos for
-the time budget, votes over versions, and writes two attempts per test input. With `--solutions` the same command is the
-local leaderboard proxy (pretrain on `a2_kaggle`, adapt on ARC-AGI-2 evaluation).
+the time budget, votes over the versions it trained, and writes two attempts per test input. With `--solutions` the
+same command is the local leaderboard proxy (pretrain on `a2_kaggle`, adapt on ARC-AGI-2 evaluation).
 
 ## Status
 
 Built and verified on CPU (tests, smoke, learnability) and on Kelvin's MI300X (ROCm venv, smoke incl. SIGTERM/resume,
-benchmark: `trm` ≈238, FRM K=4 ≈224–227 TFLOP/s compiled). Pilot P1 (`trm_a1` vs `frm_a1`, 18,000 PFLOP each) is
-running; decision rules in `docs/EXPERIMENTS.md` §4.
+benchmark: `trm` ≈238, FRM K=4 ≈224–227 TFLOP/s compiled). Pilot P1's first FRM run was stopped at 3,700 PF: its
+children were redundant (parent mass 0.95) and its dev votes were mostly blind (15% of voting versions trained). The
+evaluation now votes with trained versions only, and FRM configs drop the join's parent slot in training (p = 0.25);
+`trm_a1` continues, `frm_a1` restarts (`docs/EXPERIMENTS.md` §4).
