@@ -49,7 +49,7 @@ class DataCfg:
     root: str = "data/built/a1"
     source_weights: dict[str, float] | None = field(default_factory=lambda: {"arc": 0.75, "composite": 0.25})
     translate_p: float = 0.75
-    tokens_per_step: int = 350_000  # parent tokens (prefix included) per optimizer step
+    tokens_per_step: int = 120_000  # parent tokens (prefix included) per optimizer step; T2 bench re-sizes it
     max_rows: int = 4096
     buckets: list[int] | None = None  # None = every bucket in the dataset
 
@@ -69,6 +69,8 @@ class TrainCfg:
     halt_explore: float = 0.1
     budget_pflops: float = 1000.0  # training stops when this much compute is spent
     max_steps: int = 0  # 0 = budget only
+    max_hours: float = 0.0  # 0 = no wall-clock limit (used by Kaggle adaptation)
+    init_from: str | None = None  # pretrained checkpoint: weights loaded, puzzle-embedding rows re-initialised
     eval_every_pflops: float = 100.0
     log_every: int = 50
     ckpt_minutes: float = 30.0

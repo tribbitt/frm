@@ -104,11 +104,16 @@ class Refiner(nn.Module):
             h = blk(h, cos_sin)
         return h
 
-    def _cycle(self, y, z, x, c, cos, sin, n: int):
+    def _f_ckpt(self, h: torch.Tensor, u: torch.Tensor, cos_sin: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """_f with activations recomputed in backward: stores only (h, u) per pass."""
+        return checkpoint(self._f, h, u, cos_sin, use_reentrant=False)
+
+    def _cycle(self, y, z, x, c, cos, sin, n: int, ckpt: bool = False):
         inj = x if c is None else x + c
+        f = self._f_ckpt if ckpt else self._f
         for _ in range(n):
-            z = self._f(z, y + inj, (cos, sin))
-        y = self._f(y, z, (cos, sin))
+            z = f(z, y + inj, (cos, sin))
+        y = f(y, z, (cos, sin))
         return y, z
 
     # ------------------------------------------------------------------ fork / join
@@ -156,10 +161,8 @@ class Refiner(nn.Module):
             yk, zk, _ = self._node(yk, zk, xk, codes, depth + 1, cos, sin, cf)
         else:
             n_child = cfg.child_L_cycles or cfg.L_cycles
-            if cfg.grad_ckpt_children and torch.is_grad_enabled():
-                yk, zk = checkpoint(self._cycle_fn, yk, zk, xk, codes, cos, sin, n_child, use_reentrant=False)
-            else:
-                yk, zk = self._cycle_fn(yk, zk, xk, codes, cos, sin, n_child)
+            ckpt = cfg.grad_ckpt_children and torch.is_grad_enabled()
+            yk, zk = self._cycle_fn(yk, zk, xk, codes, cos, sin, n_child, ckpt)
         ys, zs = yk.view(B, K, L, D), zk.view(B, K, L, D)
         q_parent = self._q(y)
         q_children = self._q(yk).view(B, K)

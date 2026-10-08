@@ -52,13 +52,14 @@ def test_tau_schedule_endpoints():
     assert math.isclose(tau_at(cfg, 1.0), 0.02) and 0.02 < tau_at(cfg, 0.15) < 1.0
 
 
-def test_wta_gradient_goes_to_the_winner():
-    K, L = 3, 4
+def test_wta_gradient_is_weighted_ce_gradient():
+    """Each child's gradient equals w_k times the gradient of its own CE; at tau->0 w = (1-eps+eps/K, eps/K, ...)."""
+    K, L, eps = 3, 4, 0.05
     labels = torch.randint(2, 12, (1, L))
     target = torch.nn.functional.one_hot(labels, 12).float() * 6
-    child = torch.randn(1, K, L, 12)
-    child[0, 2] = target[0]  # child 2 is (nearly) right
-    child.requires_grad_(True)
+    base = torch.randn(1, K, L, 12)
+    base[0, 2] = target[0]  # child 2 is (nearly) right
+    child = base.clone().requires_grad_(True)
     out = RoundOut(
         logits=target.clone(),
         q=torch.zeros(1),
@@ -68,12 +69,15 @@ def test_wta_gradient_goes_to_the_winner():
         join_entropy=torch.zeros(1),
         carry=Carry(torch.zeros(1), torch.zeros(1)),
     )
-    loss, m = Objective(ObjectiveCfg(lambda_q=0.0, tau_end=1e-3))(out, {"labels": labels}, progress=1.0)
+    cfg = ObjectiveCfg(lambda_q=0.0, lambda_wta=1.0, wta_eps=eps, tau_end=1e-4)
+    loss, m = Objective(cfg)(out, {"labels": labels}, progress=1.0)
     loss.backward()
-    g = child.grad.abs().sum((-1, -2))[0]
     assert m["winner"].item() == 2
-    assert g[2] > 0, "the winner must receive gradient"
-    assert g[0] / g.sum() < 0.1 and g[1] / g.sum() < 0.1, "losers get only the eps share"
+    expected_w = torch.tensor([eps / K, eps / K, 1 - eps + eps / K])
+    for k in range(K):
+        own = base.clone().requires_grad_(True)
+        row_ce(own[:, k], labels).sum().backward()
+        torch.testing.assert_close(child.grad[0, k], expected_w[k] * own.grad[0, k], atol=1e-6, rtol=1e-4)
 
 
 def test_subgoal_term_claims_closest_child():

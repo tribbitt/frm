@@ -30,9 +30,9 @@ def record_cycles(model):
     calls = []
     inner = model._cycle_fn
 
-    def wrapped(y, z, x, c, cos, sin, n):
+    def wrapped(y, z, x, c, cos, sin, n, ckpt=False):
         calls.append((y.shape[0], torch.is_grad_enabled(), c is not None))
-        return inner(y, z, x, c, cos, sin, n)
+        return inner(y, z, x, c, cos, sin, n, ckpt)
 
     model._cycle_fn = wrapped
     return calls
@@ -40,6 +40,22 @@ def record_cycles(model):
 
 def nonzero_grad(p):
     return p.grad is not None and bool(p.grad.abs().sum() > 0)
+
+
+def test_child_checkpointing_is_exact():
+    """Per-pass activation checkpointing of child cycles changes memory, not values or gradients."""
+    grads = []
+    for ckpt in (False, True):
+        m = make(K=3, grad_ckpt_children=ckpt)
+        x, ids, labels = inputs()
+        out = m.round(m.init_carry(B, S, torch.device("cpu"), torch.float32), x, ids)
+        row_ce(out.logits, labels).mean().backward()
+        grads.append([None if p.grad is None else p.grad.clone() for p in m.parameters()])
+        assert m.passes_per_round()[2] == (3 * (m.cfg.L_cycles + 1) if ckpt else 0)
+    for a, b in zip(*grads):
+        assert (a is None) == (b is None)
+        if a is not None:
+            torch.testing.assert_close(a, b)
 
 
 def test_fork_gate():
