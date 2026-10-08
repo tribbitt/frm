@@ -84,6 +84,7 @@ class TrainCfg:
 class EvalCfg:
     splits: list[str] = field(default_factory=lambda: ["dev", "dev_composite"])
     max_versions: int = 32
+    max_tasks: int = 256  # per split, deterministic hash-ordered subset (0 = all); ARC dev has ~140 tasks
     tokens_per_batch: int = 400_000
     max_rows: int = 2048
     rounds: int = 16

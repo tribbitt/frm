@@ -42,7 +42,8 @@ class RoundOut:
     child_q: torch.Tensor | None  # [B, K] float32
     join_alpha: torch.Tensor | None  # [B, K+1] join weights averaged over grid cells (slot 0 = parent)
     join_entropy: torch.Tensor | None  # [B] mean per-cell entropy of the join weights
-    carry: Carry  # detached
+    carry: Carry | None  # detached; None in outputs kept for instruments (frm.evaluate.run_rounds)
+    pre_logits: torch.Tensor | None = None  # [B, S*S, V] parent readout just before the fork (detached; instruments)
 
 
 class Refiner(nn.Module):
@@ -74,7 +75,15 @@ class Refiner(nn.Module):
 
     # ------------------------------------------------------------------ basics
     def compile_cycles(self, **kwargs) -> None:
-        """torch.compile the cycle (one graph per canvas size); call before training/eval on GPU."""
+        """torch.compile the cycle; call before training/eval on GPU.
+
+        One graph per (bucket, batch size, grad mode, child/parent variant): ~3 per bucket in training plus eval
+        variants, well over dynamo's default limit of 8, after which it silently falls back to eager."""
+        import torch._dynamo
+
+        for name in ("recompile_limit", "cache_size_limit", "accumulated_recompile_limit", "accumulated_cache_size_limit"):
+            if hasattr(torch._dynamo.config, name):
+                setattr(torch._dynamo.config, name, max(getattr(torch._dynamo.config, name), 512))
         self._cycle_fn = torch.compile(self._cycle, dynamic=False, **kwargs)
 
     def init_carry(self, B: int, S: int, device: torch.device, dtype: torch.dtype) -> Carry:
@@ -125,11 +134,11 @@ class Refiner(nn.Module):
             codes = codes + c[:, None]
         return codes
 
-    def _join(self, y, z, ys, zs, q_parent, q_children, cf):
+    def _join(self, y, z, ys, zs, q_parent, q_children, cf, sham_perm):
         """Per-cell softmax attention of the parent over {parent, children}; returns new (y, z) and stats."""
-        B, K = ys.shape[0], ys.shape[1]
         if cf == "sham":  # children of another row: tests whether the parent uses child *content*
-            ys, zs, q_children = ys.roll(1, dims=0), zs.roll(1, dims=0), q_children.roll(1, dims=0)
+            perm = sham_perm if sham_perm is not None else torch.roll(torch.arange(ys.shape[0], device=ys.device), 1)
+            ys, zs, q_children = ys[perm], zs[perm], q_children[perm]
         Y = torch.cat([y[:, None], ys], dim=1)  # [B, K+1, L, D]
         Z = torch.cat([z[:, None], zs], dim=1)
         qv = self.join_q(rms_norm(z, self.cfg.rms_eps))  # [B, L, d]
@@ -148,8 +157,10 @@ class Refiner(nn.Module):
         ent = -(grid_alpha.clamp_min(1e-9).log() * grid_alpha).sum(1).mean(-1)
         return y_new, z_new, grid_alpha.mean(-1), ent
 
-    def _node(self, y, z, x, c, depth: int, cos, sin, cf):
-        """Fork K children (each a node one level deeper), join them, run the post cycle. Returns children too."""
+    def _node(self, y, z, x, c, depth: int, cos, sin, cf, sham_perm=None):
+        """Fork K children (each a node one level deeper), join them, run the post cycle. Returns children too.
+
+        Counterfactual modes apply to the root join only (depth 0)."""
         cfg = self.cfg
         B, L, D = y.shape
         K = cfg.K
@@ -158,7 +169,7 @@ class Refiner(nn.Module):
         zk = z[:, None].expand(B, K, L, D).reshape(B * K, L, D)
         xk = x[:, None].expand(B, K, L, D).reshape(B * K, L, D)
         if depth + 1 < cfg.fork_depth:
-            yk, zk, _ = self._node(yk, zk, xk, codes, depth + 1, cos, sin, cf)
+            yk, zk, _ = self._node(yk, zk, xk, codes, depth + 1, cos, sin, None)
         else:
             n_child = cfg.child_L_cycles or cfg.L_cycles
             ckpt = cfg.grad_ckpt_children and torch.is_grad_enabled()
@@ -166,7 +177,7 @@ class Refiner(nn.Module):
         ys, zs = yk.view(B, K, L, D), zk.view(B, K, L, D)
         q_parent = self._q(y)
         q_children = self._q(yk).view(B, K)
-        y, z, alpha, ent = self._join(y, z, ys, zs, q_parent, q_children, cf)
+        y, z, alpha, ent = self._join(y, z, ys, zs, q_parent, q_children, cf, sham_perm)
         y, z = self._cycle_fn(y, z, x, c, cos, sin, cfg.L_cycles)
         return y, z, (ys, q_children, alpha, ent)
 
@@ -177,8 +188,18 @@ class Refiner(nn.Module):
     def _logits(self, y: torch.Tensor) -> torch.Tensor:
         return self.lm_head(y[..., self.cfg.prefix_len :, :]).float()
 
-    def round(self, carry: Carry, inputs: torch.Tensor, puzzle_ids: torch.Tensor, cf: str | None = None) -> RoundOut:
-        """One deep-supervision round. Gradient flows only if grad mode is enabled by the caller."""
+    def round(
+        self,
+        carry: Carry,
+        inputs: torch.Tensor,
+        puzzle_ids: torch.Tensor,
+        cf: str | None = None,
+        sham_perm: torch.Tensor | None = None,
+    ) -> RoundOut:
+        """One deep-supervision round. Gradient flows only if grad mode is enabled by the caller.
+
+        ``cf``: None, "nofork" (root join forced onto the parent slot) or "sham" (root join reads the children of row
+        ``sham_perm[b]``; default: the next row)."""
         assert cf in CF_MODES
         cfg = self.cfg
         S = int(round(math.sqrt(inputs.shape[1])))
@@ -186,7 +207,7 @@ class Refiner(nn.Module):
         x = self.embed(inputs, puzzle_ids, y.dtype)
         cos, sin = self.rope(S, y.device)
         n = cfg.L_cycles
-        child_logits = child_q = alpha = ent = None
+        child_logits = child_q = alpha = ent = pre_logits = None
         if cfg.K == 0:
             with torch.no_grad():
                 for _ in range(cfg.H_cycles - cfg.grad_cycles):
@@ -197,7 +218,8 @@ class Refiner(nn.Module):
             with torch.no_grad():
                 for _ in range(cfg.H_cycles - 2):
                     y, z = self._cycle_fn(y, z, x, None, cos, sin, n)
-            y, z, (ys, child_q, alpha, ent) = self._node(y, z, x, None, 0, cos, sin, cf)
+                pre_logits = self._logits(y)
+            y, z, (ys, child_q, alpha, ent) = self._node(y, z, x, None, 0, cos, sin, cf, sham_perm)
             child_logits = self._logits(ys)
         return RoundOut(
             logits=self._logits(y),
@@ -207,6 +229,7 @@ class Refiner(nn.Module):
             join_alpha=alpha,
             join_entropy=ent,
             carry=Carry(y.detach(), z.detach()),
+            pre_logits=pre_logits,
         )
 
     # ------------------------------------------------------------------ accounting

@@ -257,6 +257,22 @@ def test_poisoning_leaves_everything_but_test_outputs_unchanged(built, poisoned)
     assert ma == mb
 
 
+def test_composite_bucket_ignores_held_out_targets():
+    """Held-out (dev_composite) outputs and sub-goals must not choose the canvas; demo sub-goals must fit it."""
+    from frm.data.build import Record, _bucket
+
+    rng = np.random.default_rng(0)
+    demos = [{"input": _rand_grid(rng, 4, 4).tolist(), "output": _rand_grid(rng, 4, 4).tolist(),
+              "subgoals": [_rand_grid(rng, 4, 4).tolist()]} for _ in range(4)]
+    small = [{"input": _rand_grid(rng, 4, 4).tolist(), "output": _rand_grid(rng, 4, 4).tolist(),
+              "subgoals": [_rand_grid(rng, 4, 4).tolist()]}]
+    big = [dict(small[0], output=_rand_grid(rng, 20, 20).tolist(), subgoals=[_rand_grid(rng, 25, 25).tolist()])]
+    rec = lambda held: Record("comp:x", "composite", {"train": demos, "test": held}, demos, "dev_composite", held)  # noqa: E731
+    assert _bucket(rec(small)) == _bucket(rec(big)) == 8
+    demos[0]["subgoals"] = [_rand_grid(rng, 11, 11).tolist()]
+    assert _bucket(rec(small)) == 12
+
+
 def test_no_test_output_in_train_rows(poisoned):
     ds = Dataset(poisoned)
     train_grids = {(g.shape, g.tobytes()) for pairs in _train_task_grids(ds).values()
@@ -303,7 +319,8 @@ def test_eval_rows_untranslated_and_keys(ds):
             seen_first: set[tuple[str, int]] = set()
             for b in batches:
                 assert b["inputs"].dtype == np.uint8 and b["labels"].dtype == np.int16
-                assert ("subgoals" in b) == (split == "dev_composite")
+                # sub-goal arrays exist only where the stored split has sub-goals, which only composites have
+                assert "subgoals" not in b or split == "dev_composite"
                 for k, (task_id, idx, pid) in enumerate(b["keys"]):
                     n_rows += 1
                     tid, v = _version(ds, pid)

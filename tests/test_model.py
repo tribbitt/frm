@@ -61,15 +61,20 @@ def test_child_checkpointing_is_exact():
 def test_fork_gate():
     """Children run with grad inside the round; the parent loss alone trains codes, join and children."""
     m = make(K=4)
+    with torch.no_grad():  # at init q_head.weight = 0 makes every q equal, so beta's gradient is exactly 0 by symmetry
+        m.q_head.weight.normal_(0, 0.1)
     calls = record_cycles(m)
     x, ids, labels = inputs()
     out = m.round(m.init_carry(B, S, torch.device("cpu"), torch.float32), x, ids)
     assert (B * 4, True, True) in calls, f"no child cycle with grad: {calls}"
     assert calls[0] == (B, False, False), "pre-fork parent cycle must run without grad"
     row_ce(out.logits, labels).mean().backward()  # parent loss only
+    scale = m.join_q.weight.grad.abs().mean()
+    assert scale > 0
     for name in ("codes", "code_up", "join_beta"):
-        assert nonzero_grad(getattr(m, name)), f"{name} receives no gradient from the parent loss"
-    assert nonzero_grad(m.join_q.weight) and nonzero_grad(m.join_k.weight)
+        g = getattr(m, name).grad
+        assert g is not None and g.abs().mean() > 1e-3 * scale, f"{name} receives no gradient from the parent loss"
+    assert m.join_k.weight.grad.abs().mean() > 1e-3 * scale
     assert all(nonzero_grad(p) for p in m.blocks.parameters())
 
 

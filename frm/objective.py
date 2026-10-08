@@ -69,7 +69,9 @@ class Objective:
     def __init__(self, cfg: ObjectiveCfg):
         self.cfg = cfg
 
-    def __call__(self, out: RoundOut, batch: dict[str, torch.Tensor], progress: float):
+    def __call__(self, out: RoundOut, batch: dict[str, torch.Tensor], progress: float, has_subgoals: bool | None = None):
+        """``has_subgoals``: host-side flag for whether any row carries sub-goals (None: read it from the batch,
+        which costs a device sync)."""
         cfg = self.cfg
         labels = batch["labels"]
         ce_parent = row_ce(out.logits, labels)
@@ -95,7 +97,6 @@ class Objective:
             m.update(
                 {
                     "wta": wta.detach(),
-                    "tau": torch.full_like(wta, tau),
                     "child_ce_min": ce_child.detach().min(-1).values,
                     "child_exact_any": exact_child.any(-1),
                     "winner": ce_child.detach().argmin(-1),
@@ -104,7 +105,9 @@ class Objective:
                     "join_entropy": out.join_entropy,
                 }
             )
-            if "subgoals" in batch and batch["subgoal_mask"].any():
+            if has_subgoals is None:
+                has_subgoals = "subgoals" in batch and bool(batch["subgoal_mask"].any())
+            if has_subgoals:
                 sub, sub_cov = self._subgoal_term(out.child_logits, batch["subgoals"], batch["subgoal_mask"], tau)
                 per_row = per_row + cfg.lambda_sub * sub
                 m["sub"] = sub.detach()

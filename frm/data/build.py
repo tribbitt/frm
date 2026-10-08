@@ -96,10 +96,12 @@ def composite_records(path: str) -> list[Record]:
 
 
 def _bucket(rec: Record) -> int:
-    if rec.source == "composite":
-        grids = [g for ex in rec.train + rec.eval_pairs for g in (ex["input"], ex["output"], *ex.get("subgoals", []))]
-        return smallest_bucket(max(max(len(g), len(g[0])) for g in grids))
-    return choose_bucket({"train": rec.train, "test": [{"input": ex["input"]} for ex in rec.eval_pairs]})
+    """Smallest bucket for demos (with their sub-goals), held-out inputs and the size rule; never held-out targets."""
+    S = choose_bucket({"train": rec.train, "test": [{"input": ex["input"]} for ex in rec.eval_pairs]})
+    demo_sub = [g for ex in rec.train for g in ex.get("subgoals", [])]
+    if demo_sub:
+        S = max(S, smallest_bucket(max(max(len(g), len(g[0])) for g in demo_sub)))
+    return S
 
 
 def collect(args: argparse.Namespace) -> list[Record]:
@@ -157,6 +159,11 @@ def _write_split(path: str, S: int, recs: list[Record], pairs_of, overflow: list
             out_hw[e] = g.shape
         for m, sg in enumerate(ex.get("subgoals", [])):
             g = _check_grid(sg)
+            if not fits(max(g.shape), S):
+                if split == "train":
+                    raise AssertionError(f"train sub-goal of {r.task_id} overflows its bucket {S}")
+                overflow.append([split, r.task_id, int(i), *g.shape, S])
+                g = g[:S, :S]
             sub[e, m, : g.shape[0], : g.shape[1]] = g
             sub_hw[e, m] = g.shape
     counts = np.array([len(pairs_of(r)) for r in recs], dtype=np.int32)
@@ -282,7 +289,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--out", required=True)
     ap.add_argument("--n_aug", type=int, default=300)
     ap.add_argument("--n_aug_composite", type=int, default=20)
-    ap.add_argument("--dev_frac", type=float, default=0.1)
+    ap.add_argument("--dev_frac", type=float, default=0.25, help="fraction of training tasks whose test pairs are dev")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
     if not args.sources and not args.composite:

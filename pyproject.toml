@@ -1,0 +1,19 @@
+[project]
+name = "frm"
+version = "0.1.0"
+description = "Forking Refinement Model: a TRM-derived tied-weight refiner that forks every round, for ARC-AGI"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.5", "numpy>=1.26"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["frm*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120

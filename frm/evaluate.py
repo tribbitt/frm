@@ -5,11 +5,13 @@
 Voting follows TRM (trm-samsung/evaluators/arc.py:107-177): each version's prediction is cropped, de-augmented and
 hashed; candidates rank by (votes, mean sigmoid(q)); the top two are the attempts. Score = mean over tasks of the
 fraction of their test inputs with a correct attempt (official ARC metric). Reading split ``test`` needs ``--final``.
+Per-task outcomes are stored so arms can be compared with paired statistics (``scripts/compare.py``).
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import sys
@@ -23,7 +25,7 @@ from frm.config import Cfg, EvalCfg
 from frm.data.augment import Version
 from frm.data.encode import crop
 from frm.data.loader import Dataset, eval_batches
-from frm.model.refiner import Refiner
+from frm.model.refiner import Refiner, RoundOut
 from frm.objective import row_exact
 
 
@@ -59,9 +61,9 @@ class Votes:
         return out
 
 
-def score(votes: Votes, tasks: dict[str, dict]) -> dict[str, float]:
-    """Official ARC scoring for tasks with known outputs."""
-    p1, p2 = [], []
+def score(votes: Votes, tasks: dict[str, dict]) -> dict:
+    """Official ARC scoring for tasks with known outputs, plus per-task pass@2 for paired comparisons."""
+    p1, per_task = [], {}
     for tid, task in tasks.items():
         s1 = s2 = 0.0
         tests = task["test"]
@@ -71,12 +73,16 @@ def score(votes: Votes, tasks: dict[str, dict]) -> dict[str, float]:
             sol = np.asarray(t["output"], dtype=np.uint8)
             att = votes.ranked((tid, i))[:2]
             ok = [a.shape == sol.shape and bool((a == sol).all()) for a in att]
-            s1 += float(bool(ok[:1] and ok[0]))
+            s1 += float(bool(ok) and ok[0])
             s2 += float(any(ok))
         p1.append(s1 / len(tests))
-        p2.append(s2 / len(tests))
-    return {"pass@1": float(np.mean(p1)) if p1 else float("nan"), "pass@2": float(np.mean(p2)) if p2 else float("nan"),
-            "n_tasks": len(p1)}
+        per_task[tid] = s2 / len(tests)
+    return {
+        "pass@1": float(np.mean(p1)) if p1 else float("nan"),
+        "pass@2": float(np.mean(list(per_task.values()))) if per_task else float("nan"),
+        "n_tasks": len(per_task),
+        "per_task": per_task,
+    }
 
 
 def attempts(votes: Votes, tasks: dict[str, dict]) -> dict[str, list[dict]]:
@@ -98,22 +104,58 @@ def _rows_per_batch(model: Refiner, S: int, ecfg: EvalCfg) -> int:
     return max(1, min(ecfg.max_rows, ecfg.tokens_per_batch // (L * width)))
 
 
+def _pad(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """Repeat row 0 up to ``rows`` so every batch of a bucket has one shape (one compiled graph)."""
+    return t if t.shape[0] == rows else torch.cat([t, t[:1].expand(rows - t.shape[0], *t.shape[1:])])
+
+
+def _trim(out: RoundOut, n: int) -> RoundOut:
+    """Drop the padding rows added by :func:`_pad`."""
+    if out.logits.shape[0] == n:
+        return out
+
+    def cut(t):
+        return None if t is None else t[:n]
+
+    return RoundOut(
+        logits=out.logits[:n],
+        q=out.q[:n],
+        child_logits=cut(out.child_logits),
+        child_q=cut(out.child_q),
+        join_alpha=cut(out.join_alpha),
+        join_entropy=cut(out.join_entropy),
+        carry=None,
+        pre_logits=cut(out.pre_logits),
+    )
+
+
+def sham_perm(tasks: list[str], device: torch.device) -> torch.Tensor:
+    """perm[b] = a row of a *different* task (searching from half a batch away); the next row if the batch has one task.
+
+    Neighbouring eval rows are other versions of the same test input, so rolling by one would hand a row children that
+    solve its own task in another orientation."""
+    B = len(tasks)
+    perm = []
+    for b in range(B):
+        offsets = ((b + s) % B for s in range(B // 2, B // 2 + B))
+        perm.append(next((j for j in offsets if tasks[j] != tasks[b]), (b + 1) % B))
+    return torch.tensor(perm, device=device)
+
+
 @torch.no_grad()
-def run_rounds(model: Refiner, inputs, ids, rounds: int, dtype, cf: str | None = None, reset_at: int | None = None):
-    """Run ``rounds`` rounds from the init carry. Returns per-round parent logits argmax/q and the final RoundOut."""
+def run_rounds(model: Refiner, inputs, ids, rounds: int, dtype, cf=None, perm=None, reset_at=None) -> list[RoundOut]:
+    """Run ``rounds`` rounds from the init carry; one RoundOut per round, without its carry (only the next round needs
+    it, and 16 kept carries would cost ~16x the state memory)."""
     S = int(round(inputs.shape[1] ** 0.5))
     carry = model.init_carry(inputs.shape[0], S, inputs.device, dtype)
-    preds, qs, logits = [], [], []
-    out = None
+    outs = []
     for r in range(1, rounds + 1):
         if reset_at is not None and r == reset_at:
             carry = model.init_carry(inputs.shape[0], S, inputs.device, dtype)
-        out = model.round(carry, inputs, ids, cf=cf)
+        out = model.round(carry, inputs, ids, cf=cf, sham_perm=perm)
         carry = out.carry
-        preds.append(out.logits.argmax(-1))
-        qs.append(out.q)
-        logits.append(out.logits)
-    return preds, qs, logits, out
+        outs.append(dataclasses.replace(out, carry=None))
+    return outs
 
 
 @torch.no_grad()
@@ -127,43 +169,74 @@ def evaluate_split(
     counterfactuals: bool = False,
     keep_attempts: bool = False,
 ) -> dict:
+    """Per-round voted pass@k plus the fork and depth instruments of DESIGN.md §7 on one split."""
     model.eval()
     R, K = ecfg.rounds, model.cfg.K
     tasks = ds.tasks(split)
+    if split != "test" and ecfg.max_tasks and len(tasks) > ecfg.max_tasks:  # test (and Kaggle) is always complete
+        keep = sorted(tasks, key=lambda t: hashlib.sha1(t.encode()).hexdigest())[: ecfg.max_tasks]
+        tasks = {t: tasks[t] for t in keep}
     versions: dict[int, Version] = {}
     per_round = [Votes() for _ in range(R)]
     child_votes = Votes()
-    row_exact_r = np.zeros(R)
+    exact_r = np.zeros(R)  # labelled rows exact at round r
+    first_solve = np.zeros(R)  # labelled rows exact for the first time at round r
+    regress = np.zeros(R)  # labelled rows exact at r-1 and wrong at r
+    by_k: dict[int, np.ndarray] = {}  # composites: exact rows by round, per composition depth k
+    n_k: dict[int, int] = defaultdict(int)
     n_rows = n_labeled = 0
-    fork = defaultdict(float)
-    cf_acc = defaultdict(float)
+    fork: dict[str, float] = defaultdict(float)
+    cf_acc: dict[str, float] = defaultdict(float)
     cf_rows = 0
-    for S in ds.buckets:
-        for batch in eval_batches(ds, split, S, _rows_per_batch(model, S, ecfg), ecfg.max_versions):
+    buckets = [S for S in ds.buckets if ds.has_split(S, split)]
+    cf_budget = ecfg.cf_rows // max(1, len(buckets))  # counterfactual rows per bucket: every canvas size is represented
+    for S in buckets:
+        rows = _rows_per_batch(model, S, ecfg)
+        cf_done = 0
+        for batch in eval_batches(ds, split, S, rows, ecfg.max_versions, set(tasks)):
             keys = batch["keys"]
-            inputs = torch.from_numpy(batch["inputs"]).long().to(device)
-            ids = torch.from_numpy(batch["puzzle_ids"]).long().to(device)
+            n = len(keys)
+            inputs = _pad(torch.from_numpy(batch["inputs"]).long().to(device), rows)
+            ids = _pad(torch.from_numpy(batch["puzzle_ids"]).long().to(device), rows)
             labels = torch.from_numpy(batch["labels"]).long().to(device)
             labeled = (labels != -100).any(-1)
-            preds, qs, logits, out = run_rounds(model, inputs, ids, R, dtype)
-            n_rows += len(keys)
+            outs = [_trim(o, n) for o in run_rounds(model, inputs, ids, R, dtype)]
+            n_rows += n
             n_labeled += int(labeled.sum())
+            exact = torch.stack([row_exact(o.logits, labels) & labeled for o in outs])  # [R, n]
+            exact_np = exact.cpu().numpy()
+            exact_r += exact_np.sum(1)
+            seen = np.zeros(n, dtype=bool)
             for r in range(R):
-                row_exact_r[r] += float((row_exact(logits[r], labels) & labeled).sum())
-            preds_np = [p.to(torch.uint8).cpu().numpy() for p in preds]
-            qs_np = [torch.sigmoid(q).float().cpu().numpy() for q in qs]
+                first_solve[r] += (exact_np[r] & ~seen).sum()
+                if r:
+                    regress[r] += (exact_np[r - 1] & ~exact_np[r]).sum()
+                seen |= exact_np[r]
+            comp = np.array([k[0].startswith("comp:") for k in keys])
+            if comp.any():  # composition depth k = 1 + number of intermediates (buckets without any store none)
+                ks = batch["subgoal_mask"].sum(-1) + 1 if "subgoal_mask" in batch else np.ones(n, dtype=np.int64)
+                for k in np.unique(ks[comp]):
+                    sel = comp & (ks == k)
+                    by_k.setdefault(int(k), np.zeros(R))
+                    by_k[int(k)] += exact_np[:, sel].sum(1)
+                    n_k[int(k)] += int(sel.sum())
+            preds_np = [o.logits.argmax(-1).to(torch.uint8).cpu().numpy() for o in outs]
+            qs_np = [torch.sigmoid(o.q).float().cpu().numpy() for o in outs]
+            last = outs[-1]
             child_np = cq_np = None
-            if out.child_logits is not None:
-                child_np = out.child_logits.argmax(-1).to(torch.uint8).cpu().numpy()
-                cq_np = torch.sigmoid(out.child_q).float().cpu().numpy()
-                fork["parent_mass"] += float(out.join_alpha[:, 0].sum())
-                fork["join_entropy"] += float(out.join_entropy.sum())
-                ce = row_exact(out.child_logits, labels[:, None])
-                fork["child_exact_any"] += float((ce.any(-1) & labeled).sum())
-                fork["oracle_gain"] += float(((ce.any(-1) | row_exact(logits[-1], labels)) & labeled).sum())
-                preds_k = out.child_logits.argmax(-1)
-                same = (preds_k[:, :, None] == preds_k[:, None]).all(-1)
-                fork["distinct"] += float((~torch.tril(same, diagonal=-1).any(-1)).sum())
+            if K > 0:
+                child_np = last.child_logits.argmax(-1).to(torch.uint8).cpu().numpy()
+                cq_np = torch.sigmoid(last.child_q).float().cpu().numpy()
+                fork["parent_mass"] += float(last.join_alpha[:, 0].sum())
+                fork["join_entropy"] += float(last.join_entropy.sum())
+                child_exact = row_exact(last.child_logits, labels[:, None]).any(-1) & labeled
+                fork["child_exact_any"] += float(child_exact.sum())
+                fork["oracle"] += float((child_exact | exact[-1]).sum())
+                for o in outs:  # adoption: pre-fork parent wrong and some child right -> is the joined parent right?
+                    chance = labeled & ~row_exact(o.pre_logits, labels)
+                    chance &= row_exact(o.child_logits, labels[:, None]).any(-1)
+                    fork["adopt_den"] += float(chance.sum())
+                    fork["adopt_num"] += float((chance & row_exact(o.logits, labels)).sum())
             for b, (tid, ti, pid) in enumerate(keys):
                 v = versions.get(pid)
                 if v is None:
@@ -171,48 +244,63 @@ def evaluate_split(
                 for r in range(R):
                     per_round[r].add((tid, ti), v.invert(crop(preds_np[r][b], S)), float(qs_np[r][b]))
                 if child_np is not None:
+                    answers = [v.invert(crop(child_np[b, k], S)) for k in range(K)]
+                    fork["distinct"] += len({_hash(a) for a in answers})  # distinct cropped answers (what is voted)
                     for k in range(K):
-                        child_votes.add((tid, ti), v.invert(crop(child_np[b, k], S)), float(cq_np[b, k]))
-            if counterfactuals and K > 0 and cf_rows < ecfg.cf_rows and bool(labeled.any()):
-                m = labeled
-                base = row_exact(logits[-1], labels)[m].float().sum()
-                cf_rows += int(m.sum())
-                cf_acc["base"] += float(base)
-                for name, kw in (("nofork", {"cf": "nofork"}), ("sham", {"cf": "sham"}), ("reset@4", {"reset_at": 4})):
-                    _, _, lg, _ = run_rounds(model, inputs, ids, R, dtype, **kw)
-                    cf_acc[name] += float(row_exact(lg[-1], labels)[m].float().sum())
+                        child_votes.add((tid, ti), answers[k], float(cq_np[b, k]))
+            if counterfactuals and K > 0 and cf_done < cf_budget and bool(labeled.any()):
+                cf_done += n
+                cf_rows += int(labeled.sum())
+                cf_acc["base"] += float(exact[-1].sum())
+                perm = sham_perm([k[0] for k in keys] + [keys[0][0]] * (rows - n), device)
+                variants = (("nofork", {"cf": "nofork"}), ("sham", {"cf": "sham", "perm": perm}), ("reset@4", {"reset_at": 4}))
+                for name, kw in variants:
+                    o = _trim(run_rounds(model, inputs, ids, R, dtype, **kw)[-1], n)
+                    cf_acc[name] += float((row_exact(o.logits, labels) & labeled).sum())
 
     res: dict = {"split": split, "rows": n_rows, "rounds": R}
-    by_round = [score(v, tasks) for v in per_round]
-    res.update(by_round[-1])
+    scored = [score(v, tasks) for v in per_round]
+    final = scored[-1]
+    res.update({k: final[k] for k in ("pass@1", "pass@2", "n_tasks")})
+    res["per_task"] = {"pass@2": final["per_task"]}
+    lab = max(n_labeled, 1)
     res["by_round"] = {
-        "pass@1": [s["pass@1"] for s in by_round],
-        "pass@2": [s["pass@2"] for s in by_round],
-        "row_exact": (row_exact_r / max(n_labeled, 1)).round(5).tolist(),
+        "pass@1": [s["pass@1"] for s in scored],
+        "pass@2": [s["pass@2"] for s in scored],
+        "row_exact": (exact_r / lab).round(5).tolist(),
+        "first_solve": (first_solve / lab).round(5).tolist(),
+        "regress": (regress / lab).round(5).tolist(),
     }
     if R >= 4:
-        res["late_gain"] = by_round[-1]["pass@2"] - by_round[3]["pass@2"]
-        res["late_gain_rows"] = float(row_exact_r[-1] - row_exact_r[3]) / max(n_labeled, 1)
+        res["per_task"]["pass@2_r4"] = scored[3]["per_task"]
+        res["late_gain"] = final["pass@2"] - scored[3]["pass@2"]
+        res["late_gain_rows"] = float(exact_r[-1] - exact_r[3]) / lab
+    if by_k:
+        res["by_k"] = {k: {"rows": n_k[k], "row_exact": (by_k[k] / n_k[k]).round(5).tolist()} for k in sorted(by_k)}
     if K > 0:
+        children = score(child_votes, tasks)
         res["fork"] = {
             "parent_mass": fork["parent_mass"] / max(n_rows, 1),
             "join_entropy": fork["join_entropy"] / max(n_rows, 1),
             "distinct": fork["distinct"] / max(n_rows, 1),
-            "child_exact_any": fork["child_exact_any"] / max(n_labeled, 1),
-            "oracle_gain": fork["oracle_gain"] / max(n_labeled, 1) - row_exact_r[-1] / max(n_labeled, 1),
-            "children_only": score(child_votes, tasks),
+            "child_exact_any": fork["child_exact_any"] / lab,
+            "oracle_gain": (fork["oracle"] - exact_r[-1]) / lab,
+            "adopt": fork["adopt_num"] / fork["adopt_den"] if fork["adopt_den"] else None,
+            "adopt_chances": int(fork["adopt_den"]),
+            "children_only": {k: children[k] for k in ("pass@1", "pass@2", "n_tasks")},
         }
         if ecfg.child_vote_weight > 0:
-            res["fork"]["with_child_votes"] = score(per_round[-1].merged(child_votes, ecfg.child_vote_weight), tasks)
+            merged = score(per_round[-1].merged(child_votes, ecfg.child_vote_weight), tasks)
+            res["fork"]["with_child_votes"] = {k: merged[k] for k in ("pass@1", "pass@2", "n_tasks")}
         if cf_rows:
             res["cf"] = {k: (cf_acc[k] - cf_acc["base"]) / cf_rows for k in ("nofork", "sham", "reset@4")}
             res["cf"]["rows"] = cf_rows
             res["cf"]["base_exact"] = cf_acc["base"] / cf_rows
     if keep_attempts:
-        final = per_round[-1]
+        votes = per_round[-1]
         if K > 0 and ecfg.child_vote_weight > 0:
-            final = final.merged(child_votes, ecfg.child_vote_weight)
-        res["attempts"] = attempts(final, tasks)
+            votes = votes.merged(child_votes, ecfg.child_vote_weight)
+        res["attempts"] = attempts(votes, tasks)
     return res
 
 
@@ -240,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--data", default=None, help="override dataset root")
     ap.add_argument("--final", action="store_true", help="required to read split 'test'")
     ap.add_argument("--max_versions", type=int, default=None)
+    ap.add_argument("--max_tasks", type=int, default=None)
     ap.add_argument("--rounds", type=int, default=None)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--submission", default=None, help="write Kaggle submission.json here")
@@ -254,10 +343,9 @@ def main(argv: list[str] | None = None) -> int:
     dtype = pick_dtype(cfg.train.precision, device)
     if cfg.train.compile:
         model.compile_cycles()
-    if args.max_versions:
-        cfg.eval.max_versions = args.max_versions
-    if args.rounds:
-        cfg.eval.rounds = args.rounds
+    for name in ("max_versions", "max_tasks", "rounds"):
+        if getattr(args, name) is not None:
+            setattr(cfg.eval, name, getattr(args, name))
     ds = Dataset(cfg.data.root)
     res = evaluate_split(model, ds, args.split, cfg.eval, device, dtype, cfg.eval.counterfactuals, bool(args.submission))
     if args.submission:
@@ -266,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     out = run_dir / "eval" / f"{args.split}_step{ck.get('step')}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(res, indent=1))
-    print(json.dumps({k: v for k, v in res.items() if k != "by_round"}, indent=1))
+    print(json.dumps({k: v for k, v in res.items() if k not in ("by_round", "per_task")}, indent=1))
     return 0
 
 

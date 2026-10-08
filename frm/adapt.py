@@ -63,6 +63,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg.train.budget_pflops = float("inf")
     cfg.train.eval_every_pflops = float("inf")
     cfg.eval.splits = []
+    # The pretrained children are already specialised: continue at the final WTA temperature, do not re-anneal from 1.
+    cfg.objective.tau_start = cfg.objective.tau_end
     for item in args.overrides:
         cfg.override(item)
 

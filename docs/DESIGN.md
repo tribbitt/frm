@@ -78,7 +78,7 @@ sham-children counterfactual costs nothing. A negative result means redesign of 
 | D11 | deep supervision regime | TRM's online carry: one optimizer step per round, halted rows replaced, per-bucket carries | TRM's regime is what produced 40%+; frmv1/frmv2 replaced it with unrolled graphs and lost TRM's behaviour [M] | unrolled multi-segment graph per step |
 | D12 | optimizer | AdamW (0.9, 0.95), lr 1e-4, wd 0.1, warm-up 2k, constant; puzzle embedding SignSGD lr 1e-2 wd 0.1; EMA 0.999 | TRM `cfg_pretrain.yaml` (AdamATan2 replaced by AdamW: no CUDA extension to build on Kelvin) | Muon (misrouted in tiny [M]) |
 | D13 | halting | TRM: q_halt = BCE(current parent canvas exactly correct), halt when q>0 in training with 10% exploration, always 16 rounds at eval | TRM default; q also ranks votes and children | PonderNet/geometric priors (reward early exit [L: Ouro 2510.25741]) |
-| D14 | evaluation discipline | checkpoints chosen on **dev** (held-out test pairs of 10% of training tasks + held-out composite pairs); ARC eval test pairs read only for reported numbers | tiny/tinyv2.2 picked best.pt on eval test pairs [M] | selecting on eval |
+| D14 | evaluation discipline | checkpoints chosen on **dev** (held-out test pairs of 25% of training and concept tasks; composites are reported, not selected on); ARC eval test pairs read only for reported numbers | tiny/tinyv2.2 picked best.pt on eval test pairs [M] | selecting on eval |
 
 ---
 
@@ -100,11 +100,14 @@ sham-children counterfactual costs nothing. A negative result means redesign of 
 
 Each augmented version of each task has its own identifier and embedding row (512-d, zero-initialised, SignSGD).
 Identifier 0 is the blank. Versions = identity + `n_aug` random (dihedral ∈ 0..7, permutation of colours 1..9, colour 0
-fixed), deduplicated by puzzle hash (TRM `build_arc_dataset.py:126-164`). Default `n_aug=300` (ARC Prize's HRM analysis:
-300 ≈ max, 30 within 4pp [L]); `n_aug=1000` for a final run if dev says it matters.
+fixed), deduplicated by puzzle hash (TRM `build_arc_dataset.py:126-164`, but hashing demos and test *inputs* only, so the
+version table cannot depend on test outputs). Default `n_aug=300` (ARC Prize's HRM analysis: 300 ≈ max, 30 within
+4pp [L]); `n_aug=1000` for a final run if dev says it matters. Measured: `arc1` + 2000 composites at `n_aug=300` →
+324,368 identifiers, 71 MB on disk, built in ≈30 s [M].
 
-Augmentation is applied **on the fly** from the version table (dihedral id + permutation per identifier), so the stored
-dataset holds each base grid once.
+Augmentation and translation are applied **on the fly** from the version table (dihedral id + permutation per
+identifier), vectorised per batch (`frm/data/encode.py:render`; 23 ms for 4,096 rows at S=16 on a laptop CPU [M]), so
+the stored dataset holds each base grid once.
 
 ### 3.3 Size buckets
 
@@ -121,14 +124,17 @@ margin of +4 cells). **The test output is never read.** Measured on `trm-samsung
 | ARC-AGI-2 evaluation | 1/172 | 46 | 0.82 |
 | ConceptARC | 0/480 | 96 | 0.38 |
 
-Training rows of a task use the task's bucket. Translation: each training row is shifted by a fresh random offset at
-load time with probability 0.75 (input, output and sub-goals share the offset); test rows are never shifted.
+Training rows of a task use the task's bucket (for training tasks whose test pairs are training data, those pairs count
+as demos, so train rows never overflow). Translation: each training row is shifted by a fresh random offset at load
+time with probability 0.75 (input, output and sub-goals share the offset, and the EOS row/column always stays inside the
+canvas); dev/test rows are never shifted. A test output too large for its bucket (2 of 419 in `arc1`) is stored cropped
+and listed in `meta.json["overflow"]`; such a pair cannot be solved.
 
 ### 3.4 Sources and splits
 
 | source | contents | split use |
 |---|---|---|
-| `arc1` | ARC-AGI-1 training (400) + evaluation (400) + ConceptARC (160) | demos of all → train; test pairs of training/concept → train, except the **dev** hold-out (10% of training tasks by sha256 of task id); evaluation test pairs → test |
+| `arc1` | ARC-AGI-1 training (400) + evaluation (400) + ConceptARC (160) | demos of all → train; test pairs of training/concept → train, except the **dev** hold-out (`--dev_frac`, default 25% of training and concept tasks by sha256 of task id: 141 tasks); evaluation test pairs → test |
 | `arc2` | ARC-AGI-2 training (1000) + evaluation (120) + ConceptARC | same pattern with evaluation2 as test. ARC-AGI-2 training contains 376 ARC-AGI-1 eval tasks [M: `decomposition-solver-arc/decomp/harvest.py:72`], so `arc1` and `arc2` never mix |
 | `arc2-kaggle` | as `arc2` but **without** evaluation2 demos | Kaggle proxy: pretrain on this, then run the §8 adaptation on evaluation2 |
 | `composite` | synthetic f_k∘…∘f_1 tasks with intermediate grids (§3.5) | demos → train; 2 held-out pairs per task → `dev_composite` |
@@ -207,8 +213,10 @@ intermediate state is what TRM lacks (§1 claim 2).
   learned end to end.
 - **Injection.** c_k is added to the z-update input at **every** child z-update, so codes are always inside the gradient
   window.
-- **Batching.** Children are a batch expansion [B, K, L, D] → [B·K, L, D]; x is expanded as a view. No separate buckets,
-  no separate episodes (the frmv2 failure mode). Child cycles may use activation checkpointing (`grad_ckpt_children`).
+- **Batching.** Children are a batch expansion [B, K, L, D] → [B·K, L, D]. No separate buckets, no separate episodes
+  (the frmv2 failure mode). With `grad_ckpt_children`, every pass of a child cycle is checkpointed individually (only the
+  pass inputs are stored; one pass is recomputed at a time in backward) — exact, gated by
+  `test_child_checkpointing_is_exact`.
 - **Exchangeability.** Children are distinguished only by codes; the join is permutation-equivariant over children.
 
 ### 4.4 Join
@@ -276,19 +284,25 @@ discounting). No term rewards a difference between two model-controlled quantiti
   `trm.py:256`).
 - **Per-bucket carries.** One carry per bucket; each step picks a bucket with probability ∝ its share of training
   examples ÷ its rows-per-step, so every example is visited at the same rate. Rows per step: a token budget
-  (`tokens_per_step`, default 350k parent tokens, TRM-mode) divided by sequence length, capped at `max_rows`.
+  (`tokens_per_step`, default 120k parent tokens — the same for every arm, so batch size is not a confound; the A100
+  benchmark re-sizes it) divided by sequence length, capped at `max_rows`. Bucketed, 120k tokens is ≈750 rows at S=12 and
+  ≈130 at S=30 (TRM: 768 rows of 916 tokens, mostly padding).
 - **Sampling.** Group-balanced per bucket (TRM `puzzle_dataset.py`): epochs are permutations of base tasks; a draw picks a
-  random version of a task and yields its train examples. Source weights mix `arc*` and `composite`.
+  random version of a task and yields its train examples; rows of a draw left over are carried to the next request, not
+  discarded. Source weights mix `arc` and `composite` (default 0.75 / 0.25 of rows).
 - **Loss scaling.** Per-row loss averaged over the rows of the step, so step gradients are comparable across buckets.
 - **Optimizers.** AdamW (fused) on dense params; SignSGD with decoupled weight decay on the touched puzzle-embedding rows;
-  gradient clip 1.0 on dense params; warm-up 2,000 steps then constant (TRM). EMA 0.999 of dense params, evaluated and
-  saved alongside raw weights.
-- **Precision/speed.** bf16 autocast (fp16 + GradScaler path for V100), SDPA attention (flash), optional
-  `torch.compile` per bucket shape, optional activation checkpointing of child cycles.
+  gradient clip 1.0 on dense params; warm-up 2,000 steps then constant (TRM). EMA 0.999 of dense params; evaluation and
+  `best.pt` use EMA weights; `last.pt` holds raw weights + EMA + optimizer.
+- **Budget.** Training stops when the model's FLOP accounting reaches `budget_pflops` (or `max_steps`, or `max_hours`);
+  the objective's τ anneal is scheduled on the same progress fraction, so it is comparable across arms.
+- **Precision/speed.** bf16 compute with fp32 master weights (TRM's "casted" layers), fp16 + GradScaler on V100, SDPA
+  attention (flash), optional `torch.compile` of the cycle per bucket shape, per-pass checkpointing of child cycles.
 - **Fault tolerance.** Atomic checkpoints (`last.pt`: model, EMA, optimizer, embedding table, step, RNG, data-stream
   state) every `ckpt_minutes`; SIGTERM/SIGUSR1 → checkpoint and exit 0; `--resume auto`. Carries are not saved (in-flight
-  rows restart; harmless).
-- **Logs.** `train.jsonl` (losses, per-round metrics by round index, fork stats, throughput), `eval.jsonl`, `config.json`.
+  rows restart; harmless). `best.pt` = best dev pass@2 on the first listed eval split (ARC dev), ties to the later step.
+- **Logs.** `train.jsonl` (losses, per-round metrics by round index, first-solve and regression histograms, WTA winner
+  counts, fork stats, throughput, memory), `eval.jsonl`, `config.json`.
 
 ---
 
@@ -305,28 +319,33 @@ fraction of test inputs with a correct attempt (official ARC metric).
 
 ### 7.2 Fork instruments (each can fail in the direction of the failure)
 
-| metric | definition | failure it detects |
+Where each lives: training metrics in `train.jsonl` (mean and `_by_round`), evaluation metrics in `eval.jsonl` /
+`runs/X/eval/*.json` under `fork`, `cf`, `by_round`, `by_k`, `per_task`.
+
+| metric (key) | definition | failure it detects |
 |---|---|---|
-| `fork/parent_mass` | mean α₀ over cells | parent ignores children (→1) |
-| `fork/join_entropy` | mean per-cell entropy of α | degenerate uniform blending (→log(K+1)) |
-| `fork/win_rate[k]` | fraction of rows child k wins the WTA | dead children (any ≈0) |
-| `fork/distinct` | mean number of distinct child canvases per row | collapse (→1) |
-| `fork/oracle_gain` | exact(best child) − exact(parent, same round) | children cover nothing the parent lacks |
-| `fork/adopt` | P(parent correct after join ∣ some child correct, pre-fork parent wrong) | join cannot select |
-| `cf/sham` | Δ exact when children are rolled across rows before the join (eval) | parent does not use child *content* |
-| `cf/nofork` | Δ exact when α is forced onto the parent slot (eval) | trained parent does not rely on children |
-| `sub/coverage` | composites: fraction of rows where some child reproduces an intermediate grid exactly | no decomposition learned |
+| `parent_mass` (train, `fork.parent_mass`) | mean α₀ over grid cells | parent ignores children (→1) |
+| `join_entropy` | mean per-cell entropy of α | degenerate uniform blending (→log(K+1)) |
+| `win0..winK-1` (train) | fraction of rows each child wins the WTA | dead children (any ≈0) |
+| `distinct` (train: answers on supervised cells; eval: distinct cropped, de-augmented answers) | distinct child answers per row | collapse (→1) |
+| `child_exact_any`, `child_ce_min`, `fork.oracle_gain` | best child vs parent | children cover nothing the parent lacks |
+| `fork.adopt` (+ `adopt_chances`) | P(parent exact after the round ∣ pre-fork parent wrong, some child exact), over all rounds | join cannot select |
+| `cf.sham` | Δ exact at round 16 when every round's root join reads the children of a row from a **different task** | parent does not use child *content* |
+| `cf.nofork` | Δ exact when the root join is forced onto the parent slot | trained parent does not rely on children |
+| `sub_coverage` (train) | composites: fraction of intermediates some child reproduces exactly | no decomposition learned |
+
+Counterfactual rows are spread evenly over buckets (`eval.cf_rows` in total).
 
 ### 7.3 Depth instruments
 
-| metric | definition |
+| metric (key) | definition |
 |---|---|
-| `depth/acc@r` | parent exact (and pass@2 after voting) at round r = 1..16 on dev, eval, `dev_composite` |
-| `depth/late_gain` | acc@16 − acc@4 (the user's stated failure point) with paired-bootstrap CI |
-| `depth/first_solve` | histogram of the first round at which a row is correct; `depth/regress` = rows correct at r−1, wrong at r |
-| `depth/by_k` | acc@r on composites by composition depth k |
-| `cf/reset@r` | Δ acc when the carry is reset to init at round r (does round r+1 use the carry?) |
-| training | the same per-round exact/CE aggregated by each row's round index on the training stream |
+| `by_round.pass@2`, `by_round.row_exact` | voted pass@2 and unvoted row exact at round r = 1..16 |
+| `late_gain`, `late_gain_rows` | round 16 − round 4 (the user's stated failure point); `per_task` holds both rounds for paired CIs (`scripts/compare.py`) |
+| `by_round.first_solve`, `by_round.regress` | fraction of labelled rows first exact at round r; exact at r−1 but wrong at r |
+| `by_k` | composites: row exact by round for each composition depth k |
+| `cf.reset@4` | Δ exact at round 16 when the carry is reset to init at round 4 (do later rounds build on the carry?) |
+| training `*_by_round`, `first_solve`, `regress` | the same per-round quantities on the training stream, by each row's round index |
 
 ---
 
@@ -336,17 +355,19 @@ The track requires a Kaggle notebook, no internet, 2 attempts per test input, 12
 competitions/2026/arc-agi-2; hardware "announced at launch", Kaggle overview cites 96 GB GPU memory — re-check before
 packaging]. Puzzle identifiers do not exist for hidden tasks, so the submission runs one **adaptation stage**:
 
-1. Build the hidden tasks (`arc-agi_test_challenges.json`) with `frm.data.build --source kaggle`: demos → train rows,
-   test inputs → test rows, `n_aug` versions.
-2. Append their identifiers to the checkpoint's embedding table (new rows = mean of trained rows; old rows kept).
-3. Fine-tune **all** weights (McGovern: embeddings-only or LoRA was not enough [L]) on the hidden demos for a fixed
-   step budget sized to the time limit (`frm.adapt --time_budget_h`), optionally replaying a fraction of pretraining
-   rows.
-4. Run §7.1 inference and write `submission.json` (`{task_id: [{"attempt_1": grid, "attempt_2": grid}, ...]}`, one entry
-   per test input, padded by repeating attempt 1).
+1. Build the hidden tasks (`arc-agi_test_challenges.json`) with `frm.data.build --sources kaggle --challenges …`:
+   demos → train rows, test inputs → test rows, `n_aug` versions.
+2. The new dataset has its own identifier space; every row of its embedding table starts at the mean of the checkpoint's
+   trained rows (`frm.train.load_pretrained`). No pretraining rows are replayed.
+3. Fine-tune **all** weights (McGovern: embeddings-only or LoRA was not enough [L]) on the hidden demos for a wall-clock
+   budget (`frm.adapt --hours`, optionally `--max_steps`); the adaptation run is resumable like any training run.
+4. Run §7.1 inference with EMA weights on **every** test task (the `test` split is never subsampled) and write
+   `submission.json` (`{task_id: [{"attempt_1": grid, "attempt_2": grid}, ...]}`, one entry per test input, padded by
+   repeating attempt 1).
 
-The same script runs locally on `arc2-kaggle` + evaluation2 as the leaderboard proxy. Packaging: the `frm` package
-(pure PyTorch + NumPy, no compiled extensions), the checkpoint, and offline wheels if Kaggle's image lacks a dependency.
+The same script runs locally on `arc2-kaggle` + evaluation2 (with `--solutions`) as the leaderboard proxy. Packaging: the
+`frm` package (pure PyTorch + NumPy, no compiled extensions), the checkpoint, and offline wheels if Kaggle's image
+lacks a dependency. Adaptation and inference are single-GPU.
 
 ---
 
@@ -359,34 +380,45 @@ sample-round with H=3, n=4 (backward ≈ 2× forward on grad passes):
 |---|---|---|---|---|
 | `trm` (K=0) | 15 | 5 | 25 | 1.0 |
 | `trm_h2` (K=0, 2 grad cycles) | 15 | 10 | 35 | 1.4 |
-| FRM K=2 | 20 | 15 | 50 | 2.0 |
-| FRM K=4 | 30 | 25 | 80 | 3.2 |
-| FRM nested K=2, depth 2 | 40 | 35 | 110 | 4.4 |
+| FRM K=2 | 20 | 15 | 50 (+10 with child checkpointing) | 2.0 (2.4) |
+| FRM K=4 | 30 | 25 | 80 (+20) | 3.2 (4.0) |
+| FRM nested K=2, depth 2 | 40 | 35 | 110 (+20) | 4.4 (5.2) |
 
-Buckets cut the per-pass cost to ≈0.35–0.45 of a 916-token pass on ARC-AGI-1/2 training data (§3.3; attention more than
-that), so FRM K=4 on buckets costs ≈1.3× TRM on 30×30 per sample-round. TRM's ARC schedule is ≈1.59e20 FLOPs (≈3 days
-on 4×H100) [M: SpecTRM]. One A100 at a realistic 40% of bf16 peak ≈ 1.1e19 FLOP/day. Matched compute is enforced in
-`EXPERIMENTS.md` by giving every arm the same FLOP budget (`budget_pflops`), not the same step count.
+`Refiner.passes_per_round` computes these counts and `test_pass_accounting_matches_execution` checks them against the
+passes actually executed; `train_flops_per_row` converts them with the exact per-bucket pass cost
+`layers · L · (2·N_block + 4·L·d)`, which reproduces TRM's 398.1 GFLOP per 30×30 row-round [M]. Example-weighted over
+`arc1` training buckets: `trm` 142, `trm_h2` 199, FRM K=2 342, FRM K=4 570 GFLOP per row-round (child checkpointing on)
+— i.e. FRM K=4 on buckets costs ≈1.4× TRM on 30×30. TRM's ARC schedule is ≈1.59e20 FLOPs (≈3 days on 4×H100)
+[M: SpecTRM]. Matched compute is enforced in `EXPERIMENTS.md` by giving every arm the same `budget_pflops`.
 
-Memory: a grad cycle stores ≈155 KB of activations per token [I: per-block tensor count × bf16]; FRM K=4 stores
-(K+1)× the parent's. Child-cycle activation checkpointing trades +1 forward of the child cycles for ≈5× less child
-memory; the A100 benchmark (`EXPERIMENTS.md` T2) decides `grad_ckpt_children` and `tokens_per_step`.
+Memory [I, to be measured in T2]: a grad pass keeps ≈29·d values per token per block (q/k upcast for RoPE, SwiGLU
+intermediates, fp32 norm inputs) ≈ 60 KB per token per pass in bf16, so ≈300 KB per token per grad cycle. FRM K=4 without
+checkpointing holds (K+1)× that per parent token (≈1.5 MB); per-pass child checkpointing stores ≈2 KB per child pass plus
+one pass of transients, ≈0.6 MB per parent token in total. At 80 GB that bounds `tokens_per_step` near 130k for FRM K=4
+(hence the 120k default for every arm) and near 250k for `trm`.
 
 ---
 
 ## 10. Gates (must pass before any GPU job)
 
-`pytest -q` in `tests/`:
+`pytest -q` (84 tests, ≈25 s on a laptop CPU):
 
-- `test_data.py`: augmentation inverse round-trip for all 8 dihedral × random permutations; encode/crop round-trip;
-  bucket choice never reads test outputs (poisoning test); dev/test rows untranslated; version dedup.
-- `test_model.py`: `test_fork_gate` (child cycles executed; non-zero grads into codes, join, children from `L_parent`
-  alone), `test_trm_mode_matches_reference_structure`, `test_carry_detached`, `test_every_param_gets_grad`,
-  `test_inference_equals_training_forward`, `test_nested_fork_gate`.
-- `test_objective.py`: WTA weights sum to 1, winner gets ≥ 1−ε+ε/K at τ→0, uniform at τ→∞; sub-goal matching picks the
-  closest child; stablemax CE ignores PAD; q targets are exact-match.
-- `test_train_smoke.py`: a CPU run on a tiny dataset trains, checkpoints, is killed with SIGTERM, resumes, evaluates,
-  and writes a valid `submission.json`.
+- `test_data.py`: dihedral inverse for all 8 ids; version apply/invert round trip; dedup; encode/crop round trip in every
+  bucket; size rule and buckets unchanged when test outputs are poisoned (whole built dataset byte-identical except test
+  outputs); composite buckets ignore held-out targets; no test output in any train row; dev/test rows untranslated and
+  keyed consistently; `take()` shapes, translation keeps content and EOS, sub-goal masks, source weights, exact resume.
+- `test_composite.py`: determinism, filters (no single primitive or shorter program reproduces a task), detour quota,
+  sub-goals equal program prefixes, every primitive exercised.
+- `test_model.py`: `test_fork_gate` (child cycles run with grad; codes, join and β get gradient from `L_parent` alone),
+  `test_nested_fork_gate`, `test_trm_mode_matches_reference_structure` (K=0 equals an independent restatement of TRM's
+  round), carry detached and reset, `test_every_param_gets_grad`, inference == training forward,
+  `test_child_checkpointing_is_exact`, pass accounting == executed passes, counterfactual modes.
+- `test_objective.py`: stablemax normalised and NaN-free gradients, PAD ignored, WTA weights at τ→0/∞, each child's
+  gradient = w_k × its own CE gradient, sub-goal matching, distinct-answer count.
+- `test_evaluate.py`: official scoring and per-task outcomes, vote ranking, submission shape, sham children from other
+  tasks.
+- `test_train_smoke.py`: build → train → SIGTERM → resume (step count continues) → DONE → evaluate → `--final` guard →
+  adapt → valid `submission.json`.
 
 ---
 
@@ -394,28 +426,29 @@ memory; the A100 benchmark (`EXPERIMENTS.md` T2) decides `grad_ckpt_children` an
 
 ```
 frm/
-  config.py            dataclasses ModelCfg, ObjectiveCfg, DataCfg, TrainCfg, EvalCfg; Cfg.load(json) + dot-path CLI overrides
+  config.py            dataclasses ModelCfg, ObjectiveCfg, DataCfg, TrainCfg, EvalCfg; Cfg.load(json) + dot-path overrides
   data/
-    arc.py             load_tasks(path_or_name) -> {task_id: {"train": [...], "test": [...]}} ; solutions merged when present
-    augment.py         dihedral(grid, tid), inverse_dihedral(grid, tid), Version(tid, perm), apply/invert, make_versions(task, n, rng)
-    encode.py          PAD/EOS/colour layout: encode_grid(grid, S, offset) -> uint8[S*S]; crop(seq, S) -> grid
-    sizerule.py        predict_output_size(task, test_input) -> (h, w) | None ; choose_bucket(task) -> S
-    build.py           CLI: build a dataset dir from sources (arc1, arc2, arc2-kaggle, composite, kaggle)
-    loader.py          Dataset(dir): buckets, identifiers, version table; TrainStream(dataset, bucket, weights, rng).take(n) -> Batch;
-                       eval_batches(dataset, split, bucket, batch_rows) -> iterator of Batch with keys
-    composite.py       primitives, compose, generate(n_tasks, depth_range, seed) -> tasks with "subgoals"; CLI writes JSON
+    arc.py             load_tasks(challenges, solutions=None), load_subset(raw_dir, subset)
+    augment.py         dihedral / inverse_dihedral, Version(tid, perm).apply/invert/parse/name, make_versions
+    encode.py          PAD/EOS/colour layout: encode_grid, labels_from, crop, render (vectorised augment+translate)
+    sizerule.py        predict_output_size(task, test_input), choose_bucket(task) — never reads test outputs
+    build.py           CLI: dataset dir from --sources arc1|arc2|arc2-kaggle|kaggle and --composite JSON
+    loader.py          Dataset(root): buckets, identifiers, tasks(split), splits(); TrainStream(ds, S, rng, weights,
+                       translate_p).take(n) + state_dict; eval_batches(ds, split, S, rows, max_versions)
+    composite.py       33 primitives, generate(n_tasks, depth_range, seed, ...) with sub-goals; CLI writes JSON
   model/
-    layers.py          rms_norm, CastedLinear, SwiGLU, Attention (SDPA, 2D RoPE), Block
-    embedding.py       PuzzleEmbedding (buffer table, gather-to-leaf, SignSGD step, extend(n_new))
-    refiner.py         Refiner(ModelCfg): init_carry(B, S), round(carry, batch, mode) -> RoundOut
-  objective.py         Objective(ObjectiveCfg): __call__(RoundOut, batch, step) -> (loss, metrics)
-  train.py             CLI: python -m frm.train --config cfg.json --run_dir runs/X [key=value ...]
-  evaluate.py          CLI: per-round voting, pass@k, instruments, counterfactuals; writes eval json + submission.json
-  adapt.py             CLI: Kaggle adaptation (extend ids, fine-tune, predict, write submission)
-configs/               smoke.json, trm_a1.json, frm_a1.json, frm2_a1.json, frm_a2.json, frm_a2_kaggle.json
-kelvin/                env.sh, setup_env.sbatch, train.sbatch (3-day chained links), smoke.sbatch, k2 helper, README.md
-scripts/               fetch_data.py, bench.py
-tests/
+    layers.py          rms_norm, CastedLinear, SwiGLU, Rope2D, Attention (SDPA), Block, block_params
+    embedding.py       PuzzleEmbedding (buffer table, gather-to-leaf, SignSGD step)
+    refiner.py         Refiner(ModelCfg, num_ids): init_carry, reset_carry, round(carry, inputs, ids, cf) -> RoundOut,
+                       passes_per_round, train_flops_per_row, eval_flops_per_row, compile_cycles
+  objective.py         Objective(ObjectiveCfg)(RoundOut, batch, progress) -> (loss, per-row metrics)
+  train.py             CLI: python -m frm.train --config cfg.json --run_dir runs/X [--resume auto] [key=value ...]
+  evaluate.py          CLI + evaluate_split: per-round voting, pass@k, instruments, counterfactuals, submission
+  adapt.py             CLI: Kaggle adaptation (build, re-initialised ids, fine-tune, predict, write submission)
+configs/               trm_a1, trm_h2_a1, frm2_a1, frm_a1, nest_a1, frm_a2_kaggle, frm_a2; smoke; learn (CPU check)
+kelvin/                k2 helper, submit.sh (approval thresholds), jobs/{env.sh, setup_env, data, smoke, bench, train, eval}
+scripts/               fetch_data.py, bench.py, compare.py (paired bootstrap + McNemar between arms)
+tests/                 test_data, test_composite, test_model, test_objective, test_evaluate, test_train_smoke
 ```
 
 `Batch` (all torch tensors on device unless noted): `inputs` int [B, S²], `labels` int [B, S²] (−100 = ignore),
@@ -429,14 +462,14 @@ tests/
 
 ## 12. Risks and planned responses (redesign, never removal)
 
-| risk | detection | response |
-|---|---|---|
-| parent ignores children | `parent_mass → 1`, `cf/sham ≈ 0` | raise λ_wta; join-dropout (randomly mask the parent slot with p=0.25 in training); more pre-fork cycles so children start from a better state |
-| children collapse | `distinct → 1`, win rates degenerate | raise ε, slow τ anneal, per-child noise σ on codes |
-| fork costs more than it returns | matched-FLOP dev pass@2 below `trm` | K=2; cheaper children (`child_L_cycles=2`); fork every other round (`fork_every=2`) |
-| depth still unused | `late_gain ≈ 0` on dev and composites | raise composite fraction/depth; inspect `cf/reset@r`; increase rounds trained (exploration p) |
-| memory | OOM in T2 | child activation checkpointing; smaller `tokens_per_step` |
-| Kaggle hardware/time | adaptation does not fit 12 h | fewer versions at adaptation, fewer rounds at inference (per-round curves say where accuracy saturates) |
+| risk | detection | response | available today? |
+|---|---|---|---|
+| parent ignores children | `parent_mass → 1`, `cf/sham ≈ 0` | raise `objective.lambda_wta`; join-dropout (mask the parent slot with p=0.25 in training); more pre-fork cycles (`H_cycles=4`) so children start from a better state | λ_wta, H_cycles: config. join-dropout: a code change |
+| children collapse | `distinct → 1`, win rates degenerate | raise `objective.wta_eps`, slow the τ anneal (`tau_anneal_frac`), per-child noise on codes | ε, τ: config. noise: a code change |
+| fork costs more than it returns | matched-FLOP dev pass@2 below `trm` | K=2; cheaper children (`child_L_cycles=2`); fork only on alternate rounds | K, child_L_cycles: config. alternate rounds: a code change |
+| depth still unused | `late_gain ≈ 0` on dev and composites | raise composite fraction/depth (`data.source_weights`, generator `--depth_max`); inspect `cf/reset@4`; more rounds trained (`halt_explore`) | config |
+| memory | OOM in T2 | `grad_ckpt_children`; smaller `tokens_per_step` | config |
+| Kaggle hardware/time | adaptation does not fit 12 h | fewer versions (`--n_aug`), fewer inference rounds (`eval.rounds`; per-round curves say where accuracy saturates) | config |
 
 Any response that removes forking from the trained model is out of scope for the agent; it goes to the user as its own
 question with the sentence "after this, the model does not train forks".

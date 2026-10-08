@@ -222,15 +222,23 @@ class TrainStream:
 
 
 def eval_batches(
-    ds: Dataset, split: str, bucket: int, batch_rows: int, max_versions: int | None = None
+    ds: Dataset,
+    split: str,
+    bucket: int,
+    batch_rows: int,
+    max_versions: int | None = None,
+    tasks: set[str] | None = None,
 ) -> Iterator[dict]:
     """Untranslated rows of ``split`` in ``bucket``: every eval pair x the task's versions (identity first, at most
-    ``max_versions``), ordered by task, pair index, version. Yields nothing if the bucket has no such split."""
+    ``max_versions``), ordered by task, pair index, version; only tasks in ``tasks`` when given (batches stay full).
+    Yields nothing if the bucket has no such split."""
     if not ds.has_split(bucket, split):
         return
     d = ds.split_data(bucket, split)
     ex_l, vid_l, keys = [], [], []
     for t, task_id in enumerate(d.tasks):
+        if tasks is not None and task_id not in tasks:
+            continue
         nv = int(d.vcount[t]) if max_versions is None else min(int(d.vcount[t]), max_versions)
         vids = range(int(d.vstart[t]), int(d.vstart[t]) + nv)
         for e in range(int(d.ex_start[t]), int(d.ex_start[t + 1])):

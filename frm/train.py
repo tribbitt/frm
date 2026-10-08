@@ -26,9 +26,12 @@ from frm.config import Cfg
 from frm.data.loader import Dataset, TrainStream
 from frm.evaluate import evaluate_split
 from frm.model.refiner import Carry, Refiner
-from frm.objective import Objective
+from frm.objective import Objective, tau_at
 
-ROUND_METRICS = ("exact", "ce", "child_exact_any", "parent_mass", "distinct", "sub_coverage")
+ROUND_METRICS = (
+    "exact", "ce", "q_loss", "q_acc", "wta", "sub", "child_exact_any", "child_ce_min", "parent_mass", "join_entropy",
+    "distinct", "sub_coverage",
+)
 
 
 # ---------------------------------------------------------------------------------------------------- utilities
@@ -41,7 +44,8 @@ def pick_device(name: str) -> torch.device:
 def pick_dtype(precision: str, device: torch.device) -> torch.dtype:
     if precision == "auto":
         if device.type == "cuda":
-            return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            # Native bf16 only (A100/H100); V100 reports emulated bf16 as "supported" and is far faster in fp16.
+            return torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation=False) else torch.float16
         return torch.float32
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
@@ -96,6 +100,7 @@ class BucketState:
     halted: torch.Tensor  # [B] bool
     solved: torch.Tensor  # [B] bool: row has been exact at some earlier round
     prev_exact: torch.Tensor  # [B] bool
+    has_sub: np.ndarray  # [B] bool, host copy: row carries sub-goals (avoids a device sync in the objective)
 
 
 def to_device(arrays: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
@@ -111,24 +116,29 @@ def to_device(arrays: dict[str, np.ndarray], device: torch.device) -> dict[str, 
 
 
 class RoundStats:
-    """Accumulates per-row metrics by round index (1..max_rounds) between log lines."""
+    """Accumulates per-row metrics by round index (1..max_rounds) between log lines.
+
+    Logged as ``{name}`` (mean over all rows) and ``{name}_by_round`` (mean over rows at each round). Rates such as
+    ``first_solve`` (row exact for the first time at this round) and ``regress`` (exact at r-1, wrong at r) are means
+    of 0/1 indicators, i.e. fractions of the rows seen at that round."""
 
     def __init__(self, max_rounds: int):
         self.R = max_rounds
         self.sums: dict[str, np.ndarray] = {}
         self.counts: dict[str, np.ndarray] = {}
-        self.first_solve = np.zeros(max_rounds + 1)
-        self.regress = np.zeros(max_rounds + 1)
 
-    def add(self, name: str, rounds: torch.Tensor, values: torch.Tensor) -> None:
-        v = values.detach().float()
-        keep = ~torch.isnan(v)
-        r = rounds[keep].clamp(1, self.R).cpu().numpy()
-        v = v[keep].cpu().numpy()
-        s = self.sums.setdefault(name, np.zeros(self.R + 1))
-        c = self.counts.setdefault(name, np.zeros(self.R + 1))
-        np.add.at(s, r, v)
-        np.add.at(c, r, 1)
+    def add_many(self, rounds: torch.Tensor, metrics: dict[str, torch.Tensor]) -> None:
+        """One device->host transfer for all per-row metrics of a step; NaN entries are skipped per metric."""
+        names = list(metrics)
+        stacked = torch.stack([rounds.float()] + [metrics[n].detach().float() for n in names]).cpu().numpy()
+        r = np.clip(stacked[0].astype(np.int64), 1, self.R)
+        for i, name in enumerate(names):
+            v = stacked[i + 1]
+            keep = ~np.isnan(v)
+            s = self.sums.setdefault(name, np.zeros(self.R + 1))
+            c = self.counts.setdefault(name, np.zeros(self.R + 1))
+            np.add.at(s, r[keep], v[keep])
+            np.add.at(c, r[keep], 1)
 
     def summary(self) -> dict:
         out = {}
@@ -136,9 +146,7 @@ class RoundStats:
             c = self.counts[name]
             out[f"{name}_by_round"] = [round(float(s[r] / c[r]), 5) if c[r] else None for r in range(1, self.R + 1)]
             out[name] = float(s.sum() / max(c.sum(), 1))
-        out["first_solve_by_round"] = self.first_solve[1:].astype(int).tolist()
-        out["regress_by_round"] = self.regress[1:].astype(int).tolist()
-        self.__init__(self.R)
+        self.sums, self.counts = {}, {}
         return out
 
 
@@ -166,19 +174,19 @@ class Trainer:
         self.ema = EMA(self.model, tc.ema)
         self.step = 0
         self.flops = 0.0
+        self.row_rounds = 0  # training rows x rounds processed (for matched-sample comparisons between arms)
         self.best = -1.0
         self.next_eval = tc.eval_every_pflops
+        if "test" in cfg.eval.splits:
+            raise ValueError("eval.splits must not contain 'test': checkpoints are selected on dev (DESIGN.md D14)")
         P = cfg.model.prefix_len
         buckets = cfg.data.buckets or self.ds.buckets
         self.buckets = [S for S in buckets if self.ds.num_train_examples(S) > 0]
         self.rows = {S: max(1, min(cfg.data.max_rows, cfg.data.tokens_per_step // (P + S * S))) for S in self.buckets}
-        w = np.array([self.ds.num_train_examples(S) / self.rows[S] for S in self.buckets], dtype=np.float64)
-        self.bucket_p = w / w.sum()
+        self.bucket_p, source_w = self._sampling_weights()
         self.rng = np.random.default_rng(tc.seed)
         self.streams = {
-            S: TrainStream(
-                self.ds, S, np.random.default_rng([tc.seed, S]), cfg.data.source_weights, cfg.data.translate_p
-            )
+            S: TrainStream(self.ds, S, np.random.default_rng([tc.seed, S]), source_w[S], cfg.data.translate_p)
             for S in self.buckets
         }
         self.states: dict[int, BucketState] = {}
@@ -198,11 +206,13 @@ class Trainer:
             "scaler": self.scaler.state_dict() if self.scaler else None,
             "step": self.step,
             "flops": self.flops,
+            "row_rounds": self.row_rounds,
             "best": self.best,
             "next_eval": self.next_eval,
             "streams": {S: s.state_dict() for S, s in self.streams.items()},
             "rng": self.rng.bit_generator.state,
             "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if self.device.type == "cuda" else None,
             "cfg": self.cfg.to_dict(),
             "num_ids": self.ds.num_ids,
         }
@@ -212,6 +222,25 @@ class Trainer:
         tmp = path.with_suffix(".tmp")
         torch.save(self._ckpt_state(), tmp)
         os.replace(tmp, path)
+
+    def _sampling_weights(self) -> tuple[np.ndarray, dict[int, dict[str, float]]]:
+        """Bucket probabilities and per-bucket source weights such that (a) source s supplies a fraction w_s of all
+        training rows and (b) every example of a source is visited at the same rate, whatever its bucket.
+
+        With n[s,S] = base examples of source s in bucket S and n[s] = sum over buckets, rows of (s, S) should be a
+        fraction e[s,S] = w_s * n[s,S] / n[s]; bucket S is drawn with probability ∝ sum_s e[s,S] / rows_S and its stream
+        mixes sources ∝ e[s,S]."""
+        counts = self.ds.meta["counts"]["train"]
+        n = {S: {s: v["examples"] for s, v in counts[str(S)].items()} for S in self.buckets}
+        sources = sorted({s for S in self.buckets for s in n[S]})
+        total = {s: sum(n[S].get(s, 0) for S in self.buckets) for s in sources}
+        w = self.cfg.data.source_weights or {s: total[s] for s in sources}
+        w = {s: w.get(s, 0.0) for s in sources if total[s] > 0}
+        z = sum(w.values())
+        e = {S: {s: w[s] / z * n[S].get(s, 0) / total[s] for s in w} for S in self.buckets}
+        p = np.array([sum(e[S].values()) / self.rows[S] for S in self.buckets], dtype=np.float64)
+        source_w = {S: {s: v for s, v in e[S].items() if v > 0} for S in self.buckets}
+        return p / p.sum(), source_w
 
     def _maybe_resume(self, resume: str) -> None:
         path = self.run_dir / "last.pt" if resume == "auto" else Path(resume)
@@ -226,36 +255,43 @@ class Trainer:
         if self.scaler and ck["scaler"]:
             self.scaler.load_state_dict(ck["scaler"])
         self.step, self.flops, self.best, self.next_eval = ck["step"], ck["flops"], ck["best"], ck["next_eval"]
+        self.row_rounds = ck["row_rounds"]
         for S, st in ck["streams"].items():
             if S in self.streams:
                 self.streams[S].load_state_dict(st)
         self.rng.bit_generator.state = ck["rng"]
-        torch.set_rng_state(ck["torch_rng"])
+        torch.set_rng_state(ck["torch_rng"].cpu())
+        if ck.get("cuda_rng") is not None and self.device.type == "cuda":
+            torch.cuda.set_rng_state_all([s.cpu() for s in ck["cuda_rng"]])
         print(f"resumed {path} at step {self.step}, {self.flops / 1e15:.1f} PFLOP", flush=True)
 
     # ------------------------------------------------------------------ one step
     def _state(self, S: int) -> BucketState:
         if S not in self.states:
             B = self.rows[S]
-            empty = to_device(self.streams[S].take(B), self.device)
+            raw = self.streams[S].take(B)
             self.states[S] = BucketState(
                 S=S,
                 rows=B,
                 carry=self.model.init_carry(B, S, self.device, self.dtype),
-                batch=empty,
+                batch=to_device(raw, self.device),
                 steps=torch.zeros(B, dtype=torch.int32, device=self.device),
                 halted=torch.zeros(B, dtype=torch.bool, device=self.device),
                 solved=torch.zeros(B, dtype=torch.bool, device=self.device),
                 prev_exact=torch.zeros(B, dtype=torch.bool, device=self.device),
+                has_sub=raw["subgoal_mask"].any(-1),
             )
         return self.states[S]
 
     def _refill(self, st: BucketState) -> None:
-        idx = st.halted.nonzero().squeeze(-1)
-        if idx.numel() == 0:
+        """Replace halted rows with fresh rows from the bucket's stream (one device->host sync for the indices)."""
+        idx_np = st.halted.nonzero().squeeze(-1).cpu().numpy()
+        if idx_np.size == 0:
             return
-        new = to_device(self.streams[st.S].take(int(idx.numel())), self.device)
-        for k, v in new.items():
+        raw = self.streams[st.S].take(int(idx_np.size))
+        st.has_sub[idx_np] = raw["subgoal_mask"].any(-1)
+        idx = torch.from_numpy(idx_np).to(self.device)
+        for k, v in to_device(raw, self.device).items():
             st.batch[k][idx] = v
         st.carry = self.model.reset_carry(st.carry, st.halted)
         st.steps[idx] = 0
@@ -266,10 +302,13 @@ class Trainer:
         return min(1.0, (self.step + 1) / max(1, self.cfg.train.warmup_steps))
 
     def progress(self) -> float:
+        """Fraction of the run's budget spent: the largest of compute, steps and wall-clock fractions."""
         tc = self.cfg.train
         p = self.flops / (tc.budget_pflops * 1e15)
         if tc.max_steps:
             p = max(p, self.step / tc.max_steps)
+        if tc.max_hours:
+            p = max(p, (time.time() - self.t_start) / (tc.max_hours * 3600))
         return min(1.0, p)
 
     def train_step(self) -> dict:
@@ -281,16 +320,18 @@ class Trainer:
         f = self.lr_factor()
         for g in self.opt.param_groups:
             g["lr"] = tc.lr * f
+        progress = self.progress()
         out = self.model.round(st.carry, st.batch["inputs"], st.batch["puzzle_ids"])
-        loss, m = self.objective(out, st.batch, self.progress())
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"non-finite loss at step {self.step}")
+        loss, m = self.objective(out, st.batch, progress, has_subgoals=bool(st.has_sub.any()))
         if self.scaler:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.opt)
         else:
             loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), tc.grad_clip)
+        loss_val, gnorm_val = torch.stack([loss.detach().float(), gnorm.float()]).tolist()
+        if not math.isfinite(loss_val):
+            raise FloatingPointError(f"non-finite loss at step {self.step}")
         if self.scaler:
             self.scaler.step(self.opt)
             self.scaler.update()
@@ -303,14 +344,13 @@ class Trainer:
         with torch.no_grad():
             st.carry = out.carry
             st.steps += 1
-            rounds = st.steps.long()
-            for name in ROUND_METRICS:
-                if name in m:
-                    self.stats.add(name, rounds, m[name].float())
             exact = m["exact"]
-            r = rounds.clamp(1, tc.max_rounds).cpu().numpy()
-            np.add.at(self.stats.first_solve, r, (exact & ~st.solved).cpu().numpy())
-            np.add.at(self.stats.regress, r, (st.prev_exact & ~exact).cpu().numpy())
+            per_row = {name: m[name] for name in ROUND_METRICS if name in m}
+            per_row["first_solve"] = exact & ~st.solved
+            per_row["regress"] = st.prev_exact & ~exact
+            if "winner" in m:
+                per_row.update({f"win{k}": m["winner"] == k for k in range(self.cfg.model.K)})
+            self.stats.add_many(st.steps, per_row)
             st.solved |= exact
             st.prev_exact = exact
             halted = st.steps >= tc.max_rounds
@@ -321,17 +361,9 @@ class Trainer:
                 halted &= st.steps >= torch.where(explore, min_rounds, 0)
             st.halted = halted
         self.flops += st.rows * self.model.train_flops_per_row(S)
+        self.row_rounds += st.rows
         self.step += 1
-        info = {"loss": loss.item(), "gnorm": gnorm.item(), "S": S, "rows": st.rows}
-        for k in ("wta", "sub", "q_loss", "q_acc", "tau", "winner"):
-            if k in m:
-                v = m[k].float()
-                v = v[~torch.isnan(v)]
-                if v.numel():
-                    info[k] = v.mean().item() if k != "winner" else np.bincount(
-                        m[k].cpu().numpy(), minlength=self.cfg.model.K
-                    ).tolist()
-        return info
+        return {"loss": loss_val, "gnorm": gnorm_val, "S": S, "rows": st.rows, "tau": tau_at(self.cfg.objective, progress)}
 
     # ------------------------------------------------------------------ evaluation
     def evaluate(self, final: bool = False) -> dict:
@@ -339,15 +371,18 @@ class Trainer:
         if ec.use_ema:
             self.ema.swap(self.model)
         try:
-            res = {"step": self.step, "pflops": self.flops / 1e15}
+            res = {"step": self.step, "pflops": self.flops / 1e15, "row_rounds": self.row_rounds}
             for split in ec.splits:
                 if split in self.ds.splits():
                     res[split] = evaluate_split(
                         self.model, self.ds, split, ec, self.device, self.dtype, counterfactuals=ec.counterfactuals
                     )
-            score = np.mean([res[s]["pass@2"] for s in ec.splits if s in res and "pass@2" in res[s]] or [0.0])
+            # best.pt is chosen on the first listed split (ARC dev); the others are reported, not selected on.
+            primary = next((res[s] for s in ec.splits if s in res), {})
+            score = primary.get("pass@2", 0.0)
+            score = 0.0 if score != score else score  # NaN (no labelled tasks) counts as 0
             res["score"] = float(score)
-            if score > self.best:
+            if score >= self.best:  # ties go to the later (longer-trained) checkpoint
                 self.best = float(score)
                 torch.save(
                     {
@@ -391,6 +426,7 @@ class Trainer:
                 rec = {
                     "step": self.step,
                     "pflops": round(self.flops / 1e15, 4),
+                    "row_rounds": self.row_rounds,
                     "lr": tc.lr * self.lr_factor(),
                     "tflops_per_s": round((self.flops - f0) / max(dt, 1e-9) / 1e12, 2),
                     "rows_per_s": round(rows_acc / max(dt, 1e-9), 1),

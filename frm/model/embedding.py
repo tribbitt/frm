@@ -40,9 +40,3 @@ class PuzzleEmbedding(nn.Module):
         p.mul_(1.0 - lr * weight_decay).add_(torch.sign(grad).to(p.dtype), alpha=-lr)
         self.table[uid] = p
         self._ids = self._rows = None
-
-    @torch.no_grad()
-    def extend(self, n_new: int) -> None:
-        """Append ``n_new`` rows initialised to the mean of the trained rows (row 0 is the blank)."""
-        mean = self.table[1:].mean(0, keepdim=True) if self.table.shape[0] > 1 else self.table.mean(0, keepdim=True)
-        self.table = torch.cat([self.table, mean.expand(n_new, -1).clone()], dim=0)
