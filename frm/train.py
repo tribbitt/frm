@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 from frm.config import Cfg
+from frm.data.build import SOURCE_CODES
 from frm.data.loader import Dataset, TrainStream
 from frm.evaluate import evaluate_split
 from frm.model.refiner import Carry, Refiner
@@ -186,7 +187,10 @@ class Trainer:
         self.bucket_p, source_w = self._sampling_weights()
         self.rng = np.random.default_rng(tc.seed)
         self.streams = {
-            S: TrainStream(self.ds, S, np.random.default_rng([tc.seed, S]), source_w[S], cfg.data.translate_p)
+            S: TrainStream(
+                self.ds, S, np.random.default_rng([tc.seed, S]), source_w[S], cfg.data.translate_p,
+                max_pairs_per_draw=cfg.data.max_pairs_per_draw,
+            )
             for S in self.buckets
         }
         self.states: dict[int, BucketState] = {}
@@ -225,22 +229,31 @@ class Trainer:
 
     def _sampling_weights(self) -> tuple[np.ndarray, dict[int, dict[str, float]]]:
         """Bucket probabilities and per-bucket source weights such that (a) source s supplies a fraction w_s of all
-        training rows and (b) every example of a source is visited at the same rate, whatever its bucket.
+        training rows and (b) every task of a source is visited at the same rate, whatever its bucket.
 
-        With n[s,S] = base examples of source s in bucket S and n[s] = sum over buckets, rows of (s, S) should be a
-        fraction e[s,S] = w_s * n[s,S] / n[s]; bucket S is drawn with probability ∝ sum_s e[s,S] / rows_S and its stream
-        mixes sources ∝ e[s,S]."""
-        counts = self.ds.meta["counts"]["train"]
-        n = {S: {s: v["examples"] for s, v in counts[str(S)].items()} for S in self.buckets}
+        A draw of a task yields min(size, max_pairs_per_draw) rows, so with n[s,S] = sum over the source's tasks in
+        bucket S of that capped size and n[s] = sum over buckets, rows of (s, S) should be a fraction
+        e[s,S] = w_s * n[s,S] / n[s]; bucket S is drawn with probability ∝ sum_s e[s,S] / rows_S and its stream mixes
+        sources ∝ e[s,S]."""
+        cap = self.cfg.data.max_pairs_per_draw
+        n: dict[int, dict[str, float]] = {}
+        for S in self.buckets:
+            d = self.ds.split_data(S, "train")
+            capped = np.minimum(np.diff(d.ex_start), cap)
+            n[S] = {s: float(capped[d.source == c].sum()) for s, c in SOURCE_CODES.items() if np.any(d.source == c)}
         sources = sorted({s for S in self.buckets for s in n[S]})
-        total = {s: sum(n[S].get(s, 0) for S in self.buckets) for s in sources}
+        total = {s: sum(n[S].get(s, 0.0) for S in self.buckets) for s in sources}
         w = self.cfg.data.source_weights or {s: total[s] for s in sources}
         w = {s: w.get(s, 0.0) for s in sources if total[s] > 0}
         z = sum(w.values())
-        e = {S: {s: w[s] / z * n[S].get(s, 0) / total[s] for s in w} for S in self.buckets}
+        if z <= 0:
+            raise ValueError(f"data.source_weights {self.cfg.data.source_weights} give no weight to sources {sources}")
+        e = {S: {s: w[s] / z * n[S].get(s, 0.0) / total[s] for s in w} for S in self.buckets}
         p = np.array([sum(e[S].values()) / self.rows[S] for S in self.buckets], dtype=np.float64)
         source_w = {S: {s: v for s, v in e[S].items() if v > 0} for S in self.buckets}
-        return p / p.sum(), source_w
+        keep = p > 0
+        self.buckets = [S for S, k in zip(self.buckets, keep) if k]
+        return p[keep] / p[keep].sum(), {S: source_w[S] for S in self.buckets}
 
     def _maybe_resume(self, resume: str) -> None:
         path = self.run_dir / "last.pt" if resume == "auto" else Path(resume)

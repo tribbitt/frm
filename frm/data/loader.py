@@ -124,10 +124,12 @@ def _rows(ds: Dataset, d: SplitData, ex: np.ndarray, vid: np.ndarray, offset: np
 class TrainStream:
     """Group-balanced stream (TRM ``puzzle_dataset.py``) over the training tasks of one bucket.
 
-    Each source keeps its own epoch (a permutation of its base tasks). A draw picks a source with probability set by
-    ``source_weights`` (row fractions; ``None`` = proportional to rows), the next task of that source's epoch and a
-    random version of it, and yields all the task's training pairs in random order. Rows of a draw not consumed by
-    ``take`` are carried to the next call.
+    Each source (``SOURCE_CODES``) keeps its own epoch (a permutation of its base tasks). A draw picks a source with
+    probability set by ``source_weights`` (row fractions; ``None`` = proportional to the source's rows per epoch), the
+    next task of that source's epoch and a random version of it, and yields a random subset of
+    min(task size, ``max_pairs_per_draw``) of the task's training pairs in random order (RE-ARC tasks have ~1000 pairs:
+    uncapped, one draw would fill a batch with one rule). Row fractions and rows per draw use the capped sizes. Rows of
+    a draw not consumed by ``take`` are carried to the next call.
     """
 
     def __init__(
@@ -137,15 +139,19 @@ class TrainStream:
         rng: np.random.Generator,
         source_weights: dict[str, float] | None = None,
         translate_p: float = 0.75,
+        max_pairs_per_draw: int = 16,
     ):
+        if max_pairs_per_draw < 1:
+            raise ValueError(f"max_pairs_per_draw must be >= 1, got {max_pairs_per_draw}")
         self.ds, self.rng, self.translate_p = ds, rng, translate_p
         self.d = d = ds.split_data(bucket, "train")
         self.task_size = np.diff(d.ex_start)
+        self.draw_size = np.minimum(self.task_size, max_pairs_per_draw)
         self.sources = [s for s, c in SOURCE_CODES.items() if np.any(d.source == c)]
         self.source_tasks = {s: np.flatnonzero(d.source == SOURCE_CODES[s]) for s in self.sources}
-        mean_rows = np.array([self.task_size[self.source_tasks[s]].mean() for s in self.sources])
+        mean_rows = np.array([self.draw_size[self.source_tasks[s]].mean() for s in self.sources])
         if source_weights is None:
-            w = np.array([self.task_size[self.source_tasks[s]].sum() for s in self.sources], dtype=np.float64)
+            w = np.array([self.draw_size[self.source_tasks[s]].sum() for s in self.sources], dtype=np.float64)
         else:
             w = np.array([float(source_weights.get(s, 0.0)) for s in self.sources])
         if w.sum() <= 0:
@@ -180,11 +186,12 @@ class TrainStream:
         vid = d.vstart[task] + (self.rng.random(k) * d.vcount[task]).astype(np.int64)
         size = self.task_size[task]
         draw = np.repeat(np.arange(k), size)
-        first = np.cumsum(size) - size
-        ex = d.ex_start[task][draw] + np.arange(len(draw)) - first[draw]
-        order = np.lexsort((self.rng.random(len(draw)), draw))
-        self.pending_ex = np.concatenate([self.pending_ex, ex[order]])
-        self.pending_vid = np.concatenate([self.pending_vid, vid[draw][order]])
+        local = np.arange(len(draw)) - (np.cumsum(size) - size)[draw]  # pair index inside its task
+        order = np.lexsort((self.rng.random(len(draw)), draw))  # random order inside each draw; draws stay in order
+        # order[i] belongs to draw[i] (sorting by draw keeps each draw's block), so local[i] is its rank there
+        sel = order[local < self.draw_size[task][draw]]
+        self.pending_ex = np.concatenate([self.pending_ex, d.ex_start[task][draw[sel]] + local[sel]])
+        self.pending_vid = np.concatenate([self.pending_vid, vid[draw[sel]]])
 
     def take(self, n: int) -> dict[str, np.ndarray]:
         while len(self.pending_ex) < n:

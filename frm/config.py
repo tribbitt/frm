@@ -52,10 +52,14 @@ class ObjectiveCfg:
 @dataclass
 class DataCfg:
     root: str = "data/built/a1"
-    source_weights: dict[str, float] | None = field(default_factory=lambda: {"arc": 0.75, "composite": 0.25})
+    # Fractions of training rows per source (sources absent from the dataset are dropped and the rest renormalised).
+    source_weights: dict[str, float] | None = field(
+        default_factory=lambda: {"arc": 0.5, "composite": 0.15, "barc": 0.25, "rearc": 0.10}
+    )
     translate_p: float = 0.75
     tokens_per_step: int = 120_000  # parent tokens (prefix included) per optimizer step; T2 bench re-sizes it
     max_rows: int = 4096
+    max_pairs_per_draw: int = 16  # a draw yields at most this many pairs of one task (RE-ARC tasks have ~1000)
     buckets: list[int] | None = None  # None = every bucket in the dataset
 
 

@@ -80,7 +80,7 @@ sham-children counterfactual costs nothing. A negative result means redesign of 
 | D11 | deep supervision regime | TRM's online carry: one optimizer step per round, halted rows replaced, per-bucket carries | TRM's regime is what produced 40%+; frmv1/frmv2 replaced it with unrolled graphs and lost TRM's behaviour [M] | unrolled multi-segment graph per step |
 | D12 | optimizer | AdamW (0.9, 0.95), lr 1e-4, wd 0.1, warm-up 2k, constant; puzzle embedding SignSGD lr 1e-2 wd 0.1; EMA 0.999 | TRM `cfg_pretrain.yaml` (AdamATan2 replaced by AdamW: no CUDA extension to build on Kelvin) | Muon (misrouted in tiny [M]) |
 | D13 | halting | TRM: q_halt = BCE(current parent canvas exactly correct), halt when q>0 in training with 10% exploration, always 16 rounds at eval | TRM default; q also ranks votes and children | PonderNet/geometric priors (reward early exit [L: Ouro 2510.25741]) |
-| D14 | evaluation discipline | checkpoints chosen on **dev** (held-out test pairs of 25% of training and concept tasks; composites are reported, not selected on); ARC eval test pairs read only for reported numbers | tiny/tinyv2.2 picked best.pt on eval test pairs [M] | selecting on eval |
+| D14 | evaluation discipline | checkpoints chosen on **dev** (test pairs of 100 ARC-AGI-1 *evaluation* tasks, demos trained; no external source derives from them); pilots additionally scored on **adev** (120 ARC-AGI-2 training tasks absent from pretraining, via adaptation); a1 `test` and ARC-AGI-2 eval read once with `--final` | tiny/tinyv2.2 picked best.pt on eval test pairs [M]; a dev drawn from ARC-AGI-1 training tasks would be inflated by RE-ARC/BARC relatives | selecting on eval; dev from training tasks |
 
 ---
 
@@ -103,13 +103,12 @@ sham-children counterfactual costs nothing. A negative result means redesign of 
 Each augmented version of each task has its own identifier and embedding row (512-d, zero-initialised, SignSGD).
 Identifier 0 is the blank. Versions = identity + `n_aug` random (dihedral ∈ 0..7, permutation of colours 1..9, colour 0
 fixed), deduplicated by puzzle hash (TRM `build_arc_dataset.py:126-164`, but hashing demos and test *inputs* only, so the
-version table cannot depend on test outputs). Default `n_aug=300` (ARC Prize's HRM analysis: 300 ≈ max, 30 within
-4pp [L]); `n_aug=1000` for a final run if dev says it matters. Measured: `arc1` + 2000 composites at `n_aug=300` →
-324,368 identifiers, 71 MB on disk, built in ≈30 s [M].
+version table cannot depend on test outputs). Default `n_aug=300` for ARC and ConceptARC (ARC Prize's HRM analysis:
+300 ≈ max, 30 within 4pp [L]), 20 for composites, 8 for external tasks (`--n_aug_external`; they are numerous).
 
 Augmentation and translation are applied **on the fly** from the version table (dihedral id + permutation per
-identifier), vectorised per batch (`frm/data/encode.py:render`; 23 ms for 4,096 rows at S=16 on a laptop CPU [M]), so
-the stored dataset holds each base grid once.
+identifier), vectorised per batch (`frm/data/encode.py:render`; ≈30 ms for 4,096 rows at S=16 on a laptop CPU [M]),
+so the stored dataset holds each base grid once.
 
 ### 3.3 Size buckets
 
@@ -136,15 +135,27 @@ and listed in `meta.json["overflow"]`; such a pair cannot be solved.
 
 | source | contents | split use |
 |---|---|---|
-| `arc1` | ARC-AGI-1 training (400) + evaluation (400) + ConceptARC (160) | demos of all → train; test pairs of training/concept → train, except the **dev** hold-out (`--dev_frac`, default 25% of training and concept tasks by sha256 of task id: 141 tasks); evaluation test pairs → test |
-| `arc2` | ARC-AGI-2 training (1000) + evaluation (120) + ConceptARC | same pattern with evaluation2 as test. ARC-AGI-2 training contains 376 ARC-AGI-1 eval tasks [M: `decomposition-solver-arc/decomp/harvest.py:72`], so `arc1` and `arc2` never mix |
-| `arc2-kaggle` | as `arc2` but **without** evaluation2 demos | Kaggle proxy: pretrain on this, then run the §8 adaptation on evaluation2 |
+| `arc1` | ARC-AGI-1 training (400) + evaluation (400) + ConceptARC (160) | demos of all → train; training/concept test pairs → train; evaluation test pairs → **dev** for the 100 *dev* tasks, **test** for the other 300 |
+| `arc2` | ARC-AGI-2 training (1000) + evaluation (120) + ConceptARC | training2 test pairs → train, except the dev tasks' (ARC-AGI-1 eval tasks are inside training2); evaluation2 test pairs → test. ARC-AGI-2 training contains 376 ARC-AGI-1 eval tasks [M], so `arc1` and `arc2` never mix |
+| `arc2-kaggle` | as `arc2` but **without** evaluation2 | the final pretraining source; evaluation2 is then the adaptation test (§8) |
 | `composite` | synthetic f_k∘…∘f_1 tasks with intermediate grids (§3.5) | demos → train; 2 held-out pairs per task → `dev_composite` |
-| `kaggle` | hidden test challenges at competition time | demos → train (adaptation); test inputs → test |
+| `barc` (external) | BARC ARC-Heavy: 28,605 LLM-written generator tasks, 827,130 pairs, sandbox-run and program-audited against the 520 ARC-AGI-1/2 evaluation tasks by tinyabstractor (623 programs dropped) | train only; ingested with frm's own filter (§3.6) |
+| `rearc` (external) | RE-ARC: generators of the 400 ARC-AGI-1 *training* tasks, 399,503 pairs | train only; each generator is split into per-bucket sub-tasks `rearc:{id}@{S}` so small examples are not trained on 30×30 canvases |
+| `kaggle` | hidden test challenges at competition time (or ARC-AGI-2 evaluation for the proxy) | demos → train (adaptation); test inputs → test |
 
-Leakage rules (gated in `tests/test_data.py`): no eval test output enters any train row; buckets, offsets and size rules
-read inputs and demos only; dev/test rows are never translated; a poisoning test perturbs test outputs and asserts the
-train arrays are unchanged.
+- **dev** = 100 ARC-AGI-1 evaluation tasks with ≥ 3 demos, first 100 by md5(task id) — tinyabstractor's rule, so the a1
+  `test` split (the other 300) is the exact set its 11.50% pass@2 was measured on. ARC-AGI-1 *training* tasks are not
+  used for dev: RE-ARC and BARC contain relatives of them (RE-ARC generators are those tasks; BARC seeds are drawn from
+  them), which would make a training-task dev easier than evaluation.
+- **adev** = 120 ARC-AGI-2 training tasks that are neither ARC-AGI-1 tasks nor ARC-AGI-2 evaluation tasks, first 120 by
+  md5 (`scripts/make_adapt_dev.py`). They are excluded from every pilot build (`--exclude_ids`, which raises if any source
+  would bring one in) and from the externals' ingest filter's targets, and are scored by `frm.adapt` on a finished
+  pilot checkpoint: the pilots' measure of solving tasks never seen in pretraining (`EXPERIMENTS.md` §2).
+- The tinyabstractor pools `synth_gap` (designed by looking at ARC-AGI-1 evaluation tasks) and ARC-GEN (328 of its tasks
+  are ARC-AGI-1 evaluation tasks) are never used. tinyabstractor's `synth` is ingestible (`--with-synth`) but not in the
+  default mix: frm's composites play its role.
+- Each draw yields at most `max_pairs_per_draw` (16) pairs of one task, so a 1,000-pair RE-ARC generator cannot flood a
+  batch; bucket and source sampling use the capped counts, so `source_weights` are the actual row fractions.
 
 ### 3.5 Composite tasks (depth demand)
 
@@ -155,10 +166,23 @@ the k−1 intermediate grids g₁ = f₁(x), g₂ = f₂(g₁), …. Filters (fr
 reimplemented): every step changes the grid on every demo; the composition is not equal on all demos to any single
 primitive or shorter composition; at least one intermediate is *not* closer to the output than the input is (a genuine
 detour, e.g. "shuffle quadrants then gravity"); grids ≤ 30×30. Each task: 6–10 demo pairs + 2 held-out pairs, its own
-augmented versions (`n_aug_composite`, default 20).
+augmented versions (`n_aug_composite`, default 20). They are the only data with known compositional depth, so they double
+as the depth instrument (§7.3).
 
-Mix: composites are a fixed fraction of training rows (`composite_frac`, default 0.25). They are the only data with
-known compositional depth, so they double as the depth instrument (§7.3).
+Default row mix (`DataCfg.source_weights`): ARC 0.50, composites 0.15, BARC 0.25, RE-ARC 0.10. ARC keeps half the rows
+because the evaluation-task embeddings are learned only from ARC rows; the pilots test whether the external half pays
+(`EXPERIMENTS.md` P2).
+
+### 3.6 Contamination guarantees
+
+| held-out set | what protects it | gate |
+|---|---|---|
+| eval test outputs (a1 `test`, ARC-AGI-2 eval) and dev test outputs | never written to a train row; buckets, offsets and the size rule read demos and test inputs only | `test_poisoning_leaves_everything_but_test_outputs_unchanged`, `test_no_test_output_in_train_rows` |
+| the same, against copies inside *training* tasks | every build drops ARC/ConceptARC training tasks (whole) and composite pairs whose canonical pair (8 dihedral × colour relabel) equals a held-out test pair, or that contain an informative (≥36 cells, ≥8 off-background) held-out test output. A dropped task is a copy of a held-out task's *rule*, so its RE-ARC generator (fresh instances no pair filter can catch) is dropped too. Measured on `arc1`: 6 training/concept tasks dropped (e.g. `40853293` contains `070dd51e`'s test pair), their 4 RE-ARC generators' sub-tasks, and 7 composite pairs | `meta.json["content_filter"]`; `test_content_filter_drops_planted` |
+| everything held out, against external pools | `scripts/ingest_external.py` filters BARC/RE-ARC/synth against all ARC-AGI-1/2 evaluation tasks and all 230 adev candidates (demos and tests, pairs and informative grids) and drops contaminated instances; the build refuses an external file whose recorded held-out ids do not cover the build's dev/test/excluded tasks. Measured: **0** contaminated pairs against the evaluation sets (tinyabstractor's filter held; the positive control — ARC-AGI-1 eval tasks inside ARC-AGI-2 training — is fully detected) and **176** against the adev candidates, all dropped: BARC 169 (94 tasks; `barc/h035065` was a copy of `bd5af378` and went whole), RE-ARC 3, synth 4 | `*_report.json`; `tests/test_external.py` (planted contamination is removed) |
+| dev representativeness | dev tasks are ARC-AGI-1 evaluation tasks, which no external source derives from | dev rule test |
+| between held-out tasks | not filtered, by design: eval tasks' demos are training data (TRM's protocol), and one eval task's demo can equal another's test output (measured once in `arc1`: dev `bf32578f` demo 0 output = dev `6df30ad6` test output up to flip + recolour). The same information is available at competition time, where every hidden task's demos are given together | documented |
+| adev | excluded from pilot builds by id (`--exclude_ids` raises, including RE-ARC sub-task base ids), filtered out of externals by content. No ARC/ConceptARC training task contains an adev test pair or test output (one, `31aa019c`, shares a grid with an adev *demo*, which adaptation shows the model anyway) | `test_exclude_ids`, `test_make_adapt_dev` |
 
 ---
 
@@ -253,7 +277,7 @@ the configured nested arm.
 ### 4.6 Size and init
 
 Dense parameters ≈ 6.83M (TRM) + fork ≈ K·512 + 512·64 + K·64·512 + join 2·512·64 ≈ 0.2M at K=4. Puzzle-embedding
-table: `n_ids × 512` fp32, outside the dense count (≈ 289k rows for `arc1` at `n_aug=300`, 0.59 GB).
+table: `n_ids × 512` fp32, outside the dense count (≈ 600k rows for the `a1` build with externals, 1.2 GB on the GPU).
 
 ### 4.7 Gradient-path invariants (gated)
 
@@ -396,9 +420,10 @@ sample-round with H=3, n=4 (backward ≈ 2× forward on grad passes):
 
 `Refiner.passes_per_round` computes these counts and `test_pass_accounting_matches_execution` checks them against the
 passes actually executed; `train_flops_per_row` converts them with the exact per-bucket pass cost
-`layers · L · (2·N_block + 4·L·d)`, which reproduces TRM's 398.1 GFLOP per 30×30 row-round [M]. Example-weighted over
-`arc1` training buckets: `trm` 142, `trm_h2` 199, FRM K=2 342, FRM K=4 570 GFLOP per row-round (child checkpointing on)
-— i.e. FRM K=4 on buckets costs ≈1.4× TRM on 30×30. TRM's ARC schedule is ≈1.59e20 FLOPs (≈3 days on 4×H100)
+`layers · L · (2·N_block + 4·L·d)`, which reproduces TRM's 398.1 GFLOP per 30×30 row-round [M]. Weighted by the default
+row mix over the `a1` build's buckets (RE-ARC split per bucket): `trm` 152, `trm_h2` 212, FRM K=2 364, FRM K=4 607 GFLOP
+per row-round (child checkpointing on; the ARC-AGI-2 mix is within 1%) — i.e. FRM K=4 on buckets costs ≈1.5× TRM on
+30×30. How this lines up with TRM's whole schedule is in `EXPERIMENTS.md` §1. TRM's ARC schedule is ≈1.59e20 FLOPs (≈3 days on 4×H100)
 [M: SpecTRM]. Matched compute is enforced in `EXPERIMENTS.md` by giving every arm the same `budget_pflops`.
 
 Memory [I, to be measured in T2]: a grad pass keeps ≈29·d values per token per block (q/k upcast for RoPE, SwiGLU
@@ -411,20 +436,26 @@ one pass of transients, ≈0.6 MB per parent token in total. At 80 GB that bound
 
 ## 10. Gates (must pass before any GPU job)
 
-`pytest -q` (84 tests, ≈25 s on a laptop CPU):
+`pytest -q` (≈100 tests, ≈30 s on a laptop CPU):
 
 - `test_data.py`: dihedral inverse for all 8 ids; version apply/invert round trip; dedup; encode/crop round trip in every
-  bucket; size rule and buckets unchanged when test outputs are poisoned (whole built dataset byte-identical except test
-  outputs); composite buckets ignore held-out targets; no test output in any train row; dev/test rows untranslated and
-  keyed consistently; `take()` shapes, translation keeps content and EOS, sub-goal masks, source weights, exact resume.
+  bucket; size rule and buckets unchanged when test outputs are poisoned (whole built dataset byte-identical except
+  dev/test outputs); composite buckets ignore held-out targets; no test output in any train row; dev rule (md5 order);
+  dev/test rows untranslated and keyed consistently; `take()` shapes, translation keeps content and EOS, sub-goal masks,
+  source weights, per-draw cap, exact resume.
+- `test_external.py`: canonical digest invariant under dihedral × recolouring; ingest removes planted contamination and
+  refuses held-out id overlaps; build refuses externals not filtered against its held-out ids; content filter drops a
+  planted training copy of a held-out test output; generator pools split per bucket; adev files; `--exclude_ids`.
 - `test_composite.py`: determinism, filters (no single primitive or shorter program reproduces a task), detour quota,
   sub-goals equal program prefixes, every primitive exercised.
 - `test_model.py`: `test_fork_gate` (child cycles run with grad; codes, join and β get gradient from `L_parent` alone),
   `test_nested_fork_gate`, `test_trm_mode_matches_reference_structure` (K=0 equals an independent restatement of TRM's
   round), carry detached and reset, `test_every_param_gets_grad`, inference == training forward,
-  `test_child_checkpointing_is_exact`, pass accounting == executed passes, counterfactual modes.
-- `test_objective.py`: stablemax normalised and NaN-free gradients, PAD ignored, WTA weights at τ→0/∞, each child's
-  gradient = w_k × its own CE gradient, sub-goal matching, distinct-answer count.
+  `test_children_get_fresh_noise_each_round`, `test_child_checkpointing_is_exact`, pass accounting == executed passes,
+  counterfactual modes.
+- `test_objective.py`: stablemax normalised, NaN-free gradients and non-zero gradients at zero logits; PAD ignored;
+  assignment table one-to-one; set matching reduces to annealed WTA, sends distinct targets to distinct children and
+  respects masks/spare children; each child's gradient = w_k × its own CE gradient; mixed composite/plain batches.
 - `test_evaluate.py`: official scoring and per-task outcomes, vote ranking, submission shape, sham children from other
   tasks.
 - `test_train_smoke.py`: build → train → SIGTERM → resume (step count continues) → DONE → evaluate → `--final` guard →
@@ -442,23 +473,27 @@ frm/
     augment.py         dihedral / inverse_dihedral, Version(tid, perm).apply/invert/parse/name, make_versions
     encode.py          PAD/EOS/colour layout: encode_grid, labels_from, crop, render (vectorised augment+translate)
     sizerule.py        predict_output_size(task, test_input), choose_bucket(task) — never reads test outputs
-    build.py           CLI: dataset dir from --sources arc1|arc2|arc2-kaggle|kaggle and --composite JSON
+    heldout.py         canon (8 dihedral × colour relabel digest), informative, HeldOut(...).hit — the content filter
+    build.py           CLI: dataset dir from --sources arc1|arc2|arc2-kaggle|kaggle, --composite JSON, --external
+                       SOURCE=PATH, --exclude_ids; dev rule; content filter; generator pools split per bucket
     loader.py          Dataset(root): buckets, identifiers, tasks(split), splits(); TrainStream(ds, S, rng, weights,
-                       translate_p).take(n) + state_dict; eval_batches(ds, split, S, rows, max_versions)
+                       translate_p, max_pairs_per_draw).take(n) + state_dict; eval_batches(ds, split, S, rows, ...)
     composite.py       33 primitives, generate(n_tasks, depth_range, seed, ...) with sub-goals; CLI writes JSON
   model/
     layers.py          rms_norm, CastedLinear, SwiGLU, Rope2D, Attention (SDPA), Block, block_params
     embedding.py       PuzzleEmbedding (buffer table, gather-to-leaf, SignSGD step)
-    refiner.py         Refiner(ModelCfg, num_ids): init_carry, reset_carry, round(carry, inputs, ids, cf) -> RoundOut,
-                       passes_per_round, train_flops_per_row, eval_flops_per_row, compile_cycles
-  objective.py         Objective(ObjectiveCfg)(RoundOut, batch, progress) -> (loss, per-row metrics)
+    refiner.py         Refiner(ModelCfg, num_ids): init_carry, reset_carry, round(carry, inputs, ids, cf, sham_perm, gen)
+                       -> RoundOut, passes_per_round, train_flops_per_row, eval_flops_per_row, compile_cycles
+  objective.py         set_match, Objective(ObjectiveCfg)(RoundOut, batch, progress) -> (loss, per-row metrics)
   train.py             CLI: python -m frm.train --config cfg.json --run_dir runs/X [--resume auto] [key=value ...]
   evaluate.py          CLI + evaluate_split: per-round voting, pass@k, instruments, counterfactuals, submission
   adapt.py             CLI: Kaggle adaptation (build, re-initialised ids, fine-tune, predict, write submission)
-configs/               trm_a1, trm_h2_a1, frm2_a1, frm_a1, nest_a1, frm_a2_kaggle, frm_a2; smoke; learn (CPU check)
-kelvin/                k2 helper, submit.sh (approval thresholds), jobs/{env.sh, setup_env, data, smoke, bench, train, eval}
-scripts/               fetch_data.py, bench.py, compare.py (paired bootstrap + McNemar between arms)
-tests/                 test_data, test_composite, test_model, test_objective, test_evaluate, test_train_smoke
+configs/               trm_a1, frm_a1, frm2_a1, frm_a1_arc (pilots); trm_h2_a1, nest_a1 (optional); frm_a2_kaggle (final);
+                       smoke; learn (CPU check)
+kelvin/                k2 helper (incl. push-external), submit.sh (approval thresholds), jobs/{env.sh, setup_env, data,
+                       smoke, bench, train, eval}
+scripts/               fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py (paired bootstrap + McNemar)
+tests/                 test_data, test_external, test_composite, test_model, test_objective, test_evaluate, test_train_smoke
 ```
 
 `Batch` (all torch tensors on device unless noted): `inputs` int [B, S²], `labels` int [B, S²] (−100 = ignore),

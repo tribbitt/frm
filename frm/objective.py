@@ -67,9 +67,10 @@ def tau_at(cfg: ObjectiveCfg, progress: float) -> float:
 
 
 @cache
-def _assignment_table(K: int, M: int) -> torch.Tensor:
+def _assignment_table(K: int, M: int, device: torch.device = torch.device("cpu")) -> torch.Tensor:
     """[P, 1+M] child index of each target (0 = final, 1..M = intermediates; -1 = unmatched) for every one-to-one map
-    of the final target plus any subset of at most K-1 intermediates onto distinct children."""
+    of the final target plus any subset of at most K-1 intermediates onto distinct children. Cached per device, so a
+    training step never copies it host -> device (which would sync the stream between forward and backward)."""
     rows = []
     for j in range(min(M, K - 1) + 1):
         for inter in itertools.combinations(range(1, M + 1), j):
@@ -79,7 +80,7 @@ def _assignment_table(K: int, M: int) -> torch.Tensor:
                 for t, k in zip(targets, kids):
                     row[t] = k
                 rows.append(row)
-    return torch.tensor(rows, dtype=torch.long)
+    return torch.tensor(rows, dtype=torch.long, device=device)
 
 
 def set_match(
@@ -95,7 +96,7 @@ def set_match(
     intermediates. Returns (sum_pi w_pi cost_pi [B], best assignment [B, 1+M] child per target, -1 = unmatched)."""
     B, K = ce_final.shape
     M = 0 if ce_sub is None else ce_sub.shape[-1]
-    A = _assignment_table(K, M).to(ce_final.device)  # [P, 1+M]
+    A = _assignment_table(K, M, ce_final.device)  # [P, 1+M]
     cost = ce_final[:, A[:, 0]]  # [B, P]
     valid = torch.ones_like(cost, dtype=torch.bool)
     if M:

@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     data_dir = work / "data"
     if not (data_dir / "meta.json").exists():
         build_argv = ["--sources", "kaggle", "--challenges", args.challenges, "--out", str(data_dir)]
-        build_argv += ["--n_aug", str(args.n_aug), "--dev_frac", "0"]
+        build_argv += ["--n_aug", str(args.n_aug)]
         if args.solutions:
             build_argv += ["--solutions", args.solutions]
         build_mod.main(build_argv)
@@ -79,8 +79,8 @@ def main(argv: list[str] | None = None) -> int:
     Path(args.submission).write_text(json.dumps(res.pop("attempts")))
     summary = {"steps": trainer.step, "pflops": trainer.flops / 1e15, "submission": args.submission}
     if args.solutions:
-        summary.update({k: res[k] for k in ("pass@1", "pass@2", "n_tasks")})
-        summary["pass@2_by_round"] = res["by_round"]["pass@2"]
+        summary.update({k: res[k] for k in ("pass@1", "pass@2", "n_tasks", "per_task")})
+        summary["pass@2_by_round"] = res["by_round"]["pass@2"]  # per_task feeds scripts/compare.py (paired adev tests)
     (work / "adapt_summary.json").write_text(json.dumps(summary, indent=1))
     print(json.dumps(summary, indent=1))
     return 0

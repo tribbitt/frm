@@ -9,16 +9,17 @@ frm keeps Samsung's TRM (2-layer tied transformer, answer state y and latent z, 
 ACT halting, puzzle-id embeddings, stablemax CE, EMA) and changes three things:
 
 1. **Fork-join inside every round.** The middle cycle of TRM's three is widened into K children with distinct learned
-   codes; a per-cell attention join over {parent, children} feeds the parent's last cycle, whose readout is graded. The
-   gradient runs through the join into the children: a child's intermediate state (a detour) is paid for by what the parent
-   does with it.
-2. **An objective for depth and meaningful forks.** Parent deep supervision + annealed relaxed winner-takes-all over
-   children + order-free sub-goal matching on synthetic composites + stop/score heads (`docs/OBJECTIVE.md`).
-3. **Data that demands depth.** Synthetic composite tasks f_k∘…∘f_1 (k ≤ 4, ≥50% genuine detours) with intermediate grids,
-   mixed into ARC training (`frm/data/composite.py`).
+   codes plus fresh noise each round; a per-cell attention join over {parent, children} feeds the parent's last cycle,
+   whose readout is graded. The gradient runs through the join into the children: a child's intermediate state (a
+   detour) is paid for by what the parent does with it, and a parent stuck at a fixed point still gets new proposals.
+2. **An objective for depth and meaningful forks.** Parent deep supervision + annealed one-to-one set matching of the
+   children to {final answer} ∪ {intermediate grids of synthetic composites} (winner-takes-all on plain rows) +
+   stop/score heads (`docs/OBJECTIVE.md` §3.0 writes it out).
+3. **Data.** ARC + ConceptARC + synthetic composite tasks f_k∘…∘f_1 (k ≤ 4, ≥50% genuine detours, with intermediate
+   grids) + BARC + RE-ARC, all filtered against every held-out set (`docs/DESIGN.md` §3.4–3.6).
 
-Plus efficiency: size-bucketed canvases with 2-D RoPE (0.34–0.49 of TRM's 30×30 token cost on ARC-AGI-1 data),
-per-pass activation checkpointing of children, FLOP-budgeted training.
+Plus efficiency: size-bucketed canvases with 2-D RoPE (0.34–0.49 of TRM's 30×30 token cost on ARC-AGI-1 data), RE-ARC
+split per bucket, per-pass activation checkpointing of children, FLOP-budgeted training.
 
 ## Documents
 
@@ -41,21 +42,26 @@ frm/objective.py       the objective
 frm/train.py           trainer (per-bucket ACT carries, EMA, checkpoints, SIGTERM-safe, FLOP budget)
 frm/evaluate.py        per-round voting, pass@k, fork/depth instruments, counterfactuals
 frm/adapt.py           Kaggle adaptation -> submission.json
-configs/                  arms (trm_a1, trm_h2_a1, frm2_a1, frm_a1, nest_a1, frm_a2_kaggle, frm_a2), smoke, learn
+configs/                  pilots trm_a1, frm_a1, frm2_a1, frm_a1_arc; optional trm_h2_a1, nest_a1; final frm_a2_kaggle
 kelvin/                   Kelvin2 job kit
-scripts/                  fetch_data.py, bench.py, compare.py
-tests/                    84 tests incl. the end-to-end smoke
+scripts/                  fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py
+tests/                    unit tests + the end-to-end smoke
 ```
 
 ## Quick start (laptop, CPU)
 
 ```bash
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python torch numpy pytest
-.venv/bin/python -m pytest -q                                   # 84 tests, ~25 s
+.venv/bin/python -m pytest -q                                   # ~25 s
 .venv/bin/python scripts/fetch_data.py                          # ARC-AGI-1/2 + ConceptARC into data/raw
 .venv/bin/python -m frm.data.composite --n 2000 --seed 0     # data/raw/composite_s0.json
-.venv/bin/python -m frm.data.build --sources arc1 --composite data/raw/composite_s0.json \
-    --n_aug 300 --dev_frac 0.25 --out data/built/a1
+S=../tinyabstractor/data/cache
+.venv/bin/python scripts/ingest_external.py --src $S --pools a2_new  # data/raw/external/a2_new.npz
+.venv/bin/python scripts/make_adapt_dev.py                       # data/raw/adev_*.json: 120 a2_new tasks
+.venv/bin/python scripts/ingest_external.py --src $S --pools barc rearc --heldout_pools data/raw/external/a2_new.npz
+.venv/bin/python -m frm.data.build --sources arc1 --composite data/raw/composite_s0.json --n_aug 300 \
+    --external barc=data/raw/external/barc.npz rearc=data/raw/external/rearc.npz \
+    --exclude_ids data/raw/adev_ids.json --out data/built/a1
 .venv/bin/python -m frm.train --config configs/smoke.json --run_dir runs/smoke train.device=cpu
 .venv/bin/python -m frm.evaluate --run_dir runs/smoke --split dev
 ```
@@ -70,8 +76,11 @@ steps, CE decreasing with every round.
 
 ```bash
 python -m frm.train --config configs/frm_a1.json --run_dir runs/frm_a1 [key=value ...]   # resumable, SIGTERM-safe
-python -m frm.evaluate --run_dir runs/frm_a1 --split dev                               # decisions use dev
+python -m frm.evaluate --run_dir runs/frm_a1 --split dev                               # checkpoint choice
+python -m frm.adapt --ckpt runs/frm_a1/best.pt --challenges data/raw/adev_challenges.json \
+    --solutions data/raw/adev_solutions.json --work runs/frm_a1/adev --hours 2.5          # adev: unseen tasks
 python -m frm.evaluate --run_dir runs/frm_a1 --split test --final                       # the reported number
+python scripts/compare.py runs/frm_a1/eval.jsonl runs/trm_a1/eval.jsonl --split dev [--match samples]
 python scripts/bench.py --config configs/frm_a1.json --arms "trm:model.K=0" "frm2:model.K=2" "frm4:"
 ```
 

@@ -11,7 +11,7 @@ import pytest
 
 from frm.data.arc import load_subset
 from frm.data.augment import DIHEDRAL_INVERSE, Version, _puzzle_hash, dihedral, inverse_dihedral, make_versions
-from frm.data.build import build, parse_args
+from frm.data.build import build, dev_ids, parse_args
 from frm.data.encode import EOS, IGNORE, PAD, crop, encode_grid, labels_from
 from frm.data.loader import Dataset, TrainStream, eval_batches
 from frm.data.sizerule import BUCKETS, choose_bucket, fits, predict_output_size
@@ -91,7 +91,7 @@ def _build(root: str, poison: bool = False) -> str:
     raw, comp = _make_raw(root, poison)
     out = os.path.join(root, "built")
     args = ["--raw", raw, "--sources", "arc1", "--composite", comp, "--out", out, "--n_aug", "6",
-            "--n_aug_composite", "3", "--dev_frac", "0.3", "--seed", "0"]
+            "--n_aug_composite", "3", "--dev_n", "2", "--seed", "0"]
     build(parse_args(args))
     return out
 
@@ -246,15 +246,50 @@ def _arrays(root: str) -> dict[str, bytes]:
 
 
 def test_poisoning_leaves_everything_but_test_outputs_unchanged(built, poisoned):
+    """Poisoning perturbs every ARC-AGI-1 evaluation test output; dev tasks are evaluation tasks, so dev outputs
+    change too. Nothing else may."""
     a, b = _arrays(built), _arrays(poisoned)
     assert a.keys() == b.keys()
     differ = {k for k in a if a[k] != b[k]}
-    allowed = {"test_tasks.json", "meta.json"} | {k for k in a if "/test/out" in k}
+    allowed = {"test_tasks.json", "meta.json"} | {k for k in a if "/test/out" in k or "/dev/out" in k}
     assert differ and differ <= allowed, differ - allowed
     ma, mb = (json.loads(x["meta.json"]) for x in (a, b))
     ma.pop("overflow"), mb.pop("overflow")
     ma.pop("composite"), mb.pop("composite")
     assert ma == mb
+
+
+def test_dev_rule_md5_order(tmp_path):
+    """dev = the n evaluation tasks with >= 3 demos with the smallest md5(task id) hex digests."""
+    import hashlib
+
+    demo = {"input": [[0]], "output": [[1]]}
+    ids = [f"t{i:02d}" for i in range(12)]
+    few = set(ids[::4])  # 2 demos: never dev
+    ch = {k: {"train": [demo] * (2 if k in few else 3), "test": [{"input": [[0]]}]} for k in ids}
+    (tmp_path / "arc-agi_evaluation_challenges.json").write_text(json.dumps(ch))
+    order = sorted((k for k in ids if k not in few), key=lambda k: hashlib.md5(k.encode()).hexdigest())
+    assert dev_ids(str(tmp_path), 4) == sorted(order[:4])
+    assert not few & set(dev_ids(str(tmp_path), 100))
+    assert len(dev_ids(str(tmp_path), 100)) == len(ids) - len(few)
+
+
+def test_dev_and_test_splits(ds, built):
+    raw = os.path.join(os.path.dirname(built), "raw")
+    ev = load_subset(raw, "evaluation")
+    want = dev_ids(raw, 2)
+    assert ds.meta["dev_ids"] == want and len(want) == 2
+    assert all(len(ev[k]["train"]) >= 3 for k in want)
+    assert set(ds.tasks("dev")) == set(want)
+    assert set(ds.tasks("test")) == set(ev) - set(want)
+    grids = _train_task_grids(ds)
+    for sub in ("training", "concept"):  # every training/concept task's test pairs are training data
+        for k, t in load_subset(raw, sub).items():
+            assert len(grids[k]) == len(t["train"]) + len(t["test"])
+    for k, t in ev.items():  # demos of dev and test tasks are trained on (transductive), their test pairs never
+        assert len(grids[k]) == len(t["train"])
+    cf = ds.meta["content_filter"]
+    assert cf["arc_tasks_dropped"] == [] and cf["composite_pairs_dropped"] == 0
 
 
 def test_composite_bucket_ignores_held_out_targets():
@@ -277,8 +312,8 @@ def test_no_test_output_in_train_rows(poisoned):
     ds = Dataset(poisoned)
     train_grids = {(g.shape, g.tobytes()) for pairs in _train_task_grids(ds).values()
                    for p in pairs for g in (p["input"], p["output"], *p["subgoals"])}
-    test = ds.tasks("test")
-    assert test
+    test = {k: t for split in ("dev", "test") for k, t in ds.tasks(split).items()}
+    assert ds.tasks("dev") and ds.tasks("test")
     for t in test.values():
         for ex in t["test"]:
             g = np.asarray(ex["output"], np.uint8)
@@ -425,7 +460,7 @@ def test_group_balanced_draws_and_carry(ds):
     runs = np.split(pids, np.flatnonzero(np.diff(pids)) + 1)
     names = [_version(ds, int(r[0]))[0] for r in runs]
     for r, name in zip(runs[:-1], names[:-1]):
-        assert len(r) % size[name] == 0  # whole draws (adjacent equal versions merge)
+        assert len(r) % min(size[name], 16) == 0  # whole draws (adjacent equal versions merge)
     assert len(set(names)) >= 0.5 * n_tasks
     pending = ts.pending_vid.copy()
     nxt = ts.take(len(pending) + 1)
@@ -450,6 +485,43 @@ def test_state_dict_resume(ds):
     b.load_state_dict(state)
     got = [b.take(n) for n in (29, 64, 5)]
     for w, g in zip(want, got):
+        for k in w:
+            assert np.array_equal(w[k], g[k]), k
+
+
+def test_per_draw_cap_and_resume(ds):
+    """A draw yields a random subset of min(task size, cap) distinct pairs; streams resume exactly with the cap."""
+    S = max(ds.buckets, key=ds.num_train_examples)
+    d = ds.split_data(S, "train")
+    cap = 3
+    big = np.flatnonzero(np.diff(d.ex_start) > cap)
+    assert len(big)
+    ts = TrainStream(ds, S, np.random.default_rng(3), max_pairs_per_draw=cap)
+    assert ts.rows_per_draw <= cap
+    seen: dict[int, set[int]] = {}
+    for _ in range(40):
+        ts._draw(25)
+        ex, vid = ts.pending_ex, ts.pending_vid
+        ts.pending_ex, ts.pending_vid = ex[:0], vid[:0]
+        task = np.searchsorted(d.ex_start, ex, side="right") - 1
+        a = 0
+        while a < len(ex):  # draws are blocks of min(size, cap) rows of one task and one version
+            t = int(task[a])
+            n = min(int(d.ex_start[t + 1] - d.ex_start[t]), cap)
+            block = ex[a : a + n]
+            assert np.all(task[a : a + n] == t) and np.all(vid[a : a + n] == vid[a]) and len(set(block)) == n
+            assert d.vstart[t] <= vid[a] < d.vstart[t] + d.vcount[t]
+            seen.setdefault(t, set()).update(block.tolist())
+            a += n
+    t = int(big[0])
+    assert seen[t] == set(range(d.ex_start[t], d.ex_start[t + 1]))  # a random subset each time, not a prefix
+    a = TrainStream(ds, S, np.random.default_rng(7), max_pairs_per_draw=cap)
+    a.take(13)
+    state = json.loads(json.dumps(a.state_dict()))
+    want = [a.take(n) for n in (29, 64, 5)]
+    b = TrainStream(ds, S, np.random.default_rng(999), max_pairs_per_draw=cap)
+    b.load_state_dict(state)
+    for w, g in zip(want, [b.take(n) for n in (29, 64, 5)]):
         for k in w:
             assert np.array_equal(w[k], g[k]), k
 
