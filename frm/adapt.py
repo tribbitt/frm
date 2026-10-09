@@ -50,8 +50,9 @@ def main(argv: list[str] | None = None) -> int:
             build_argv += ["--solutions", args.solutions]
         build_mod.main(build_argv)
 
-    ck_cfg = torch.load(args.ckpt, map_location="cpu", weights_only=False)["cfg"]
-    cfg = Cfg.from_dict(ck_cfg)
+    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    cfg, ck_price = Cfg.from_dict(ck["cfg"]), ck.get("price")
+    del ck  # the table and optimizer state are loaded again by the trainer; do not hold a second copy
     cfg.data.root = str(data_dir)
     cfg.data.buckets = None
     cfg.data.source_weights = None
@@ -65,6 +66,9 @@ def main(argv: list[str] | None = None) -> int:
     cfg.eval.splits = []
     # The pretrained children are already specialised: continue at the final WTA temperature, do not re-anneal from 1.
     cfg.objective.tau_start = cfg.objective.tau_end
+    # Likewise a pretrained fork gate: no forced-fork familiarisation, and its labels keep the price it ended at.
+    cfg.train.fork_force_frac = 0.0
+    cfg.objective.fork_price = cfg.objective.fork_price if ck_price is None else ck_price
     for item in args.overrides:
         cfg.override(item)
 

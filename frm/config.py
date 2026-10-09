@@ -20,6 +20,10 @@ class ModelCfg:
     prefix_len: int = 16
     vocab: int = 12
     rope_theta: float = 10000.0
+    # "2d": row/column RoPE, prefix unrotated (frm's own models). "trm1d": TRM's 1-D RoPE with every cell at its
+    # 30x30-canvas index (prefix i -> i, cell (r, c) -> prefix_len + 30r + c), so a TRM checkpoint sees the relative
+    # positions it was trained with on any bucket (scripts/import_trm.py).
+    pos_encoding: str = "2d"
     rms_eps: float = 1e-5
     # Forking. K=0 is the forkless TRM control.
     K: int = 4
@@ -37,7 +41,11 @@ class ModelCfg:
     # build on the children and the parent's loss reaches them at full strength (OBJECTIVE.md §7, response to
     # parent_mass -> 1). Evaluation never drops. 0 disables.
     join_drop_parent: float = 0.0
-    # Gradient window of the K=0 control (TRM = 1 cycle; trm_h2 = 2).
+    # Adaptive forking (DESIGN.md §4.8): a gate head on the pre-fork state decides per row and round whether to fork;
+    # declined rows run TRM's round. Off = every round forks. Needs fork_depth = 1.
+    fork_gate: bool = False
+    gate_hidden: int = 128
+    # Gradient window of the K=0 control (TRM = 1 cycle; trm_h2 = 2), and of the rows a fork gate declines.
     grad_cycles: int = 1
     grad_ckpt_children: bool = False
 
@@ -51,6 +59,10 @@ class ObjectiveCfg:
     tau_start: float = 1.0
     tau_end: float = 0.02
     tau_anneal_frac: float = 0.3
+    # Fork gate (OBJECTIVE.md §3.6): BCE of the gate logit against "forking beat the no-fork continuation by more than
+    # fork_price nats per supervised token", on rows that forked with their own join.
+    lambda_gate: float = 0.1
+    fork_price: float = 0.0
 
 
 @dataclass
@@ -80,10 +92,25 @@ class TrainCfg:
     ema: float = 0.999
     max_rounds: int = 16
     halt_explore: float = 0.1
+    # Fork gate schedule: every row-round forks for the first fork_force_frac of training (familiarisation), then the
+    # gate decides and a declined row forks anyway with probability fork_explore. fork_rate_target > 0 turns the price
+    # into a controller: after each gated step price = max(0, price + fork_price_lr * (fork rate - target)).
+    fork_force_frac: float = 0.3
+    fork_explore: float = 0.1
+    fork_rate_target: float = 0.0
+    fork_price_lr: float = 0.01
+    # Learning-rate multiplier for the fork modules (the parameters a K=0 model lacks: codes, join, noise map, gate).
+    # After a warm start from a trained TRM they start from scratch while the shared weights only fine-tune; > 1 lets
+    # them learn at their own pace. 1 keeps a single parameter group (and resumes pre-existing runs unchanged).
+    fork_lr_mult: float = 1.0
     budget_pflops: float = 1000.0  # training stops when this much compute is spent
     max_steps: int = 0  # 0 = budget only
     max_hours: float = 0.0  # 0 = no wall-clock limit (used by Kaggle adaptation)
-    init_from: str | None = None  # pretrained checkpoint: weights loaded, puzzle-embedding rows re-initialised
+    init_from: str | None = None  # checkpoint whose weights initialise the model (see init_mode)
+    # "adapt": new tasks (Kaggle adaptation): every puzzle-embedding row starts at the mean trained row, untrained.
+    # "continue": the same dataset (e.g. an imported TRM, scripts/import_trm.py): the table and its visit counts are
+    # kept; fork modules absent from the checkpoint (a K=0 source) keep their fresh initialisation.
+    init_mode: str = "adapt"
     eval_every_pflops: float = 100.0
     log_every: int = 50
     ckpt_minutes: float = 30.0

@@ -1,7 +1,8 @@
-"""TRM building blocks: post-norm block, SwiGLU, SDPA attention with 2D RoPE.
+"""TRM building blocks: post-norm block, SwiGLU, SDPA attention with 2D RoPE (or TRM's 1-D RoPE).
 
-Port of ``trm-samsung/models/layers.py`` with one change: positions are 2D (row, col) so canvases of any bucket size
-share the same geometry. Prefix tokens are left unrotated.
+Port of ``trm-samsung/models/layers.py``. frm's own models use 2D (row, col) positions so canvases of any bucket
+size share the same geometry, with prefix tokens unrotated. ``RopeTRM1D`` reproduces TRM's 1-D RoPE instead, with each
+cell at its index on TRM's 30x30 canvas, so an imported TRM checkpoint sees exactly its trained relative positions.
 """
 
 from __future__ import annotations
@@ -102,19 +103,57 @@ def apply_rope_2d(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torc
     return out.to(dtype)
 
 
+class RopeTRM1D(nn.Module):
+    """TRM's 1-D RoPE (``RotaryEmbedding``: inv_freq over the whole head, angles concatenated twice) evaluated at
+    TRM's positions: prefix token i at i, cell (r, c) of an S x S canvas at ``prefix_len + 30 r + c``. On S = 30 this is
+    TRM's table; on a smaller bucket every pair of tokens keeps the offset it would have on TRM's canvas."""
+
+    STRIDE = 30
+
+    def __init__(self, head_dim: int, prefix_len: int, theta: float):
+        super().__init__()
+        self.prefix_len = prefix_len
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._cache: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def forward(self, S: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (S, str(device))
+        if key not in self._cache:
+            assert S <= self.STRIDE, f"canvas {S} exceeds TRM's 30x30"
+            r = torch.arange(S, device=device)
+            cells = self.prefix_len + (r[:, None] * self.STRIDE + r[None, :]).reshape(-1)
+            pos = torch.cat((torch.arange(self.prefix_len, device=device), cells)).float()
+            f = torch.outer(pos, self.inv_freq.to(device))
+            ang = torch.cat((f, f), dim=-1)  # [P + S*S, head_dim]
+            self._cache[key] = (ang.cos(), ang.sin())
+        return self._cache[key]
+
+
+def apply_rope_1d(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """TRM's ``apply_rotary_pos_emb`` for one tensor: x [B, L, H, Dh], cos/sin [L, Dh], computed in float32."""
+    dtype = x.dtype
+    x = x.float()
+    return (x * cos[:, None, :] + _rotate_half(x) * sin[:, None, :]).to(dtype)
+
+
+ROPE_APPLY = {"2d": apply_rope_2d, "trm1d": apply_rope_1d}
+
+
 class Attention(nn.Module):
-    def __init__(self, hidden: int, heads: int):
+    def __init__(self, hidden: int, heads: int, pos_encoding: str = "2d"):
         super().__init__()
         self.heads = heads
         self.head_dim = hidden // heads
         self.qkv = CastedLinear(hidden, 3 * hidden)
         self.o = CastedLinear(hidden, hidden)
+        self.rope = ROPE_APPLY[pos_encoding]
 
     def forward(self, x: torch.Tensor, cos_sin: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         B, L, D = x.shape
-        q, k, v = self.qkv(x).view(B, L, 3, self.heads, self.head_dim).unbind(2)
+        q, k, v = self.qkv(x).view(B, L, 3, self.heads, self.head_dim).unbind(2)  # TRM's qkv_proj layout
         cos, sin = cos_sin
-        q, k = apply_rope_2d(q, cos, sin), apply_rope_2d(k, cos, sin)
+        q, k = self.rope(q, cos, sin), self.rope(k, cos, sin)
         out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
         return self.o(out.transpose(1, 2).reshape(B, L, D))
 
@@ -122,9 +161,9 @@ class Attention(nn.Module):
 class Block(nn.Module):
     """TRM post-norm block: h = rms(h + attn(h)); h = rms(h + mlp(h))."""
 
-    def __init__(self, hidden: int, heads: int, expansion: float, eps: float):
+    def __init__(self, hidden: int, heads: int, expansion: float, eps: float, pos_encoding: str = "2d"):
         super().__init__()
-        self.attn = Attention(hidden, heads)
+        self.attn = Attention(hidden, heads, pos_encoding)
         self.mlp = SwiGLU(hidden, expansion)
         self.eps = eps
 

@@ -223,12 +223,13 @@ def test_join_parent_dropout_forces_children_in_training_only():
     y, z = torch.randn(B, L, D, generator=g), torch.randn(B, L, D, generator=g)
     cy, cz = torch.randn(B, 1, L, D, generator=g), torch.randn(B, 1, L, D, generator=g)
     ys, zs, q, qc = cy.expand(B, 4, L, D), cz.expand(B, 4, L, D), torch.zeros(B), torch.zeros(B, 4)
-    y_new, z_new, mass, ent = m._join(y, z, ys, zs, q, qc, None, None)
+    y_new, z_new, mass, ent, drop = m._join(y, z, ys, zs, q, qc, None, None)
     torch.testing.assert_close(y_new, cy[:, 0])
     torch.testing.assert_close(z_new, cz[:, 0])
-    assert torch.isnan(mass).all() and torch.isnan(ent).all()
+    assert torch.isnan(mass).all() and torch.isnan(ent).all() and bool(drop.all())
     m.eval()
-    _, _, mass_eval, _ = m._join(y, z, ys, zs, q, qc, None, None)
+    _, _, mass_eval, _, drop_eval = m._join(y, z, ys, zs, q, qc, None, None)
+    assert drop_eval is None
     assert not torch.isnan(mass_eval).any() and bool((mass_eval[:, 0] > 0).all())
 
 

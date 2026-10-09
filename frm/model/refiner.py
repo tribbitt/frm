@@ -8,6 +8,10 @@ One round (= one deep-supervision step) with H_cycles=3:
                               per-cell attention join over {parent, children}     (join, with grad)
                               1 parent cycle with grad -> graded readout
 
+With ``fork_gate`` a gate head reads the pre-fork state and decides per row whether the round forks; a row that
+declines runs the rest of TRM's round instead (1 cycle without grad, 1 with), so it computes exactly what the K = 0
+control computes with the same weights. The gate is trained from measured counterfactual benefit (frm.objective).
+
 A cycle is n z-updates z = f(z, y + x + c) then one y-update y = f(y, z); f is the same two blocks everywhere.
 """
 
@@ -23,9 +27,10 @@ from torch.utils.checkpoint import checkpoint
 
 from frm.config import ModelCfg
 from frm.model.embedding import PuzzleEmbedding
-from frm.model.layers import Block, CastedLinear, Rope2D, block_params, rms_norm, trunc_normal_
+from frm.model.layers import Block, CastedLinear, Rope2D, RopeTRM1D, block_params, rms_norm, trunc_normal_
 
 CF_MODES = (None, "nofork", "sham")
+FORK_MODES = ("gate", "all", "none")
 
 
 @dataclass
@@ -44,6 +49,12 @@ class RoundOut:
     join_entropy: torch.Tensor | None  # [B] mean per-cell entropy of the join weights
     carry: Carry | None  # detached; None in outputs kept for instruments (frm.evaluate.run_rounds)
     pre_logits: torch.Tensor | None = None  # [B, S*S, V] parent readout just before the fork (detached; instruments)
+    # Adaptive forking. Child fields above keep full-B shapes; on rows with fork=False the join stats are NaN and the
+    # child logits/q are zeros that consumers must mask out with ``fork``.
+    fork: torch.Tensor | None = None  # [B] bool rows that forked this round (None for K = 0)
+    fork_logit: torch.Tensor | None = None  # [B] float32 gate logit (None without fork_gate)
+    cf_logits: torch.Tensor | None = None  # [B, S*S, V] no-fork continuation readout (detached); zeros off gate_rows
+    gate_rows: torch.Tensor | None = None  # [B] bool rows carrying a gate label (forked, own join, slot not dropped)
 
 
 class Refiner(nn.Module):
@@ -55,8 +66,11 @@ class Refiner(nn.Module):
 
         self.tok_emb = nn.Parameter(trunc_normal_(torch.empty(cfg.vocab, D), std=1.0 / self.scale))
         self.puzzle_emb = PuzzleEmbedding(num_ids, D)
-        self.rope = Rope2D(D // cfg.heads, P, cfg.rope_theta)
-        self.blocks = nn.ModuleList(Block(D, cfg.heads, cfg.expansion, cfg.rms_eps) for _ in range(cfg.layers))
+        rope = {"2d": Rope2D, "trm1d": RopeTRM1D}[cfg.pos_encoding]
+        self.rope = rope(D // cfg.heads, P, cfg.rope_theta)
+        self.blocks = nn.ModuleList(
+            Block(D, cfg.heads, cfg.expansion, cfg.rms_eps, cfg.pos_encoding) for _ in range(cfg.layers)
+        )
         self.lm_head = CastedLinear(D, cfg.vocab)
         self.q_head = CastedLinear(D, 1, bias=True, std=0.0)
         with torch.no_grad():
@@ -73,6 +87,15 @@ class Refiner(nn.Module):
             self.join_beta = nn.Parameter(torch.zeros(()))
             if cfg.noise_dim:
                 self.code_noise = CastedLinear(cfg.noise_dim, D, std=cfg.noise_init / math.sqrt(cfg.noise_dim))
+        # Gate head (DESIGN.md §4.8), built last so the other parameters initialise as in an ungated model. A declined
+        # row must reproduce TRM's round from the pre-fork state, which already used H-2 of TRM's H-grad no-grad cycles.
+        self.gate: nn.Module | None = None
+        if cfg.fork_gate and cfg.K > 0:
+            if cfg.fork_depth != 1 or cfg.grad_cycles > 2:
+                raise ValueError("fork_gate needs fork_depth=1 and grad_cycles <= 2")
+            self.gate = nn.Sequential(
+                CastedLinear(2 * D, cfg.gate_hidden), nn.SiLU(), CastedLinear(cfg.gate_hidden, 1, bias=True)
+            )
         self._cycle_fn = self._cycle
 
     # ------------------------------------------------------------------ basics
@@ -80,13 +103,25 @@ class Refiner(nn.Module):
         """torch.compile the cycle; call before training/eval on GPU.
 
         One graph per (bucket, batch size, grad mode, child/parent variant): ~3 per bucket in training plus eval
-        variants, well over dynamo's default limit of 8, after which it silently falls back to eager."""
+        variants, well over dynamo's default limit of 8, after which it silently falls back to eager. With the fork
+        gate the forked and declined subsets change size every step, so the batch dimension is marked dynamic (one
+        graph per bucket and variant instead of one per subset size); ungated models keep fully static graphs."""
         import torch._dynamo
 
         for name in ("recompile_limit", "cache_size_limit", "accumulated_recompile_limit", "accumulated_cache_size_limit"):
             if hasattr(torch._dynamo.config, name):
                 setattr(torch._dynamo.config, name, max(getattr(torch._dynamo.config, name), 512))
-        self._cycle_fn = torch.compile(self._cycle, dynamic=False, **kwargs)
+        if self.gate is None:
+            self._cycle_fn = torch.compile(self._cycle, dynamic=False, **kwargs)
+            return
+        compiled = torch.compile(self._cycle, **kwargs)
+
+        def cycle(y, z, x, c, cos, sin, n: int, ckpt: bool = False):
+            for t in (y, z, x) if c is None else (y, z, x, c):
+                torch._dynamo.maybe_mark_dynamic(t, 0)
+            return compiled(y, z, x, c, cos, sin, n, ckpt)
+
+        self._cycle_fn = cycle
 
     def init_carry(self, B: int, S: int, device: torch.device, dtype: torch.dtype) -> Carry:
         L = self.cfg.prefix_len + S * S
@@ -142,7 +177,8 @@ class Refiner(nn.Module):
         return codes
 
     def _join(self, y, z, ys, zs, q_parent, q_children, cf, sham_perm):
-        """Per-cell softmax attention of the parent over {parent, children}; returns new (y, z) and stats."""
+        """Per-cell softmax attention of the parent over {parent, children}; returns new (y, z), stats and the rows
+        whose parent slot was dropped (None when dropout is off)."""
         if cf == "sham":  # children of another row: tests whether the parent uses child *content*
             perm = sham_perm if sham_perm is not None else torch.roll(torch.arange(ys.shape[0], device=ys.device), 1)
             ys, zs, q_children = ys[perm], zs[perm], q_children[perm]
@@ -170,7 +206,7 @@ class Refiner(nn.Module):
         if drop is not None:  # forced rows say nothing about the join's choice: NaN is skipped by the training logs
             mass = mass.masked_fill(drop[:, None], float("nan"))
             ent = ent.masked_fill(drop, float("nan"))
-        return y_new, z_new, mass, ent
+        return y_new, z_new, mass, ent, drop
 
     def _node(self, y, z, x, c, depth: int, cos, sin, cf, sham_perm=None, gen=None):
         """Fork K children (each a node one level deeper), join them, run the post cycle. Returns children too.
@@ -192,9 +228,9 @@ class Refiner(nn.Module):
         ys, zs = yk.view(B, K, L, D), zk.view(B, K, L, D)
         q_parent = self._q(y)
         q_children = self._q(yk).view(B, K)
-        y, z, alpha, ent = self._join(y, z, ys, zs, q_parent, q_children, cf, sham_perm)
+        y, z, alpha, ent, drop = self._join(y, z, ys, zs, q_parent, q_children, cf, sham_perm)
         y, z = self._cycle_fn(y, z, x, c, cos, sin, cfg.L_cycles)
-        return y, z, (ys, q_children, alpha, ent)
+        return y, z, (ys, q_children, alpha, ent, drop)
 
     # ------------------------------------------------------------------ heads / round
     def _q(self, y: torch.Tensor) -> torch.Tensor:
@@ -202,6 +238,27 @@ class Refiner(nn.Module):
 
     def _logits(self, y: torch.Tensor) -> torch.Tensor:
         return self.lm_head(y[..., self.cfg.prefix_len :, :]).float()
+
+    def _trm_tail(self, y, z, x, cos, sin, nograd: int):
+        """The end of TRM's round: ``nograd`` cycles without grad, then ``grad_cycles`` cycles in the caller's mode."""
+        n = self.cfg.L_cycles
+        with torch.no_grad():
+            for _ in range(nograd):
+                y, z = self._cycle_fn(y, z, x, None, cos, sin, n)
+        for _ in range(self.cfg.grad_cycles):
+            y, z = self._cycle_fn(y, z, x, None, cos, sin, n)
+        return y, z
+
+    def _decide(self, fork_logit, fork_mode: str, explore: float, B: int, device) -> torch.Tensor:
+        """[B] bool: rows that fork this round."""
+        if fork_mode == "none":
+            return torch.zeros(B, dtype=torch.bool, device=device)
+        if fork_mode == "all" or fork_logit is None:
+            return torch.ones(B, dtype=torch.bool, device=device)
+        fork = fork_logit > 0
+        if explore > 0:  # declined rows still fork now and then, so labels keep arriving for the states it declines
+            fork = fork | (torch.rand(B, device=device) < explore)
+        return fork
 
     def round(
         self,
@@ -211,53 +268,117 @@ class Refiner(nn.Module):
         cf: str | None = None,
         sham_perm: torch.Tensor | None = None,
         gen: torch.Generator | None = None,
+        fork_mode: str = "gate",
+        explore: float = 0.0,
     ) -> RoundOut:
         """One deep-supervision round. Gradient flows only if grad mode is enabled by the caller.
 
         ``cf``: None, "nofork" (root join forced onto the parent slot) or "sham" (root join reads the children of row
-        ``sham_perm[b]``; default: the next row). ``gen``: generator for the children's noise (None = global RNG);
-        evaluation passes a seeded one so results are reproducible and counterfactuals see the same noise."""
-        assert cf in CF_MODES
+        ``sham_perm[b]``; default: the next row); both apply to the rows that fork. ``gen``: generator for the
+        children's noise (None = global RNG); evaluation passes a seeded one so results are reproducible and
+        counterfactuals see the same noise.
+
+        ``fork_mode`` (K > 0): "gate" forks the rows whose gate logit is > 0, plus each declined row with probability
+        ``explore`` (training); without ``fork_gate`` it means "all". "all" forks every row, "none" no row (TRM's
+        round with the shared weights). Each subset is gathered and run on its own, so declined rows cost a TRM round.
+        With the gate, rows in ``gate_rows`` also get the no-fork continuation's readout (``cf_logits``, no grad)."""
+        assert cf in CF_MODES and fork_mode in FORK_MODES
         cfg = self.cfg
         S = int(round(math.sqrt(inputs.shape[1])))
         y, z = carry.y, carry.z
         x = self.embed(inputs, puzzle_ids, y.dtype)
         cos, sin = self.rope(S, y.device)
-        n = cfg.L_cycles
-        child_logits = child_q = alpha = ent = pre_logits = None
         if cfg.K == 0:
-            with torch.no_grad():
-                for _ in range(cfg.H_cycles - cfg.grad_cycles):
-                    y, z = self._cycle_fn(y, z, x, None, cos, sin, n)
-            for _ in range(cfg.grad_cycles):
-                y, z = self._cycle_fn(y, z, x, None, cos, sin, n)
+            y, z = self._trm_tail(y, z, x, cos, sin, cfg.H_cycles - cfg.grad_cycles)
+            return RoundOut(
+                logits=self._logits(y), q=self._q(y), child_logits=None, child_q=None, join_alpha=None,
+                join_entropy=None, carry=Carry(y.detach(), z.detach()),
+            )
+        with torch.no_grad():
+            for _ in range(cfg.H_cycles - 2):
+                y, z = self._cycle_fn(y, z, x, None, cos, sin, cfg.L_cycles)
+            pre_logits = self._logits(y)
+        B, K, P = y.shape[0], cfg.K, cfg.prefix_len
+        fork_logit = None
+        if self.gate is not None:  # reads the no-grad pre-fork state, so it sends no gradient into the trunk
+            fork_logit = self.gate(torch.cat([y[:, 0], y[:, P:].mean(1)], dim=-1)).squeeze(-1).float()
+        fork = self._decide(fork_logit, fork_mode, explore, B, y.device)
+        if fork_mode == "none":
+            n_fork = 0
+        elif fork_mode == "all" or self.gate is None:
+            n_fork = B
         else:
-            with torch.no_grad():
-                for _ in range(cfg.H_cycles - 2):
-                    y, z = self._cycle_fn(y, z, x, None, cos, sin, n)
-                pre_logits = self._logits(y)
-            y, z, (ys, child_q, alpha, ent) = self._node(y, z, x, None, 0, cos, sin, cf, sham_perm, gen)
+            n_fork = int(fork.sum())  # host sync: the subsets' sizes
+        rest = 2 - cfg.grad_cycles  # no-grad cycles a declined row still owes TRM's round (H-2 already ran)
+        drop = None
+        if n_fork == B:
+            y_out, z_out, (ys, child_q, alpha, ent, drop) = self._node(y, z, x, None, 0, cos, sin, cf, sham_perm, gen)
             child_logits = self._logits(ys)
+        else:
+            f32 = torch.float32
+            child_logits = pre_logits.new_zeros(B, K, *pre_logits.shape[1:])
+            child_q = pre_logits.new_zeros(B, K)
+            alpha = torch.full((B, K + 1), float("nan"), dtype=f32, device=y.device)
+            ent = torch.full((B,), float("nan"), dtype=f32, device=y.device)
+            if n_fork == 0:
+                y_out, z_out = self._trm_tail(y, z, x, cos, sin, rest)
+            else:
+                order = torch.argsort((~fork).to(torch.uint8), stable=True)
+                idx_f, idx_n = order[:n_fork], order[n_fork:]
+                if cf == "sham":  # children of every row, so that sham_perm keeps indexing the whole batch
+                    yf, zf, stats = self._node(y, z, x, None, 0, cos, sin, cf, sham_perm, gen)
+                    yf, zf = yf[idx_f], zf[idx_f]
+                    ys, cq, a, e = (t[idx_f] for t in stats[:4])
+                else:
+                    yf, zf, (ys, cq, a, e, d) = self._node(
+                        y[idx_f], z[idx_f], x[idx_f], None, 0, cos, sin, cf, None, gen
+                    )
+                    if d is not None:
+                        drop = torch.zeros_like(fork)
+                        drop[idx_f] = d
+                yn, zn = self._trm_tail(y[idx_n], z[idx_n], x[idx_n], cos, sin, rest)
+                y_out = y.index_copy(0, idx_f, yf).index_copy(0, idx_n, yn)
+                z_out = z.index_copy(0, idx_f, zf).index_copy(0, idx_n, zn)
+                child_logits = child_logits.index_copy(0, idx_f, self._logits(ys))
+                child_q = child_q.index_copy(0, idx_f, cq)
+                alpha, ent = alpha.index_copy(0, idx_f, a), ent.index_copy(0, idx_f, e)
+        cf_logits = gate_rows = None
+        if self.gate is not None:
+            # Label rows: a fork whose join is the model's own (no counterfactual override, parent slot not dropped),
+            # compared with the TRM continuation those rows would have run from the same pre-fork state.
+            gate_rows = torch.zeros_like(fork) if cf is not None else fork if drop is None else fork & ~drop
+            cf_logits = torch.zeros_like(pre_logits)
+            if cf is None and n_fork:
+                with torch.no_grad():
+                    idx_g = gate_rows.nonzero().squeeze(1)
+                    if idx_g.numel():
+                        yg, _ = self._trm_tail(y[idx_g], z[idx_g], x[idx_g], cos, sin, rest)
+                        cf_logits.index_copy_(0, idx_g, self._logits(yg))
         return RoundOut(
-            logits=self._logits(y),
-            q=self._q(y),
+            logits=self._logits(y_out),
+            q=self._q(y_out),
             child_logits=child_logits,
             child_q=child_q,
             join_alpha=alpha,
             join_entropy=ent,
-            carry=Carry(y.detach(), z.detach()),
+            carry=Carry(y_out.detach(), z_out.detach()),
             pre_logits=pre_logits,
+            fork=fork,
+            fork_logit=fork_logit,
+            cf_logits=cf_logits,
+            gate_rows=gate_rows,
         )
 
     # ------------------------------------------------------------------ accounting
-    def passes_per_round(self) -> tuple[int, int, int]:
+    def passes_per_round(self, fork: bool = True) -> tuple[int, int, int]:
         """(no-grad passes, grad passes, checkpoint-recomputed passes) per parent row per training round.
 
-        A pass is one application of f (all blocks) to one row; children count once per child.
+        A pass is one application of f (all blocks) to one row; children count once per child. ``fork=False``: a row
+        that does not fork, i.e. TRM's round (what every K = 0 row and every row the gate declines runs).
         """
         cfg = self.cfg
         n, nc = cfg.L_cycles + 1, (cfg.child_L_cycles or cfg.L_cycles) + 1
-        if cfg.K == 0:
+        if cfg.K == 0 or not fork:
             return (cfg.H_cycles - cfg.grad_cycles) * n, cfg.grad_cycles * n, 0
 
         def node(depth: int) -> tuple[int, int]:  # (grad passes, leaf passes) below and including this node
@@ -275,9 +396,24 @@ class Refiner(nn.Module):
         return cfg.layers * L * (2 * block_params(cfg.hidden, cfg.expansion) + 4 * L * cfg.hidden)
 
     def train_flops_per_row(self, S: int) -> float:
+        """Training FLOPs per row-round when every round forks (bench, docs; the trainer uses round_flops)."""
         nograd, grad, recompute = self.passes_per_round()
         return (nograd + 3 * grad + recompute) * self.flops_per_row_pass(S)
 
     def eval_flops_per_row(self, S: int) -> float:
         nograd, grad, _ = self.passes_per_round()
         return (nograd + grad) * self.flops_per_row_pass(S)
+
+    def round_flops(self, S: int, rows: int, fork_rows: int, cf_rows: int, train: bool = True) -> float:
+        """FLOPs of one round over ``rows`` rows of which ``fork_rows`` forked and ``cf_rows`` also ran the no-fork
+        continuation for their gate label (2 cycles forward only). Grad passes cost 3x in training (forward +
+        backward), checkpoint recompute is counted when on; the gate head itself is negligible and not counted.
+        fork_rows == rows, cf_rows == 0 gives rows * train_flops_per_row(S)."""
+
+        def units(passes: tuple[int, int, int]) -> int:
+            nograd, grad, recompute = passes
+            return nograd + 3 * grad + recompute if train else nograd + grad
+
+        cont = 2 * (self.cfg.L_cycles + 1)
+        total = (rows - fork_rows) * units(self.passes_per_round(fork=False)) + fork_rows * units(self.passes_per_round())
+        return (total + cf_rows * cont) * self.flops_per_row_pass(S)

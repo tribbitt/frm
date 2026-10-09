@@ -10,6 +10,7 @@ final checkpoint, final dev evaluation, RUN/DONE, exit 0; any failure -> nonzero
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -31,7 +32,7 @@ from frm.objective import Objective, tau_at
 
 ROUND_METRICS = (
     "exact", "ce", "q_loss", "q_acc", "set", "child_exact_any", "child_ce_min", "parent_mass", "join_entropy",
-    "distinct", "sub_coverage",
+    "distinct", "sub_coverage", "fork_rate", "gate_acc", "gate_pos", "benefit",
 )
 
 
@@ -72,17 +73,33 @@ class EMA:
             self.shadow[n].copy_(tmp)
 
 
-def load_pretrained(model: Refiner, path: str, device: torch.device) -> None:
+def load_pretrained(model: Refiner, path: str, device: torch.device, mode: str = "adapt") -> None:
     """Load dense weights and fixed buffers from a checkpoint (EMA weights when present).
 
-    The puzzle-embedding table belongs to the new dataset's identifiers: every row except the blank becomes the mean of
-    the checkpoint's *trained* rows (TRM's reset-to-mean, applied only to the new table; averaging the never-trained
-    zero rows too would shrink it by the checkpoint's coverage, which differs between arms). New rows start untrained.
+    ``mode="adapt"``: the puzzle-embedding table belongs to a new dataset's identifiers. Every row except the blank
+    becomes the mean of the checkpoint's *trained* rows (TRM's reset-to-mean, applied only to the new table; averaging
+    the never-trained zero rows too would shrink it by the checkpoint's coverage, which differs between arms), and the
+    new rows start untrained.
+
+    ``mode="continue"``: the same dataset (identifier for identifier). The table and its visit counts are kept, and
+    the model may have modules the checkpoint lacks — the fork modules of a K>0 model started from a K=0 checkpoint
+    (an imported TRM) — which keep their fresh initialisation. Every shared weight must be present.
     """
     ck = torch.load(path, map_location=device, weights_only=False)
     state = dict(ck["model"])
     if "ema" in ck:
         state.update(ck["ema"])
+    if mode == "continue":
+        if state["puzzle_emb.table"].shape != model.puzzle_emb.table.shape:
+            raise ValueError(f"{path}: init_mode=continue needs the checkpoint's dataset ({ck.get('num_ids')} ids), "
+                             f"the model has {model.puzzle_emb.num_ids}")
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        shared = set(Refiner(_forkless(model.cfg), num_ids=1).state_dict())
+        if unexpected or any(k in shared for k in missing):
+            raise ValueError(f"checkpoint/model mismatch: missing {missing}, unexpected {unexpected}")
+        return
+    if mode != "adapt":
+        raise ValueError(f"init_mode {mode!r} not in ('adapt', 'continue')")
     old = state.pop("puzzle_emb.table")
     old_visits = state.pop("puzzle_emb.visits", None)
     trained = (old_visits > 0) if old_visits is not None else (old != 0).any(-1)
@@ -96,6 +113,12 @@ def load_pretrained(model: Refiner, path: str, device: torch.device) -> None:
         model.puzzle_emb.table.copy_(old[trained].mean(0).expand_as(model.puzzle_emb.table))
         model.puzzle_emb.table[0].zero_()
         model.puzzle_emb.visits.zero_()
+
+
+def _forkless(cfg):
+    """The K=0 twin of a model config: its state-dict keys are the weights every arm shares."""
+    fields = {f.name for f in dataclasses.fields(cfg)}
+    return dataclasses.replace(cfg, K=0, **({"fork_gate": False} if "fork_gate" in fields else {}))
 
 
 @dataclass
@@ -170,20 +193,26 @@ class Trainer:
         self.ds = Dataset(cfg.data.root)
         self.model = Refiner(cfg.model, self.ds.num_ids).to(self.device)
         if tc.init_from:
-            load_pretrained(self.model, tc.init_from, self.device)
+            load_pretrained(self.model, tc.init_from, self.device, tc.init_mode)
         if tc.compile:
             self.model.compile_cycles()
         self.objective = Objective(cfg.objective)
         fused = self.device.type == "cuda"
-        self.opt = torch.optim.AdamW(
-            self.model.parameters(), lr=tc.lr, betas=(tc.beta1, tc.beta2), weight_decay=tc.weight_decay, fused=fused
-        )
+        groups = [{"params": list(self.model.parameters()), "lr_mult": 1.0}]
+        if tc.fork_lr_mult != 1.0 and cfg.model.K > 0:
+            shared = set(Refiner(_forkless(cfg.model), num_ids=1).state_dict())
+            named = list(self.model.named_parameters())
+            groups = [{"params": [p for n, p in named if n in shared], "lr_mult": 1.0},
+                      {"params": [p for n, p in named if n not in shared], "lr_mult": tc.fork_lr_mult}]
+        self.opt = torch.optim.AdamW(groups, lr=tc.lr, betas=(tc.beta1, tc.beta2), weight_decay=tc.weight_decay,
+                                     fused=fused)
         self.scaler = torch.amp.GradScaler("cuda") if self.dtype == torch.float16 else None
         self.ema = EMA(self.model, tc.ema)
         self.step = 0
         self.flops = 0.0
         self.row_rounds = 0  # training rows x rounds processed (for matched-sample comparisons between arms)
         self.best = -1.0
+        self.price = cfg.objective.fork_price  # fork price (nats/token) behind the gate's labels; a controller moves it
         self.next_eval = tc.eval_every_pflops
         if "test" in cfg.eval.splits:
             raise ValueError("eval.splits must not contain 'test': checkpoints are selected on dev (DESIGN.md D14)")
@@ -218,6 +247,7 @@ class Trainer:
             "step": self.step,
             "flops": self.flops,
             "row_rounds": self.row_rounds,
+            "price": self.price,
             "best": self.best,
             "next_eval": self.next_eval,
             "streams": {S: s.state_dict() for S, s in self.streams.items()},
@@ -276,6 +306,7 @@ class Trainer:
             self.scaler.load_state_dict(ck["scaler"])
         self.step, self.flops, self.best, self.next_eval = ck["step"], ck["flops"], ck["best"], ck["next_eval"]
         self.row_rounds = ck["row_rounds"]
+        self.price = ck.get("price", self.price)  # checkpoints written before the fork gate carry none
         for S, st in ck["streams"].items():
             if S in self.streams:
                 self.streams[S].load_state_dict(st)
@@ -339,17 +370,31 @@ class Trainer:
         self.model.train()
         f = self.lr_factor()
         for g in self.opt.param_groups:
-            g["lr"] = tc.lr * f
+            g["lr"] = tc.lr * f * g["lr_mult"]
         progress = self.progress()
-        out = self.model.round(st.carry, st.batch["inputs"], st.batch["puzzle_ids"])
-        loss, m = self.objective(out, st.batch, progress, has_subgoals=bool(st.has_sub.any()))
+        # Fork policy: every row-round forks while the gate familiarises itself with what forks do, then the gate
+        # decides, with an exploration floor (ignored by ungated models, where "gate" means every row forks).
+        forced = progress < tc.fork_force_frac
+        fork_mode, explore = ("all", 0.0) if forced else ("gate", tc.fork_explore)
+        out = self.model.round(
+            st.carry, st.batch["inputs"], st.batch["puzzle_ids"], fork_mode=fork_mode, explore=explore
+        )
+        price = self.price
+        loss, m = self.objective(out, st.batch, progress, has_subgoals=bool(st.has_sub.any()), price=price)
         if self.scaler:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.opt)
         else:
             loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), tc.grad_clip)
-        loss_val, gnorm_val = torch.stack([loss.detach().float(), gnorm.float()]).tolist()
+        host = [loss.detach().float(), gnorm.float()]  # one device->host sync for the scalars and the fork counts
+        if out.fork is not None:
+            host.append(out.fork.sum().float())
+        if out.gate_rows is not None:
+            host.append(out.gate_rows.sum().float())
+        loss_val, gnorm_val, *counts = torch.stack(host).tolist()
+        n_fork = int(counts[0]) if out.fork is not None else st.rows
+        n_cf = int(counts[1]) if out.gate_rows is not None else 0
         if not math.isfinite(loss_val):
             raise FloatingPointError(f"non-finite loss at step {self.step}")
         if self.scaler:
@@ -368,8 +413,11 @@ class Trainer:
             per_row = {name: m[name] for name in ROUND_METRICS if name in m}
             per_row["first_solve"] = exact & ~st.solved
             per_row["regress"] = st.prev_exact & ~exact
-            if "winner" in m:
-                per_row.update({f"win{k}": m["winner"] == k for k in range(self.cfg.model.K)})
+            if "winner" in m:  # NaN on rows that did not fork
+                w = m["winner"]
+                per_row.update(
+                    {f"win{k}": (w == k).float().masked_fill(w.isnan(), math.nan) for k in range(self.cfg.model.K)}
+                )
             self.stats.add_many(st.steps, per_row)
             st.solved |= exact
             st.prev_exact = exact
@@ -380,10 +428,15 @@ class Trainer:
                 min_rounds = torch.randint(2, tc.max_rounds + 1, (st.rows,), device=self.device)
                 halted &= st.steps >= torch.where(explore, min_rounds, 0)
             st.halted = halted
-        self.flops += st.rows * self.model.train_flops_per_row(S)
+        self.flops += self.model.round_flops(S, st.rows, n_fork, n_cf)
         self.row_rounds += st.rows
         self.step += 1
-        return {"loss": loss_val, "gnorm": gnorm_val, "S": S, "rows": st.rows, "tau": tau_at(self.cfg.objective, progress)}
+        if self.model.gate is not None and not forced and tc.fork_rate_target > 0:
+            self.price = max(0.0, self.price + tc.fork_price_lr * (n_fork / st.rows - tc.fork_rate_target))
+        info = {"loss": loss_val, "gnorm": gnorm_val, "S": S, "rows": st.rows, "tau": tau_at(self.cfg.objective, progress)}
+        if self.model.gate is not None:
+            info["price"] = price
+        return info
 
     # ------------------------------------------------------------------ evaluation
     def evaluate(self, final: bool = False) -> dict:
@@ -410,6 +463,7 @@ class Trainer:
                         "step": self.step,
                         "flops": self.flops,
                         "row_rounds": self.row_rounds,
+                        "price": self.price,
                         "cfg": self.cfg.to_dict(),
                         "num_ids": self.ds.num_ids,
                         "score": score,

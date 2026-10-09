@@ -24,7 +24,7 @@ forward forks. Only the user may retire, defer, or make conditional any row.
 | core idea | trained in the forward? | where | gate that proves it |
 |---|---|---|---|
 | tied-weight TRM refiner (y, z, H/L cycles, deep supervision, ACT) | **yes** | `frm/model/refiner.py` `Refiner.cycle`, `Refiner.round` | `tests/test_model.py::test_trm_mode_matches_reference_structure` |
-| **forking**: every training round spawns K children from the parent state, runs them through the same tied refiner, and joins them back into the parent before the graded readout | **yes, every round, K≥1 in every non-control config** | `Refiner.round` (`_fork`, `_join`) | `tests/test_model.py::test_fork_gate` fails if no child cycle runs or if the parent loss sends no gradient into the fork codes, child cycles and join |
+| **forking**: a training round spawns K children from the parent state, runs them through the same tied refiner, and joins them back into the parent before the graded readout | **yes, K≥1 in every non-control config: every round by default; with `fork_gate` (user decision, D5) every round during the forced-fork phase, then on the rows the gate picks plus an exploration floor** | `Refiner.round` (`_node`, `_join`) | `tests/test_model.py::test_fork_gate` fails if no child cycle runs or if the parent loss sends no gradient into the fork codes, child cycles and join; `tests/test_gate.py` fails if a gated round's forked rows are not exactly the FRM round |
 | children may fork again (nested) | yes when `fork_depth ≥ 2` (off by default for compute; see §4.5) | `Refiner._node` | `test_nested_fork_gate` |
 | depth utilisation as a first-class objective | yes: objective + data + instruments (§5, §7.3) | `frm/objective.py`, `frm/data/composite.py` | per-round metrics logged every eval; `EXPERIMENTS.md` decision rules |
 
@@ -69,9 +69,9 @@ sham-children counterfactual costs nothing. A negative result means redesign of 
 |---|---|---|---|---|
 | D1 | task conditioning | TRM's per-augmented-puzzle embedding, transductive (all demos of all tasks, incl. eval demos, in training; eval *test* pairs never) | in-context lineage models: 2–12% ARC-AGI-1 [M: tiny 25/419, tinyabstractor 11.5% a1_test]; TRM-style 40–45% [M: TRM ckpt 169/190 of 419 on tiny's harness]; Kaggle-feasible via full fine-tune [L: McGovern 2511.02886, 6.67% ARC-AGI-2 semi-private] | in-context demo encoder (ARM support-TTT, tinyabstractor): weaker at our compute, larger sequences |
 | D2 | backbone | TRM exactly: 2 post-norm blocks, d=512, 8 heads, SwiGLU ×4, one module for both y and z updates, fixed (non-learned) init buffers, stablemax CE, q-head on position 0 | `trm-samsung/models/recursive_reasoning/trm.py:65-222` | HRM two-module, ARM latents (ARM's H-level got no CE gradient [M]) |
-| D3 | positions | 2D RoPE (row/col halves of each head), prefix tokens unrotated | needed for size buckets; 1D RoPE over a variable stride was a measured frmv1 bug [M: `frmv1/models/layers.py:44-52`] | TRM 1D RoPE over 30×30 |
+| D3 | positions | 2D RoPE (row/col halves of each head), prefix tokens unrotated; **`trm1d`** for models started from a published TRM checkpoint: TRM's 1-D RoPE with every cell at its 30×30-canvas index (prefix i → i, cell (r,c) → 16+30r+c), so the checkpoint keeps its relative positions on every bucket (`layers.RopeTRM1D`; import is numerically exact at S=30, §4.9) | needed for size buckets; 1D RoPE over a variable stride was a measured frmv1 bug [M: `frmv1/models/layers.py:44-52`] (a fixed stride of 30 is not that bug) | TRM 1D RoPE over 30×30 |
 | D4 | canvas | size buckets {8,12,16,20,24,30}, chosen from demo grids + test input + a demo-verified size rule; never from the test output | token cost 0.32–0.49 of 30×30 on ARC-AGI-1 sets, 0.82 on ARC-AGI-2 eval; overflow 2/419 a1 eval, 1/172 a2 eval [M: computed from `trm-samsung/kaggle/combined`, see §3.3] | fixed 30×30 (2–3× more tokens) |
-| D5 | fork structure | **fixed-structure**: every round forks K children (default K=4) at the middle cycle; no learned "whether to fork" gate | learned gates collapse to schedules [M: frmv1 gate 98.9% cycle-index variance]; discrete decisions add high-variance gradients [L: research C10] | learned fork gate, REINFORCE/Gumbel fork decisions |
+| D5 | fork structure | **fixed structure by default**: every round forks K children (default K=4) at the middle cycle. **Adaptive forking (`fork_gate`, the user's decision):** a gate head on the pre-fork state decides per row and round whether to fork; declined rows run TRM's round (§4.8) | learned gates collapse to schedules [M: frmv1 gate 98.9% cycle-index variance]; discrete decisions add high-variance gradients [L: research C10]. The gate therefore gets **no end-to-end gradient**: it is trained by BCE on labels from the *measured* counterfactual benefit of each fork (fork CE vs the no-fork continuation's CE, from the same state), after a **forced-fork familiarisation phase** (`fork_force_frac`), with an **exploration floor** (`fork_explore`) so declined states keep getting labels, and **no step-index input** (it reads only the state) | REINFORCE/Gumbel fork decisions, a soft gate trained through the loss, round-index features |
 | D6 | child symmetry breaking and diversity | non-zero, distinct learned fork codes injected at **every** child z-update (inside the gradient window), a parent-conditioned per-cell code, and **fresh per-round noise** through a learned map | tiny's zero-init codes + zero-init arbitration collapsed onto child 0 (w=0.993) [M: `tiny/results/fork_probe.json`]; anything only on a no-grad path never trains [M: tinyv2.2 `init_state`, ARM latents]; deterministic recursion has no escape from a wrong fixed point [L: PTRM 2605.19943]; IMLE cannot drop modes [L: 1809.09087] | zero-init codes, seeds only in warm-up, deterministic children |
 | D7 | child information | children start from the full parent state (y, z) and see the full input x; nothing is masked | masked/starved children equalled random shams [M: tinyabstractor I-9, children right 0.13 vs base 0.74 on disagreements] | crop/masked-plane children |
 | D8 | join | per-cell softmax attention over {parent, child₁..child_K} on (y, z), with gradient; parent slot lets the parent ignore children | detached joins train nothing [M: tinyabstractor `fork_in` detaches all; frmv2 "nothing learned through the merge" removed forks]; merge forms carried the decomposition solver's gains (21-0) while branch-only forms were null [M: decomposition-solver-arc ladder] | detached claim join, inference-only selection |
@@ -291,8 +291,80 @@ table: `n_ids × 512` fp32, outside the dense count (≈ 600k rows for the `a1` 
 2. Children's cycles run with grad; the pre-fork cycle runs without.
 3. The carry is detached: a round's loss sends no gradient into the previous round.
 4. `trm` control reproduces TRM's structure: (H−1) no-grad cycles, one grad cycle, same op order.
-5. Inference forward == training forward (same function, no grad), except the training-only parent-slot dropout.
+5. Inference forward == training forward (same function, no grad), except the training-only parent-slot dropout and
+   fork exploration.
 6. No parameter is reachable only through a no-grad path (`test_every_param_gets_grad`).
+7. With `fork_gate`: a declined row's round equals the K = 0 round with the same weights, a forked row's equals the
+   ungated FRM round, each row is independent of how the batch was split, and the gate head gets gradient only from
+   its own loss and sends none into the trunk (`tests/test_gate.py`).
+
+### 4.8 Adaptive forking (`fork_gate`)
+
+Off by default (every round forks, as above). The user decided (D5) that the model should choose, per row and round,
+whether to fork, so forks are spent where they pay. Forking stays in the trained forward; the gate only decides where.
+
+```
+no_grad: (H−2) × cycle(y, z, x, 0)                               # pre-fork cycle, every row
+g    = MLP([y[:,0] ‖ mean_cells(y)])   2d → gate_hidden → SiLU → 1   # on the detached pre-fork state
+fork = g > 0, or (training) with probability fork_explore anyway
+forked rows:   children → join (parent-slot dropout) → post cycle → readout      # the FRM round of §4.2
+declined rows: no_grad (H−grad_cycles)−(H−2) cycles, then grad_cycles cycles     # = the K = 0 round, same weights
+label rows (forked, own join, slot not dropped): no_grad, the declined rows' continuation from the same
+         pre-fork state → cf_logits                                             # what not forking would have given
+```
+
+- **Execution.** Each subset is gathered, run on its own and scattered back (`index_copy`, autograd-safe), so a declined
+  row costs a TRM round and no children. Child outputs keep full-batch shapes: join statistics are NaN and child
+  logits zeros on declined rows (`RoundOut.fork` masks them). Exception: the `sham` counterfactual runs the children
+  of every row, so the permutation keeps indexing the whole batch. With `compile`, the cycle's batch dimension is
+  marked dynamic (subset sizes change every step); ungated models keep static graphs.
+- **Training signal.** No end-to-end gradient: the gate's inputs are detached, and it is trained by BCE against the
+  label "this fork beat the no-fork continuation by more than the price" (`OBJECTIVE.md` §3.6), measured on the label
+  rows. The trunk's losses never reach the gate, and the gate's loss never reaches the trunk.
+- **Collapse risk and mitigations.** frmv1's learned gate became a schedule (98.9% of its variance was the cycle index
+  [M]). Here: (1) labels come from the *measured* counterfactual benefit of each fork, not from gradients through the
+  decision; (2) a **forced-fork familiarisation phase**: for the first `train.fork_force_frac` (0.3) of training every
+  row-round forks, so children and join learn everywhere and the gate gets labels on every state; (3) an
+  **exploration floor**: afterwards a declined row forks anyway with probability `train.fork_explore` (0.1), so the
+  states the gate declines keep producing labels (otherwise a "no" can never be corrected); (4) **no step-index
+  input**: the gate reads only the state. `fork.rate_by_round` shows whether it nevertheless became a schedule.
+- **Price.** `objective.fork_price` (nats per supervised token, default 0: fork whenever it helps at all). With
+  `train.fork_rate_target > 0` the trainer moves it after each gated step:
+  price ← max(0, price + `fork_price_lr` · (batch fork rate − target)); not during the forced phase, whose rate is 1
+  by construction. The price is trainer state: logged (`price`), checkpointed in `last.pt`/`best.pt`, restored on
+  resume; adaptation inherits it and skips the forced phase.
+- **Accounting.** The trainer charges `Refiner.round_flops(S, rows, fork_rows, cf_rows)` from the step's actual counts
+  (declined rows at the K = 0 cost, forked rows at the FRM cost, label rows plus the continuation's 2 forward
+  cycles); `passes_per_round`/`train_flops_per_row` remain the every-round-forks numbers (§9, bench).
+- **Evaluation** uses the gate's decisions (no exploration); `cf.allfork`/`cf.gateoff` rerun with every row / no row
+  forking (§7.2). Requires `fork_depth = 1` and `grad_cycles ≤ 2` (else `ValueError`).
+
+### 4.9 Warm start from a published TRM (`scripts/import_trm.py`)
+
+The ARC Prize verified TRM checkpoints (`arcprize/trm_arc_prize_verification`: `arc_v1_public/step_518071`, trained
+for TRM's full recipe, 40% on ARC-AGI-1 semi-private; `arc_v2_public`, 6.2% on ARC-AGI-2) load into frm:
+
+- **Weights.** frm's refiner is TRM's (D2): every dense tensor maps one to one (qkv layout, SwiGLU width 1536,
+  H_init/L_init → y_init/z_init, q_head's halt row). With `pos_encoding="trm1d"` (D3) the imported model reproduces
+  TRM's own forward exactly: on S = 30 the logits of 4 rounds of dev rows are bitwise equal in fp32 and the halt logits
+  agree to 2·10⁻⁶ [M: run against `trm-samsung`'s model code, 2026-10-09].
+- **Puzzle embedding.** TRM's table is indexed by its dataset's identifiers, which use frm's naming and augmentation
+  semantics (identity = the bare task id). A dataset built with `--versions_from` TRM's `identifiers.json` gives every
+  ARC/ConceptARC task exactly TRM's ≈1000 versions, so every row transfers (871,328 of 871,328 for `arc1`; the 5,077
+  unused rows belong to the 6 tasks the content filter drops). BARC, RE-ARC and composite rows start at the mean TRM
+  row, untrained. Imported rows carry one visit, so all of them vote (§7.1).
+- **Canvas.** TRM computes on all 900 cells, PAD included, and relies on that space: the imported model scores dev
+  pass@2 0.485 on its 30×30 canvas and 0.410 on size buckets (row exact 0.336 → 0.203) [M]. Builds for warm starts
+  keep ARC tasks at 30 (`--min_bucket 30 --min_bucket_sources arc`) and bucket only the sources TRM never saw.
+- **Continuing.** `train.init_from` = the import, `train.init_mode="continue"`: table and visits kept, fresh optimizer
+  and EMA from the imported weights. A K > 0 model takes every shared weight from the checkpoint; its fork modules
+  (codes, join, noise map, gate) start fresh and can learn faster than the fine-tuned shared weights
+  (`train.fork_lr_mult`, a second optimizer group). This is how FRM is trained on top of a TRM that has already spent
+  its full compute budget (`EXPERIMENTS.md` §4b).
+- **Contamination.** `arc_v1_public` trained on ARC-AGI-1 training + evaluation *demos* + ConceptARC: the frm dev
+  and a1 `test` (evaluation test pairs) and adev (ARC-AGI-2-only tasks) stay clean. `arc_v2_public` trained on
+  ARC-AGI-2 training, which holds the test outputs of 376 ARC-AGI-1 evaluation tasks: with it, frm's a1 dev is
+  contaminated and a final run needs a dev drawn from ARC-AGI-2 evaluation test pairs (TRM saw only their demos).
 
 ---
 
@@ -309,10 +381,15 @@ c_π = CE(child_π(final), y*) + (λ_sub/λ_wta) · mean_{t matched} CE(child_π
 w   = softmax_π(−c / τ) over one-to-one assignments of {y*} ∪ intermediates to distinct children, no gradient
 ```
 
+With `fork_gate` the children's terms apply to the rows that forked (a declined row's loss is exactly the K = 0
+loss) and the gate adds `λ_gate · mean_{label rows} BCE(g, [CE(no-fork continuation) − CE(parent) > price])`
+(`OBJECTIVE.md` §3.6).
+
 CE is TRM's stablemax cross-entropy, token-mean per row over non-PAD labels. Defaults: λ_wta = 0.5, λ_sub = 0.5,
-λ_q = 0.5, ε = 0.05, τ annealed log-linearly 1.0 → 0.02 over the first 30% of the budget. Plain rows (no intermediates)
-reduce to annealed relaxed winner-takes-all. Uniform weight per round (no discounting). No term rewards a difference
-between two model-controlled quantities.
+λ_q = 0.5, ε = 0.05, τ annealed log-linearly 1.0 → 0.02 over the first 30% of the budget, λ_gate = 0.1, price 0.
+Plain rows (no intermediates) reduce to annealed relaxed winner-takes-all. Uniform weight per round (no discounting).
+No term rewards a difference between two model-controlled quantities: the gate's label is such a difference, but it is
+detached and trains only the gate, which cannot change either quantity.
 
 ---
 
@@ -336,6 +413,10 @@ between two model-controlled quantities.
   `best.pt` use EMA weights; `last.pt` holds raw weights + EMA + optimizer.
 - **Budget.** Training stops when the model's FLOP accounting reaches `budget_pflops` (or `max_steps`, or `max_hours`);
   the objective's τ anneal is scheduled on the same progress fraction, so it is comparable across arms.
+- **Fork policy (`fork_gate` only, §4.8).** Every row-round forks while progress < `fork_force_frac`; then the gate
+  decides with exploration `fork_explore`; the price controller (if `fork_rate_target > 0`) runs after each gated step.
+  FLOPs are charged from the step's actual fork and label-row counts, read in the step's existing device→host sync
+  (the gated round itself syncs once for the subset sizes and once for the label rows).
 - **Precision/speed.** bf16 compute with fp32 master weights (TRM's "casted" layers), fp16 + GradScaler on V100, SDPA
   attention (flash), optional `torch.compile` of the cycle per bucket shape, per-pass checkpointing of child cycles.
 - **Fault tolerance.** Atomic checkpoints (`last.pt`: model, EMA, optimizer, embedding table, step, RNG, data-stream
@@ -384,6 +465,17 @@ Where each lives: training metrics in `train.jsonl` (mean and `_by_round`), eval
 | `cf.sham` | Δ exact at round 16 when every round's root join reads the children of a row from a **different task** | parent does not use child *content* |
 | `cf.nofork` | Δ exact when the root join is forced onto the parent slot | trained parent does not rely on children |
 | `sub_coverage` (train) | composites: fraction of intermediates some child reproduces exactly | no decomposition learned |
+| `fork_rate` (train), `fork.rate`, `fork.rate_by_round` (eval) | fraction of row-rounds that forked (overall; per round index) | gate never forks (→0, the model became TRM), always forks (→1, no compute saved), or became a round schedule (`rate_by_round` a step function of r) |
+| `gate_acc`, `gate_pos`, `benefit` (train) | on label rows: (gate logit > 0) == label; label rate; CE(no-fork continuation) − CE(fork) in nats/token | gate no better than the label base rate; forks that do not pay (`benefit` ≤ price) |
+| `fork.gate_precision`, `fork.benefit` (eval) | on held-out labelled rows the gate chose to fork (all rounds): fraction where the fork beat the no-fork continuation in CE; mean CE gain | the gate's forks do not pay on unseen pairs (precision ≈ 0.5, benefit ≤ 0) |
+| `price` (train) | the current fork price (moves only with `train.fork_rate_target > 0`) | controller pinned at 0 or running away |
+| `cf.allfork`, `cf.gateoff` (gated models) | Δ exact when every row / no row forks, against the gate's own choice | gate declines forks that pay (`allfork` > 0); forking is useless (`gateoff` ≈ 0) |
+
+With the gate, the children instruments (`parent_mass`, `join_entropy`, `distinct`, `child_exact_any`,
+`oracle_gain`, child votes) are computed over the rows that forked at the round in question: in training they are
+NaN (skipped) on declined rows; at evaluation over the rows that forked at the final round (`fork.forked_rows`;
+`fork.forked_labeled` for the labelled-row rates), and `adopt` counts only rounds at which the row forked. Without the
+gate every row forks and the numbers are as before.
 
 Counterfactual rows are spread evenly over buckets (`eval.cf_rows` in total).
 
@@ -443,6 +535,11 @@ per row-round (child checkpointing on; the ARC-AGI-2 mix is within 1%) — i.e. 
 30×30. How this lines up with TRM's whole schedule is in `EXPERIMENTS.md` §1. TRM's ARC schedule is ≈1.59e20 FLOPs (≈3 days on 4×H100)
 [M: SpecTRM]. Matched compute is enforced in `EXPERIMENTS.md` by giving every arm the same `budget_pflops`.
 
+With `fork_gate` the trainer charges each step's actual mix (`Refiner.round_flops`, checked against executed passes by
+`test_round_flops_match_executed_passes`): a declined row costs the `trm` row, a forked row the FRM row, and a label
+row adds its no-fork continuation (2 cycles forward, 10 units at n=4). FRM K=4 at fork rate ρ with parent-slot
+dropout p costs ≈ 25 + 55ρ + 10ρ(1−p) units, e.g. 43.8 at ρ=0.3, p=0.25 (vs 80 when every round forks).
+
 Memory [I, to be measured in T2]: a grad pass keeps ≈29·d values per token per block (q/k upcast for RoPE, SwiGLU
 intermediates, fp32 norm inputs) ≈ 60 KB per token per pass in bf16, so ≈300 KB per token per grad cycle. FRM K=4 without
 checkpointing holds (K+1)× that per parent token (≈1.5 MB); per-pass child checkpointing stores ≈2 KB per child pass plus
@@ -471,6 +568,13 @@ one pass of transients, ≈0.6 MB per parent token in total. At 80 GB that bound
   `test_children_get_fresh_noise_each_round`, `test_child_checkpointing_is_exact`, pass accounting == executed passes,
   counterfactual modes, parent-slot dropout (children only in training, never at eval), embedding visit counts (and
   their derivation for checkpoints written before the counter), reset-to-mean over trained rows only.
+- `test_gate.py` (adaptive forking, §4.8): `fork_mode="none"` equals the K=0 model with the same weights;
+  `fork_mode="all"` equals the ungated round (incl. parent-slot dropout); in a mixed batch every row equals its own
+  path run alone; `cf_logits` equal an independent restatement of TRM's round; dropped parent slots give no label;
+  declined rows send no gradient into the fork; the gate trains only from its loss and sends nothing into the trunk;
+  decisions and exploration; declined rows' loss is exactly the K=0 loss and child terms add per forked row; gate label
+  = benefit > price, plain mean over label rows; `round_flops` boundaries and executed passes; gated training steps
+  (forced phase, price controller, resume restores the price) and `evaluate_split` (`fork.rate`, `cf.allfork/gateoff`).
 - `test_objective.py`: stablemax normalised, NaN-free gradients and non-zero gradients at zero logits; PAD ignored;
   assignment table one-to-one; set matching reduces to annealed WTA, sends distinct targets to distinct children and
   respects masks/spare children; each child's gradient = w_k × its own CE gradient; mixed composite/plain batches.
@@ -500,9 +604,11 @@ frm/
   model/
     layers.py          rms_norm, CastedLinear, SwiGLU, Rope2D, Attention (SDPA), Block, block_params
     embedding.py       PuzzleEmbedding (buffer table, gather-to-leaf, SignSGD step)
-    refiner.py         Refiner(ModelCfg, num_ids): init_carry, reset_carry, round(carry, inputs, ids, cf, sham_perm, gen)
-                       -> RoundOut, passes_per_round, train_flops_per_row, eval_flops_per_row, compile_cycles
-  objective.py         set_match, Objective(ObjectiveCfg)(RoundOut, batch, progress) -> (loss, per-row metrics)
+    refiner.py         Refiner(ModelCfg, num_ids): init_carry, reset_carry, round(carry, inputs, ids, cf, sham_perm, gen,
+                       fork_mode, explore) -> RoundOut, passes_per_round(fork), train_flops_per_row, eval_flops_per_row,
+                       round_flops(S, rows, fork_rows, cf_rows, train), compile_cycles
+  objective.py         set_match, Objective(ObjectiveCfg)(RoundOut, batch, progress, has_subgoals, price)
+                       -> (loss, per-row metrics)
   train.py             CLI: python -m frm.train --config cfg.json --run_dir runs/X [--resume auto] [key=value ...]
   evaluate.py          CLI + evaluate_split: per-round voting, pass@k, instruments, counterfactuals, submission
   adapt.py             CLI: Kaggle adaptation (build, re-initialised ids, fine-tune, predict, write submission)
@@ -514,8 +620,8 @@ kelvin/                k2 helper (incl. push-external, monitor), submit.sh (appr
                        data, smoke, bench, train, eval}
 scripts/               fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py (paired bootstrap + McNemar),
                        monitor.py (live monitor; every reading explained in monitor.md)
-tests/                 test_data, test_external, test_composite, test_model, test_objective, test_evaluate, test_train_smoke,
-                       test_monitor
+tests/                 test_data, test_external, test_composite, test_model, test_gate, test_objective, test_evaluate,
+                       test_train_smoke, test_monitor
 ```
 
 `Batch` (all torch tensors on device unless noted): `inputs` int [B, S²], `labels` int [B, S²] (−100 = ignore),
@@ -523,7 +629,9 @@ tests/                 test_data, test_external, test_composite, test_model, tes
 `keys` for eval rows (task id, test index, identifier).
 
 `RoundOut`: `logits` [B, S², 12] float32, `q` [B], `child_logits` [B, K, S², 12] or None, `child_q` [B, K] or None,
-`join_alpha` [B, K+1] (cell-mean, for stats), `join_entropy` [B], `carry` (y, z detached).
+`join_alpha` [B, K+1] (cell-mean, for stats), `join_entropy` [B], `carry` (y, z detached), `pre_logits`; with K > 0
+`fork` bool [B] (rows that forked; child fields are zeros/NaN elsewhere); with `fork_gate` also `fork_logit` [B],
+`gate_rows` bool [B] (label rows) and `cf_logits` [B, S², 12] (no-fork continuation, zeros off the label rows).
 
 ---
 
@@ -533,7 +641,8 @@ tests/                 test_data, test_external, test_composite, test_model, tes
 |---|---|---|---|
 | parent ignores children | `parent_mass → 1`, `cf/sham ≈ 0` | raise `objective.lambda_wta`; join-dropout (mask the parent slot with p=0.25 in training); more pre-fork cycles (`H_cycles=4`) so children start from a better state | all config (`model.join_drop_parent`, applied from P1's rerun) |
 | children collapse | `distinct → 1`, win rates degenerate | raise `objective.wta_eps`, slow the τ anneal (`tau_anneal_frac`), per-child noise on codes | ε, τ: config. noise: a code change |
-| fork costs more than it returns | matched-FLOP dev pass@2 below `trm` | K=2; cheaper children (`child_L_cycles=2`); fork only on alternate rounds | K, child_L_cycles: config. alternate rounds: a code change |
+| fork costs more than it returns | matched-FLOP dev pass@2 below `trm` | K=2; cheaper children (`child_L_cycles=2`); adaptive forking (`model.fork_gate`, §4.8: fork where the gate predicts it pays); fork only on alternate rounds | K, child_L_cycles, fork_gate: config. alternate rounds: a code change |
+| fork gate collapses | `fork_rate` → 0 or 1 after the forced phase, `rate_by_round` a step in r, `gate_acc` ≈ max(`gate_pos`, 1−`gate_pos`), `cf.allfork` > 0 | raise `fork_explore`, lengthen `fork_force_frac`, set `fork_rate_target` (price controller) | config |
 | depth still unused | `late_gain ≈ 0` on dev and composites | raise composite fraction/depth (`data.source_weights`, generator `--depth_max`); inspect `cf/reset@4`; more rounds trained (`halt_explore`) | config |
 | memory | OOM in T2 | `grad_ckpt_children`; smaller `tokens_per_step` | config |
 | Kaggle hardware/time | adaptation does not fit 12 h | fewer versions (`--n_aug`), fewer inference rounds (`eval.rounds`; per-round curves say where accuracy saturates) | config |

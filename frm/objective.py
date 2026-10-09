@@ -13,6 +13,11 @@ Rows without intermediates have K assignments (y* -> child k), and the term is a
 On composite rows the one-to-one constraint forces *different* children to produce the different grids.
 tau anneals log-linearly from tau_start to tau_end over the first tau_anneal_frac of training. CE is TRM's stablemax
 cross-entropy, token-mean per row over non-ignored labels.
+
+With the fork gate the child terms apply to the rows that forked; a declined row's loss is exactly the K = 0 loss.
+The gate is trained on its label rows (forked, own join, parent slot kept) by a separate mean over those rows:
+
+    + lambda_gate * mean_{gate rows} BCE(gate_logit, [CE(no-fork continuation, y*) - CE(parent, y*) > price])
 """
 
 from __future__ import annotations
@@ -116,11 +121,20 @@ class Objective:
             raise ValueError("lambda_wta must be > 0: it scales the children's set term")
         self.cfg = cfg
 
-    def __call__(self, out: RoundOut, batch: dict[str, torch.Tensor], progress: float, has_subgoals: bool | None = None):
+    def __call__(
+        self,
+        out: RoundOut,
+        batch: dict[str, torch.Tensor],
+        progress: float,
+        has_subgoals: bool | None = None,
+        price: float | None = None,
+    ):
         """``has_subgoals``: host-side flag for whether any row carries sub-goals (None: read it from the batch,
-        which costs a device sync)."""
+        which costs a device sync). ``price``: the fork price in nats per supervised token (None: cfg.fork_price);
+        the trainer passes its controller's current value."""
         cfg = self.cfg
         labels = batch["labels"]
+        nan = float("nan")
         ce_parent = row_ce(out.logits, labels)
         exact_parent = row_exact(out.logits, labels)
         q_loss = F.binary_cross_entropy_with_logits(out.q, exact_parent.float(), reduction="none")
@@ -133,6 +147,11 @@ class Objective:
         }
 
         if out.child_logits is not None:
+            fork = out.fork if out.fork is not None else torch.ones_like(exact_parent)
+
+            def forked(v: torch.Tensor) -> torch.Tensor:  # a child metric is undefined on rows that did not fork
+                return torch.where(fork, v.float(), nan)
+
             tau = tau_at(cfg, progress)
             ce_final = row_ce(out.child_logits, labels[:, None])  # [B, K]
             exact_child = row_exact(out.child_logits, labels[:, None])  # [B, K]
@@ -145,22 +164,36 @@ class Objective:
             match, best = set_match(ce_final, ce_sub, mask, tau, cfg.lambda_sub / cfg.lambda_wta)
             set_term = cfg.lambda_wta * ((1.0 - cfg.wta_eps) * match + cfg.wta_eps * ce_final.mean(-1))
             q_child = F.binary_cross_entropy_with_logits(out.child_q, exact_child.float(), reduction="none").mean(-1)
-            per_row = per_row + set_term + cfg.lambda_q * q_child
+            per_row = per_row + torch.where(fork, set_term + cfg.lambda_q * q_child, 0.0)
             m.update(
                 {
-                    "set": set_term.detach(),
-                    "child_ce_min": ce_final.detach().min(-1).values,
-                    "child_exact_any": exact_child.any(-1),
-                    "winner": best[:, 0],
-                    "distinct": _distinct(out.child_logits.argmax(-1), labels),
+                    "set": forked(set_term.detach()),
+                    "child_ce_min": forked(ce_final.detach().min(-1).values),
+                    "child_exact_any": forked(exact_child.any(-1)),
+                    "winner": forked(best[:, 0]),
+                    "distinct": forked(_distinct(out.child_logits.argmax(-1), labels)),
                     "parent_mass": out.join_alpha[:, 0],
                     "join_entropy": out.join_entropy,
+                    "fork_rate": fork.float(),
                 }
             )
             if has_subgoals:
-                m["sub_coverage"] = _coverage(out.child_logits, batch["subgoals"], mask, best[:, 1:])
+                m["sub_coverage"] = forked(_coverage(out.child_logits, batch["subgoals"], mask, best[:, 1:]))
 
         loss = per_row.mean()
+        if out.fork_logit is not None:  # the gate's label: did this fork beat the no-fork continuation by the price?
+            g = out.gate_rows
+            benefit = (row_ce(out.cf_logits, labels) - ce_parent).detach()
+            target = (benefit > (cfg.fork_price if price is None else price)).float()
+            bce = F.binary_cross_entropy_with_logits(out.fork_logit, target, reduction="none")
+            loss = loss + cfg.lambda_gate * torch.where(g, bce, 0.0).sum() / g.sum().clamp_min(1)
+            m.update(
+                {
+                    "gate_acc": torch.where(g, ((out.fork_logit > 0).float() == target).float(), nan),
+                    "gate_pos": torch.where(g, target, nan),
+                    "benefit": torch.where(g, benefit, nan),
+                }
+            )
         return loss, m
 
 

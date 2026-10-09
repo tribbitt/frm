@@ -44,9 +44,11 @@ frm/train.py           trainer (per-bucket ACT carries, EMA, checkpoints, SIGTER
 frm/evaluate.py        per-round voting, pass@k, fork/depth instruments, counterfactuals
 frm/adapt.py           Kaggle adaptation -> submission.json
 frm/monitor/           the live monitor's source (Kelvin over the ssh master), run state, charts, pages
-configs/                  pilots trm_a1, frm_a1, frm2_a1, frm_a1_arc; optional trm_h2_a1, nest_a1; final frm_a2_kaggle
+configs/                  pilots trm_a1, frm_a1, frm2_a1, frm_a1_arc; optional trm_h2_a1, nest_a1; final frm_a2_kaggle;
+                          warm start from TRM: trm_import, trmc_a1tn (TRM continued), frmc_a1tn (FRM continued, gated)
 kelvin/                   Kelvin2 job kit
-scripts/                  fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py, monitor.py
+scripts/                  fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py, monitor.py,
+                          import_trm.py (published TRM checkpoint -> frm checkpoint aligned with a frm dataset)
 tests/                    unit tests + the end-to-end smoke
 ```
 
@@ -101,7 +103,7 @@ same command is the local leaderboard proxy (pretrain on `a2_kaggle`, adapt on A
 ## Status
 
 Built and verified on CPU (tests, smoke, learnability) and on Kelvin's MI300X (ROCm venv, smoke incl. SIGTERM/resume,
-benchmark: `trm` ≈238, FRM K=4 ≈224–227 TFLOP/s compiled). Pilot P1's first FRM run was stopped at 3,700 PF: its
-children were redundant (parent mass 0.95) and its dev votes were mostly blind (15% of voting versions trained). The
-evaluation now votes with trained versions only, and FRM configs drop the join's parent slot in training (p = 0.25);
-`trm_a1` continues, `frm_a1` restarts (`docs/EXPERIMENTS.md` §4).
+benchmark: `trm` ≈238, FRM K=4 ≈224–227 TFLOP/s compiled). Pilot P1: FRM ≥ TRM per step once the join's parent slot is
+dropped in training, but 3–4× the cost per step. Current direction (`docs/EXPERIMENTS.md` §4b): start from the ARC
+Prize verified TRM checkpoint (`scripts/import_trm.py`; exact import, dev pass@2 0.485 on TRM's canvas) and continue it
+as TRM and as FRM with adaptive forking (`model.fork_gate`) at matched compute.

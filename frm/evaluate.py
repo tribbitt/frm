@@ -29,7 +29,7 @@ from frm.data.augment import Version
 from frm.data.encode import crop
 from frm.data.loader import Dataset, eval_batches, eval_versions
 from frm.model.refiner import Refiner, RoundOut
-from frm.objective import row_exact
+from frm.objective import row_ce, row_exact
 
 
 def _hash(g: np.ndarray) -> str:
@@ -129,6 +129,10 @@ def _trim(out: RoundOut, n: int) -> RoundOut:
         join_entropy=cut(out.join_entropy),
         carry=None,
         pre_logits=cut(out.pre_logits),
+        fork=cut(out.fork),
+        fork_logit=cut(out.fork_logit),
+        cf_logits=cut(out.cf_logits),
+        gate_rows=cut(out.gate_rows),
     )
 
 
@@ -147,11 +151,12 @@ def sham_perm(tasks: list[str], device: torch.device) -> torch.Tensor:
 
 @torch.no_grad()
 def run_rounds(
-    model: Refiner, inputs, ids, rounds: int, dtype, cf=None, perm=None, reset_at=None, seed: int = 0
+    model: Refiner, inputs, ids, rounds: int, dtype, cf=None, perm=None, reset_at=None, seed: int = 0, fork_mode="gate"
 ) -> list[RoundOut]:
     """Run ``rounds`` rounds from the init carry; one RoundOut per round, without its carry (only the next round needs
     it, and 16 kept carries would cost ~16x the state memory). Children's noise comes from a generator seeded with
-    ``seed``, so a batch evaluates identically every time and its counterfactual reruns see the same noise."""
+    ``seed``, so a batch evaluates identically every time and its counterfactual reruns see the same noise.
+    ``fork_mode`` as in ``Refiner.round`` (no exploration at evaluation)."""
     S = int(round(inputs.shape[1] ** 0.5))
     carry = model.init_carry(inputs.shape[0], S, inputs.device, dtype)
     gen = torch.Generator(device=inputs.device).manual_seed(seed)
@@ -159,7 +164,7 @@ def run_rounds(
     for r in range(1, rounds + 1):
         if reset_at is not None and r == reset_at:
             carry = model.init_carry(inputs.shape[0], S, inputs.device, dtype)
-        out = model.round(carry, inputs, ids, cf=cf, sham_perm=perm, gen=gen)
+        out = model.round(carry, inputs, ids, cf=cf, sham_perm=perm, gen=gen, fork_mode=fork_mode)
         carry = out.carry
         outs.append(dataclasses.replace(out, carry=None))
     return outs
@@ -193,6 +198,7 @@ def evaluate_split(
     n_k: dict[int, int] = defaultdict(int)
     n_rows = n_labeled = 0
     fork: dict[str, float] = defaultdict(float)
+    fork_r = np.zeros(R)  # rows that forked at round r
     cf_acc: dict[str, float] = defaultdict(float)
     cf_rows = 0
     buckets = [S for S in ds.buckets if ds.has_split(S, split)]
@@ -241,27 +247,40 @@ def evaluate_split(
             preds_np = [o.logits.argmax(-1).to(torch.uint8).cpu().numpy() for o in outs]
             qs_np = [torch.sigmoid(o.q).float().cpu().numpy() for o in outs]
             last = outs[-1]
-            child_np = cq_np = None
-            if K > 0:
+            child_np = cq_np = forked_np = None
+            if K > 0:  # children instruments over the rows that forked at the round in question
+                fork_r += torch.stack([o.fork for o in outs]).sum(1).cpu().numpy()
+                f = last.fork
+                forked_np = f.cpu().numpy()
                 child_np = last.child_logits.argmax(-1).to(torch.uint8).cpu().numpy()
                 cq_np = torch.sigmoid(last.child_q).float().cpu().numpy()
-                fork["parent_mass"] += float(last.join_alpha[:, 0].sum())
-                fork["join_entropy"] += float(last.join_entropy.sum())
-                child_exact = row_exact(last.child_logits, labels[:, None]).any(-1) & labeled
+                fork["forked"] += float(f.sum())
+                fork["forked_labeled"] += float((f & labeled).sum())
+                fork["parent_mass"] += float(last.join_alpha[f, 0].sum())
+                fork["join_entropy"] += float(last.join_entropy[f].sum())
+                child_exact = row_exact(last.child_logits, labels[:, None]).any(-1) & labeled & f
                 fork["child_exact_any"] += float(child_exact.sum())
-                fork["oracle"] += float((child_exact | exact[-1]).sum())
+                fork["oracle"] += float((child_exact | (exact[-1] & f)).sum())
+                fork["oracle_base"] += float((exact[-1] & f).sum())
                 for o in outs:  # adoption: pre-fork parent wrong and some child right -> is the joined parent right?
-                    chance = labeled & ~row_exact(o.pre_logits, labels)
+                    chance = labeled & o.fork & ~row_exact(o.pre_logits, labels)
                     chance &= row_exact(o.child_logits, labels[:, None]).any(-1)
                     fork["adopt_den"] += float(chance.sum())
                     fork["adopt_num"] += float((chance & row_exact(o.logits, labels)).sum())
+                    if o.gate_rows is not None:  # did the forks the gate chose beat the TRM round on held-out rows?
+                        g = o.gate_rows & labeled
+                        if bool(g.any()):
+                            b = row_ce(o.cf_logits[g], labels[g]) - row_ce(o.logits[g], labels[g])
+                            fork["gate_n"] += float(g.sum())
+                            fork["gate_hit"] += float((b > 0).sum())
+                            fork["benefit"] += float(b.sum())
             for b, (tid, ti, pid) in enumerate(keys):
                 v = versions.get(pid)
                 if v is None:
                     v = versions[pid] = Version.parse(ds.identifiers[pid])[1]
                 for r in range(R):
                     per_round[r].add((tid, ti), v.invert(crop(preds_np[r][b], S)), float(qs_np[r][b]))
-                if child_np is not None:
+                if child_np is not None and forked_np[b]:
                     answers = [v.invert(crop(child_np[b, k], S)) for k in range(K)]
                     fork["distinct"] += len({_hash(a) for a in answers})  # distinct cropped answers (what is voted)
                     for k in range(K):
@@ -271,7 +290,11 @@ def evaluate_split(
                 cf_rows += int(labeled.sum())
                 cf_acc["base"] += float(exact[-1].sum())
                 perm = sham_perm([k[0] for k in keys] + [keys[0][0]] * (rows - n), device)
-                variants = (("nofork", {"cf": "nofork"}), ("sham", {"cf": "sham", "perm": perm}), ("reset@4", {"reset_at": 4}))
+                variants = [
+                    ("nofork", {"cf": "nofork"}), ("sham", {"cf": "sham", "perm": perm}), ("reset@4", {"reset_at": 4})
+                ]
+                if model.gate is not None:  # every row forks / no row forks, against the gate's own choice
+                    variants += [("allfork", {"fork_mode": "all"}), ("gateoff", {"fork_mode": "none"})]
                 for name, kw in variants:
                     o = _trim(run_rounds(model, inputs, ids, R, dtype, seed=seed, **kw)[-1], n)
                     cf_acc[name] += float((row_exact(o.logits, labels) & labeled).sum())
@@ -304,21 +327,36 @@ def evaluate_split(
         res["by_k"] = {k: {"rows": n_k[k], "row_exact": (by_k[k] / n_k[k]).round(5).tolist()} for k in sorted(by_k)}
     if K > 0:
         children = score(child_votes, tasks)
+        forked, forked_lab = fork["forked"], fork["forked_labeled"]
+
+        def per(key: str, den: float) -> float | None:
+            return fork[key] / den if den else None
+
+        # Denominators: rows that forked at the final round (forked_rows; forked_labeled for the labelled-row rates).
         res["fork"] = {
-            "parent_mass": fork["parent_mass"] / max(n_rows, 1),
-            "join_entropy": fork["join_entropy"] / max(n_rows, 1),
-            "distinct": fork["distinct"] / max(n_rows, 1),
-            "child_exact_any": fork["child_exact_any"] / lab,
-            "oracle_gain": (fork["oracle"] - exact_r[-1]) / lab,
+            "rate": float(fork_r.sum() / max(n_rows * R, 1)),
+            "rate_by_round": (fork_r / max(n_rows, 1)).round(5).tolist(),
+            "forked_rows": int(forked),
+            "forked_labeled": int(forked_lab),
+            "parent_mass": per("parent_mass", forked),
+            "join_entropy": per("join_entropy", forked),
+            "distinct": per("distinct", forked),
+            "child_exact_any": per("child_exact_any", forked_lab),
+            "oracle_gain": (fork["oracle"] - fork["oracle_base"]) / forked_lab if forked_lab else None,
             "adopt": fork["adopt_num"] / fork["adopt_den"] if fork["adopt_den"] else None,
             "adopt_chances": int(fork["adopt_den"]),
             "children_only": {k: children[k] for k in ("pass@1", "pass@2", "n_tasks")},
         }
+        if fork["gate_n"]:  # the gate's chosen forks, all rounds, labelled rows: benefit = CE(TRM round) - CE(fork)
+            res["fork"]["gate_precision"] = fork["gate_hit"] / fork["gate_n"]
+            res["fork"]["benefit"] = fork["benefit"] / fork["gate_n"]
+            res["fork"]["gate_rows"] = int(fork["gate_n"])
         if ecfg.child_vote_weight > 0:
             merged = score(per_round[-1].merged(child_votes, ecfg.child_vote_weight), tasks)
             res["fork"]["with_child_votes"] = {k: merged[k] for k in ("pass@1", "pass@2", "n_tasks")}
         if cf_rows:
-            res["cf"] = {k: (cf_acc[k] - cf_acc["base"]) / cf_rows for k in ("nofork", "sham", "reset@4")}
+            names = [k for k in ("nofork", "sham", "reset@4", "allfork", "gateoff") if k in cf_acc]
+            res["cf"] = {k: (cf_acc[k] - cf_acc["base"]) / cf_rows for k in names}
             res["cf"]["rows"] = cf_rows
             res["cf"]["base_exact"] = cf_acc["base"] / cf_rows
     if keep_attempts:

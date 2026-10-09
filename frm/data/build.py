@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from frm.data.arc import Task, load_subset, load_tasks
-from frm.data.augment import make_versions
+from frm.data.augment import SEP, Version, make_versions
 from frm.data.heldout import HeldOut
 from frm.data.sizerule import MAX_SIDE, choose_bucket, fits, smallest_bucket
 
@@ -326,14 +326,36 @@ def _write_split(path: str, S: int, recs: list[Record], pairs_of, overflow: list
         json.dump([r.task_id for r in recs], f)
 
 
+def trm_versions(path: str) -> dict[str, list[Version]]:
+    """Version table of a TRM dataset's ``identifiers.json`` (``"<blank>"``, then per task its plain id = identity,
+    followed by ``"task|||t{tid}|||{perm}"``; frm's names use the same dihedral numbering and colour-permutation
+    semantics, ``augment.Version``). Reusing it lets an imported TRM checkpoint keep every trained embedding row."""
+    with open(path) as f:
+        names = json.load(f)
+    table: dict[str, list[Version]] = {}
+    for name in names[1:]:
+        if SEP in name:
+            task_id, v = Version.parse(name)
+        else:
+            task_id, v = name, Version.identity()
+        table.setdefault(task_id, []).append(v)
+    for task_id, vs in table.items():
+        if vs[0] != Version.identity():
+            raise SystemExit(f"{path}: the first version of {task_id} is not the identity")
+    return table
+
+
 def build(args: argparse.Namespace) -> dict:
     recs, dev, content = collect(args)
     identifiers = ["<blank>"]
     tids, perms = [0], [list(range(10))]
+    fixed = trm_versions(args.versions_from) if args.versions_from else {}
     for r in recs:
-        r.bucket = _bucket(r)
+        lift = not args.min_bucket_sources or r.source in args.min_bucket_sources
+        r.bucket = max(_bucket(r), args.min_bucket) if lift else _bucket(r)
         n = args.n_aug_external if r.external else args.n_aug_composite if r.source == "composite" else args.n_aug
-        versions = make_versions(r.original, n, _task_seed(args.seed, r.task_id))
+        fixed_r = fixed.get(r.task_id) if r.source == "arc" and not r.external else None
+        versions = fixed_r or make_versions(r.original, n, _task_seed(args.seed, r.task_id))
         r.vstart, r.vcount = len(identifiers), len(versions)
         for v in versions:
             identifiers.append(v.name(r.task_id))
@@ -403,6 +425,9 @@ def build(args: argparse.Namespace) -> dict:
         "composite": list(args.composite),
         "external": [[s, p] for s, p in args.external],
         "exclude_ids": args.exclude_ids,
+        "versions_from": args.versions_from,
+        "min_bucket": args.min_bucket,
+        "min_bucket_sources": args.min_bucket_sources,
         "content_filter": content,
         "counts": counts,
         "overflow": overflow,
@@ -446,6 +471,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="dev = this many ARC-AGI-1 evaluation tasks with >= 3 demos, by md5 of the task id")
     ap.add_argument("--exclude_ids", help="JSON list of task ids that must not enter the build through any source "
                     "(e.g. data/raw/adev_ids.json, scripts/make_adapt_dev.py): the build fails if one would")
+    ap.add_argument("--versions_from", help="a TRM dataset's identifiers.json: ARC/ConceptARC tasks listed there get "
+                    "exactly its versions (in its order), so an imported TRM checkpoint's embedding rows carry over "
+                    "(scripts/import_trm.py); other tasks get --n_aug random versions")
+    ap.add_argument("--min_bucket", type=int, default=0,
+                    help="place tasks in a bucket of at least this size (30 = TRM's single 30x30 canvas)")
+    ap.add_argument("--min_bucket_sources", nargs="*", default=[], choices=list(SOURCE_CODES),
+                    help="sources --min_bucket applies to (default: all); e.g. arc keeps an imported TRM on its "
+                    "native canvas while the new sources stay bucketed")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
     if not args.sources and not args.composite and not args.external:

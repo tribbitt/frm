@@ -151,6 +151,19 @@ exactly to annealed relaxed winner-takes-all: child k's gradient is λ_wta·[(1�
 Implementation: `frm/objective.py` (`set_match`, `Objective.__call__`); Π is enumerated once per (K, M) — 136
 assignments at K = 4 with up to 3 intermediates — and evaluated as one gather per step.
 
+With the fork gate (`model.fork_gate`, `DESIGN.md` §4.8), let f_b = 1 if row b forked this round. Terms (2) and the
+children's half of (3) are multiplied by f_b, so a declined row's loss is exactly the K = 0 loss, and the gate adds a
+fourth term, a mean over its label rows G (forked, own join, parent slot not dropped; §3.6):
+
+$$
+\mathcal{L} \;\mathrel{+}=\; \lambda_{\mathrm{gate}}\cdot\frac{1}{|G|}\sum_{b\in G}
+\mathrm{BCE}\big(g_b,\; \mathbb{1}[\,\mathrm{CE}(\tilde y_b, y_b) - \mathrm{CE}(\hat y_b, y_b) > p\,]\big)
+\qquad (0 \text{ if } G = \varnothing)
+$$
+
+with g_b the gate logit, ỹ_b the readout of the no-fork continuation (TRM's round from the same pre-fork state, no
+grad) and p the fork price in nats per supervised token.
+
 ### 3.1 Term 1 — parent deep supervision (R1, R2, R3)
 
 Unchanged from TRM in form, changed in what it trains. Because the graded readout comes *after* the join and a full
@@ -196,18 +209,20 @@ resilient MCL. Nothing rewards stopping early; evaluation always runs 16 rounds.
 
 ### 3.4 Gradient-flow table
 
-| parameter | term 1 | term 2 | term 3 |
-|---|---|---|---|
-| shared blocks f | ✓ (parent post cycle + children via join) | ✓ (children) | ✓ |
-| fork codes e_k, A_k, B, noise map W_ξ | ✓ via join | ✓ | ✓ |
-| join W_q, W_k, β | ✓ | — | — (q enters detached) |
-| lm_head | ✓ | ✓ | — |
-| q_head | — | — | ✓ |
-| puzzle embedding | ✓ | ✓ | ✓ |
-| pre-fork parent cycle | no grad by design (TRM) — it has no parameters of its own | | |
+| parameter | term 1 | term 2 | term 3 | term 4 (gate) |
+|---|---|---|---|---|
+| shared blocks f | ✓ (parent post cycle + children via join) | ✓ (children) | ✓ | — |
+| fork codes e_k, A_k, B, noise map W_ξ | ✓ via join | ✓ | ✓ | — |
+| join W_q, W_k, β | ✓ | — | — (q enters detached) | — |
+| lm_head | ✓ | ✓ | — | — |
+| q_head | — | — | ✓ | — |
+| puzzle embedding | ✓ | ✓ | ✓ | — |
+| gate head (`fork_gate`) | — | — | — | ✓ (only) |
+| pre-fork parent cycle | no grad by design (TRM) — it has no parameters of its own | | | |
 
+On declined rows terms 2 and 3's child half are absent, so their loss trains exactly what the K = 0 loss trains.
 `tests/test_model.py::test_fork_gate` asserts the first column from term 1 alone; `test_every_param_gets_grad` asserts that
-no parameter is left out.
+no parameter is left out; `tests/test_gate.py` asserts the last column and the declined rows' isolation.
 
 ### 3.5 Normalisation
 
@@ -215,6 +230,30 @@ Token-mean CE per row makes rows of different sizes comparable; the per-step mea
 comparable across buckets whose row counts differ by 10×. TRM sums per-row means and divides by the global batch size,
 which is the same thing at a fixed batch. In c_bπ the intermediates are averaged, so a depth-4 composite row weighs the
 same as a depth-2 one.
+
+### 3.6 Term 4 — fork gate (only with `model.fork_gate`)
+
+The gate decides per row and round whether the round forks (`DESIGN.md` §4.8). It is trained as a classifier on
+measured outcomes, never through the loss it influences:
+
+- **Label.** On a label row, benefit b = CE(no-fork continuation, y*) − CE(parent after the fork, y*), both token-mean
+  stablemax CE from the same pre-fork state, detached; label = b > price. The continuation is exactly what the row
+  would have computed had it declined (TRM's remaining cycles, forward only), so the label answers "did this fork pay
+  at least the price" for this state.
+- **Label rows.** Rows that forked with the model's own join: not under a counterfactual, and (training) parent slot
+  not dropped — a forced-children join measures a handicapped fork, not the one evaluation would run. Declined rows
+  give no label; the exploration floor (`train.fork_explore`) makes the gate's "no" states fork now and then so they do.
+- **Loss.** λ_gate · mean over label rows of BCE(g, label), λ_gate = 0.1; a plain mean (not scaled by the label-row
+  fraction), 0 when there is none. The gate's inputs ([y₀ ‖ mean over cells of y] of the no-grad pre-fork state) are
+  detached, so the term trains only the gate head and terms 1–3 never reach it.
+- **Price.** `objective.fork_price` (default 0: fork whenever it helps). With `train.fork_rate_target > 0` the trainer
+  adjusts it after each gated step: price ← max(0, price + `fork_price_lr` · (fork rate − target)); the objective takes
+  the current value as `price`.
+- **Why not a learned soft or REINFORCE gate.** frmv1's soft gate learned the cycle index (98.9% of its variance) and
+  discrete decisions need high-variance estimators (§5). Supervised labels from measured counterfactual benefit, a
+  forced-fork familiarisation phase (`train.fork_force_frac` = 0.3: every row forks, every state is labelled), the
+  exploration floor and no step-index input are the mitigations; `fork.rate_by_round` and `gate_acc` vs `gate_pos`
+  detect a relapse (§7).
 
 ## 4. How the objective incentivises depth — the argument in one place
 
@@ -230,7 +269,8 @@ same as a depth-2 one.
 5. **No early-exit bias.** No discounting, no geometric priors, fixed 16-round evaluation (M5).
 
 None of these terms can be satisfied by making an earlier round worse (R5): no term compares two model-controlled
-losses; assignment weights are computed without gradient.
+losses with gradient; assignment weights are computed without gradient, and the gate's label (a difference of two
+detached CEs) trains only the gate, which cannot move either CE.
 
 ## 5. Considered and rejected
 
@@ -240,7 +280,7 @@ losses; assignment weights are computed without gradient.
 | load balancing across children (MoE-style) | forces equal use when one child is legitimately better; ε already prevents dead children |
 | per-target independent softmin for intermediates (this repo's first version) | one child could claim the final answer *and* every intermediate, leaving the others identical — replaced by one-to-one matching |
 | noise only at test time (PTRM) | trained-in noise lets the codes learn *how* to use it; test-time-only noise perturbs a model that never saw it |
-| learned "whether to fork" gate (soft or discrete) | frmv1's soft gate learned the cycle index (98.9% of its variance) [M]; discrete decisions need REINFORCE-style variance on top of a weak signal |
+| learned "whether to fork" gate trained end to end (soft) or by REINFORCE/Gumbel (discrete) | frmv1's soft gate learned the cycle index (98.9% of its variance) [M]; discrete decisions need REINFORCE-style variance on top of a weak signal. The adopted gate (the user's decision, §3.6) is instead a classifier on measured counterfactual benefit, with a forced-fork phase and an exploration floor |
 | TD value potential with gradient into the state | unstable critic exploitation at this scale [I]; revisit only if the fork path's credit proves too short |
 | canvas-improvement reward or hinge | telescopes (no signal) or reweights stalled rows (already done by set matching without a round-dependent factor) |
 | final-round-only grading | frmv1: detours appear but are never rewarded; loses TRM's training-time benefit of dense grading |
@@ -266,3 +306,6 @@ single-seed arms, paired per-task statistics, seed choice at the end.
 | `sub_coverage` ≈ 0 after τ has annealed | children never produce intermediates | raise λ_sub; check composite detour rate |
 | q accuracy high but q never > 0 | halting never fires (all rows run 16 rounds) | expected early; if persistent, compare throughput with the control |
 | `child_ce_min` ≪ `ce` | join failing to adopt good children | inspect β and `fork.adopt`; more join capacity |
+| gated: `fork_rate` → 0 or 1 after the forced phase, or `fork.rate_by_round` a step function of r | the gate collapsed or became a round schedule | raise `train.fork_explore`; lengthen `train.fork_force_frac`; set `train.fork_rate_target` |
+| gated: `gate_acc` ≈ max(`gate_pos`, 1 − `gate_pos`) | the gate predicts only the base rate | more label rows (exploration); check `benefit`'s spread — forks may not differ in value by state |
+| gated: `cf.allfork` > 0 at eval | the gate declines forks that pay | lower `objective.fork_price` or the rate target |
