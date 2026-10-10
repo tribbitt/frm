@@ -292,6 +292,28 @@ def test_dev_and_test_splits(ds, built):
     assert cf["arc_tasks_dropped"] == [] and cf["composite_pairs_dropped"] == 0
 
 
+def test_dev_pool_evaluation2_takes_dev_from_arc_agi2_evaluation(tmp_path):
+    """For a model whose pretraining saw ARC-AGI-2 training test outputs, dev comes from evaluation2: its dev tasks'
+    test pairs are dev, the other evaluation2 tasks' are test, and every training2 test pair stays training data."""
+    if not os.path.isdir(REAL):
+        pytest.skip("needs ../trm-samsung/kaggle/combined")
+    raw = str(tmp_path / "raw")
+    os.makedirs(raw)
+    for subset, n in (("training2", 6), ("concept", 2), ("evaluation2", 5)):
+        tasks = load_subset(REAL, subset)
+        _write_subset(raw, subset, tasks, _pick(tasks, n, False))
+    out = str(tmp_path / "built")
+    build(parse_args(["--raw", raw, "--sources", "arc2", "--dev_subset", "evaluation2", "--dev_n", "2", "--out", out,
+                      "--n_aug", "2", "--seed", "0"]))
+    d = Dataset(out)
+    ev2 = load_subset(raw, "evaluation2")
+    assert set(d.tasks("dev")) == set(dev_ids(raw, 2, "evaluation2")) and set(d.tasks("dev")) <= set(ev2)
+    assert set(d.tasks("test")) == set(ev2) - set(d.tasks("dev"))
+    grids = _train_task_grids(d)
+    for k, t in load_subset(raw, "training2").items():
+        assert len(grids[k]) == len(t["train"]) + len(t["test"])
+
+
 def test_composite_bucket_ignores_held_out_targets():
     """Held-out (dev_composite) outputs and sub-goals must not choose the canvas; demo sub-goals must fit it."""
     from frm.data.build import Record, _bucket

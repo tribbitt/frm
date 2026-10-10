@@ -3,10 +3,11 @@
     python -m frm.data.build --raw data/raw --sources arc1 [--composite c.json ...] \
         [--external SOURCE=data/raw/external/POOL.npz ...] --out data/built/NAME
 
-Splits (DESIGN.md §3.4). The dev rule is fixed: the ``--dev_n`` ARC-AGI-1 evaluation tasks with >= 3 demos, ordered by
-the md5 hex digest of the task id (tinyv2.2 / tinyabstractor's development tasks). ``arc1``: their test pairs -> dev,
-the other evaluation tasks' test pairs -> test, every training/concept test pair -> train. ``arc2``/``arc2-kaggle``:
-training2 tasks with a dev id -> their test pairs -> dev; evaluation2 test pairs -> test (``arc2``). Demos of every
+Splits (DESIGN.md §3.4). The dev rule: the ``--dev_n`` tasks of the dev pool (``--dev_subset``, default ARC-AGI-1
+evaluation) with >= 3 demos, ordered by the md5 hex digest of the task id (tinyv2.2 / tinyabstractor's development
+tasks). ``arc1``: their test pairs -> dev, the other evaluation tasks' test pairs -> test, every training/concept test
+pair -> train. ``arc2``/``arc2-kaggle``: training2 tasks with a dev id -> their test pairs -> dev; evaluation2 test pairs
+-> test (``arc2``); with ``--dev_subset evaluation2`` the dev tasks are evaluation2 tasks instead. Demos of every
 task are training data. External pools (``scripts/ingest_external.py``) are training pairs only; generator pools
 (RE-ARC, synth) are split into per-bucket sub-tasks ``{source}:{id}@{S}``, other tasks stay whole.
 
@@ -77,9 +78,10 @@ class Record:
     vcount: int = 0
 
 
-def dev_ids(raw: str, n: int) -> list[str]:
-    """The ``n`` ARC-AGI-1 evaluation tasks with >= 3 demos with the smallest md5(task id) hex digests, sorted."""
-    with open(os.path.join(raw, f"arc-agi_{DEV_SUBSET}_challenges.json")) as f:
+def dev_ids(raw: str, n: int, subset: str = DEV_SUBSET) -> list[str]:
+    """The ``n`` tasks of ``subset`` (default ARC-AGI-1 evaluation) with >= 3 demos with the smallest md5(task id) hex
+    digests, sorted."""
+    with open(os.path.join(raw, f"arc-agi_{subset}_challenges.json")) as f:
         tasks = json.load(f)
     ok = sorted((k for k, t in tasks.items() if len(t["train"]) >= DEV_MIN_DEMOS),
                 key=lambda k: hashlib.md5(k.encode()).hexdigest())
@@ -221,7 +223,7 @@ def content_filter(recs: list[Record]) -> tuple[list[Record], dict]:
 def collect(args: argparse.Namespace) -> tuple[list[Record], list[str], dict]:
     """Records of every source, the dev rule's task ids and the content filter's report."""
     recs: list[Record] = []
-    dev = dev_ids(args.raw, args.dev_n) if any(s in ARC_SOURCES for s in args.sources) else []
+    dev = dev_ids(args.raw, args.dev_n, args.dev_subset) if any(s in ARC_SOURCES for s in args.sources) else []
     for src in args.sources:
         if src == "kaggle":
             if not args.challenges:
@@ -231,8 +233,8 @@ def collect(args: argparse.Namespace) -> tuple[list[Record], list[str], dict]:
         train_subsets, test_subsets = ARC_SOURCES[src]
         for sub in train_subsets:
             recs += arc_records(load_subset(args.raw, sub), "train", set(dev))
-        for sub in test_subsets:  # dev tasks are ARC-AGI-1 evaluation tasks: arc2's evaluation2 is test only
-            recs += arc_records(load_subset(args.raw, sub), "test", set(dev) if src == "arc1" else set())
+        for sub in test_subsets:  # the dev pool's tasks give dev pairs; every other held-out task gives test pairs
+            recs += arc_records(load_subset(args.raw, sub), "test", set(dev) if sub == args.dev_subset else set())
     for path in args.composite:
         recs += composite_records(path)
     recs, info = content_filter(recs)
@@ -419,6 +421,7 @@ def build(args: argparse.Namespace) -> dict:
         "n_aug_composite": args.n_aug_composite,
         "n_aug_external": args.n_aug_external,
         "dev_n": args.dev_n,
+        "dev_subset": args.dev_subset,
         "dev_ids": dev,
         "seed": args.seed,
         "sources": list(args.sources),
@@ -468,7 +471,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help=f"ingested pool npz (scripts/ingest_external.py); SOURCE in {list(SOURCE_CODES)}")
     ap.add_argument("--n_aug_external", type=int, default=8)
     ap.add_argument("--dev_n", type=int, default=100,
-                    help="dev = this many ARC-AGI-1 evaluation tasks with >= 3 demos, by md5 of the task id")
+                    help="dev = this many tasks of --dev_subset with >= 3 demos, by md5 of the task id")
+    ap.add_argument("--dev_subset", default=DEV_SUBSET, choices=("evaluation", "evaluation2"),
+                    help="the dev pool: ARC-AGI-1 evaluation (default) or ARC-AGI-2 evaluation, for models whose "
+                    "pretraining saw ARC-AGI-2 training test outputs (an imported arc_v2_public TRM); the rest of the "
+                    "pool's tasks give test pairs")
     ap.add_argument("--exclude_ids", help="JSON list of task ids that must not enter the build through any source "
                     "(e.g. data/raw/adev_ids.json, scripts/make_adapt_dev.py): the build fails if one would")
     ap.add_argument("--versions_from", help="a TRM dataset's identifiers.json: ARC/ConceptARC tasks listed there get "

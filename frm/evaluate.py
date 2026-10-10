@@ -151,12 +151,14 @@ def sham_perm(tasks: list[str], device: torch.device) -> torch.Tensor:
 
 @torch.no_grad()
 def run_rounds(
-    model: Refiner, inputs, ids, rounds: int, dtype, cf=None, perm=None, reset_at=None, seed: int = 0, fork_mode="gate"
+    model: Refiner, inputs, ids, rounds: int, dtype, cf=None, perm=None, reset_at=None, seed: int = 0, fork_mode="gate",
+    state_noise: float = 0.0,
 ) -> list[RoundOut]:
     """Run ``rounds`` rounds from the init carry; one RoundOut per round, without its carry (only the next round needs
     it, and 16 kept carries would cost ~16x the state memory). Children's noise comes from a generator seeded with
     ``seed``, so a batch evaluates identically every time and its counterfactual reruns see the same noise.
-    ``fork_mode`` as in ``Refiner.round`` (no exploration at evaluation)."""
+    ``fork_mode`` as in ``Refiner.round`` (no exploration at evaluation). ``state_noise`` > 0 adds Gaussian noise of
+    that many RMS units to the latent z between rounds (PTRM's test-time noisy trajectories, arXiv 2605.19943)."""
     S = int(round(inputs.shape[1] ** 0.5))
     carry = model.init_carry(inputs.shape[0], S, inputs.device, dtype)
     gen = torch.Generator(device=inputs.device).manual_seed(seed)
@@ -166,6 +168,11 @@ def run_rounds(
             carry = model.init_carry(inputs.shape[0], S, inputs.device, dtype)
         out = model.round(carry, inputs, ids, cf=cf, sham_perm=perm, gen=gen, fork_mode=fork_mode)
         carry = out.carry
+        if state_noise > 0:
+            z = carry.z.float()
+            eps = torch.randn(z.shape, device=z.device, generator=gen)
+            z = z + state_noise * z.square().mean(-1, keepdim=True).sqrt() * eps
+            carry = dataclasses.replace(carry, z=z.to(carry.z.dtype))
         outs.append(dataclasses.replace(out, carry=None))
     return outs
 
@@ -225,6 +232,11 @@ def evaluate_split(
             labels = torch.from_numpy(batch["labels"]).long().to(device)
             labeled = (labels != -100).any(-1)
             outs = [_trim(o, n) for o in run_rounds(model, inputs, ids, R, dtype, seed=seed)]
+            extra = [  # PTRM-style noisy trajectories: extra voters only, instruments stay on the clean run
+                [_trim(o, n) for o in run_rounds(model, inputs, ids, R, dtype, seed=seed + 7919 * s,
+                                                 state_noise=ecfg.state_noise)]
+                for s in range(1, ecfg.noise_samples)
+            ]
             n_rows += n
             n_labeled += int(labeled.sum())
             exact = torch.stack([row_exact(o.logits, labels) & labeled for o in outs])  # [R, n]
@@ -246,6 +258,8 @@ def evaluate_split(
                     n_k[int(k)] += int(sel.sum())
             preds_np = [o.logits.argmax(-1).to(torch.uint8).cpu().numpy() for o in outs]
             qs_np = [torch.sigmoid(o.q).float().cpu().numpy() for o in outs]
+            extra_np = [([o.logits.argmax(-1).to(torch.uint8).cpu().numpy() for o in e],
+                         [torch.sigmoid(o.q).float().cpu().numpy() for o in e]) for e in extra]
             last = outs[-1]
             child_np = cq_np = forked_np = None
             if K > 0:  # children instruments over the rows that forked at the round in question
@@ -280,6 +294,8 @@ def evaluate_split(
                     v = versions[pid] = Version.parse(ds.identifiers[pid])[1]
                 for r in range(R):
                     per_round[r].add((tid, ti), v.invert(crop(preds_np[r][b], S)), float(qs_np[r][b]))
+                    for ep, eq in extra_np:
+                        per_round[r].add((tid, ti), v.invert(crop(ep[r][b], S)), float(eq[r][b]))
                 if child_np is not None and forked_np[b]:
                     answers = [v.invert(crop(child_np[b, k], S)) for k in range(K)]
                     fork["distinct"] += len({_hash(a) for a in answers})  # distinct cropped answers (what is voted)
@@ -393,6 +409,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max_versions", type=int, default=None)
     ap.add_argument("--max_tasks", type=int, default=None)
     ap.add_argument("--rounds", type=int, default=None)
+    ap.add_argument("--noise_samples", type=int, default=None, help="extra noisy trajectories as voters (PTRM)")
+    ap.add_argument("--state_noise", type=float, default=None, help="their z noise in RMS units")
+    ap.add_argument("--child_vote_weight", type=float, default=None, help="children's answers vote with this weight")
+    ap.add_argument("--tag", default="", help="suffix for the output file (several settings on one checkpoint)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--submission", default=None, help="write Kaggle submission.json here")
     args = ap.parse_args(argv)
@@ -406,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:
     dtype = pick_dtype(cfg.train.precision, device)
     if cfg.train.compile:
         model.compile_cycles()
-    for name in ("max_versions", "max_tasks", "rounds"):
+    for name in ("max_versions", "max_tasks", "rounds", "noise_samples", "state_noise", "child_vote_weight"):
         if getattr(args, name) is not None:
             setattr(cfg.eval, name, getattr(args, name))
     ds = Dataset(cfg.data.root)
@@ -415,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.submission).write_text(json.dumps(res.pop("attempts")))
     res["ckpt"], res["step"], res["row_rounds"] = str(ckpt), ck.get("step"), ck.get("row_rounds")
     res["pflops"] = ck["flops"] / 1e15 if "flops" in ck else None
-    out = run_dir / "eval" / f"{args.split}_step{ck.get('step')}.json"
+    out = run_dir / "eval" / f"{args.split}_step{ck.get('step')}{'_' + args.tag if args.tag else ''}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(res, indent=1))
     print(json.dumps({k: v for k, v in res.items() if k not in ("by_round", "per_task")}, indent=1))

@@ -132,6 +132,10 @@ class EvalCfg:
     counterfactuals: bool = True
     cf_rows: int = 1024
     use_ema: bool = True
+    # Test-time noisy trajectories (PTRM): noise_samples - 1 extra runs per row with Gaussian noise of state_noise RMS
+    # units added to z between rounds; their predictions are extra voters (the clean run keeps the instruments).
+    noise_samples: int = 1
+    state_noise: float = 0.0
 
 
 @dataclass
