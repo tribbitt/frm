@@ -41,22 +41,26 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("overrides", nargs="*", help="dot-path overrides applied to the checkpoint's config")
     args = ap.parse_args(argv)
 
+    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    cfg, ck_price = Cfg.from_dict(ck["cfg"]), ck.get("price")
+    del ck  # the table and optimizer state are loaded again by the trainer; do not hold a second copy
+
     work = Path(args.work)
     data_dir = work / "data"
     if not (data_dir / "meta.json").exists():
         build_argv = ["--sources", "kaggle", "--challenges", args.challenges, "--out", str(data_dir)]
         build_argv += ["--n_aug", str(args.n_aug)]
+        if cfg.model.pos_encoding == "trm1d":  # a model from a TRM checkpoint computes on TRM's 30x30 canvas (§4.9)
+            build_argv += ["--min_bucket", "30"]
         if args.solutions:
             build_argv += ["--solutions", args.solutions]
         build_mod.main(build_argv)
 
-    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    cfg, ck_price = Cfg.from_dict(ck["cfg"]), ck.get("price")
-    del ck  # the table and optimizer state are loaded again by the trainer; do not hold a second copy
     cfg.data.root = str(data_dir)
     cfg.data.buckets = None
     cfg.data.source_weights = None
     cfg.train.init_from = args.ckpt
+    cfg.train.init_mode = "adapt"  # new tasks: fresh rows at the checkpoint's mean trained row, whatever it trained with
     cfg.train.lr = args.lr
     cfg.train.warmup_steps = args.warmup_steps
     cfg.train.max_hours = args.hours

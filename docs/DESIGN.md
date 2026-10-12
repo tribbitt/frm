@@ -74,7 +74,7 @@ sham-children counterfactual costs nothing. A negative result means redesign of 
 | D5 | fork structure | **fixed structure by default**: every round forks K children (default K=4) at the middle cycle. **Adaptive forking (`fork_gate`, the user's decision):** a gate head on the pre-fork state decides per row and round whether to fork; declined rows run TRM's round (§4.8) | learned gates collapse to schedules [M: frmv1 gate 98.9% cycle-index variance]; discrete decisions add high-variance gradients [L: research C10]. The gate therefore gets **no end-to-end gradient**: it is trained by BCE on labels from the *measured* counterfactual benefit of each fork (fork CE vs the no-fork continuation's CE, from the same state), after a **forced-fork familiarisation phase** (`fork_force_frac`), with an **exploration floor** (`fork_explore`) so declined states keep getting labels, and **no step-index input** (it reads only the state) | REINFORCE/Gumbel fork decisions, a soft gate trained through the loss, round-index features |
 | D6 | child symmetry breaking and diversity | non-zero, distinct learned fork codes injected at **every** child z-update (inside the gradient window), a parent-conditioned per-cell code, and **fresh per-round noise** through a learned map | tiny's zero-init codes + zero-init arbitration collapsed onto child 0 (w=0.993) [M: `tiny/results/fork_probe.json`]; anything only on a no-grad path never trains [M: tinyv2.2 `init_state`, ARM latents]; deterministic recursion has no escape from a wrong fixed point [L: PTRM 2605.19943]; IMLE cannot drop modes [L: 1809.09087] | zero-init codes, seeds only in warm-up, deterministic children |
 | D7 | child information | children start from the full parent state (y, z) and see the full input x; nothing is masked | masked/starved children equalled random shams [M: tinyabstractor I-9, children right 0.13 vs base 0.74 on disagreements] | crop/masked-plane children |
-| D8 | join | per-cell softmax attention over {parent, child₁..child_K} on (y, z), with gradient; parent slot lets the parent ignore children | detached joins train nothing [M: tinyabstractor `fork_in` detaches all; frmv2 "nothing learned through the merge" removed forks]; merge forms carried the decomposition solver's gains (21-0) while branch-only forms were null [M: decomposition-solver-arc ladder] | detached claim join, inference-only selection |
+| D8 | join | per-cell softmax attention over {parent, child₁..child_K} on (y, z), with gradient; parent slot lets the parent ignore children. **Warm starts from a finished TRM: the function-preserving residual join** (§4.10): the parent's own TRM cycle plus a zero-initialised per-cell tanh gate toward the children's mix, so the model starts as the source TRM | detached joins train nothing [M: tinyabstractor `fork_in` detaches all; frmv2 "nothing learned through the merge" removed forks]; merge forms carried the decomposition solver's gains (21-0) while branch-only forms were null [M: decomposition-solver-arc ladder]; the softmax join on a finished TRM cost 0.063 nats CE at the start and ≈ 30,000 PF to recover [M: W] | detached claim join, inference-only selection |
 | D9 | child objective | one-to-one set matching of {final answer} ∪ {composite intermediates} onto distinct children, annealed and relaxed; on plain rows this is annealed relaxed winner-takes-all | MCL/rWTA/annealed MCL [L: 1606.07839, 1612.00197, 2407.15580]; bipartite set matching forces unique predictions [L: DETR 2005.12872]; same-target CE on all children → collapse [M: tiny] | per-child CE to the final target, diversity bonuses, per-target independent softmin (one child can claim every target) |
 | D10 | depth demand | synthetic composite tasks f_k∘…∘f_1 (k = 1..4) with intermediate grids, mixed with ARC; per-round metrics by k | corpora without detour tasks cannot test the thesis [M: tinyabstractor `synth/compose.py:29-32` refused "second step hides the first"; frmv1 branching factor 1 in 100% of tasks] | ARC only |
 | D11 | deep supervision regime | TRM's online carry: one optimizer step per round, halted rows replaced, per-bucket carries | TRM's regime is what produced 40%+; frmv1/frmv2 replaced it with unrolled graphs and lost TRM's behaviour [M] | unrolled multi-segment graph per step |
@@ -366,6 +366,47 @@ for TRM's full recipe, 40% on ARC-AGI-1 semi-private; `arc_v2_public`, 6.2% on A
   ARC-AGI-2 training, which holds the test outputs of 376 ARC-AGI-1 evaluation tasks: with it, frm's a1 dev is
   contaminated and a final run needs a dev drawn from ARC-AGI-2 evaluation test pairs (TRM saw only their demos).
 
+### 4.10 Function-preserving forks for warm starts (`join_mode="residual"`)
+
+Why (W, `EXPERIMENTS.md` §4b): with the softmax join, adding fresh fork modules to a finished TRM *replaces* part of
+its computation from step 0 — the joined state is a softmax mix over {pre-fork state, untrained children}, and the
+parent no longer runs TRM's second cycle. FRM's training CE started 0.063 nats above the TRM it was copied from and
+took ≈ 30,000 PF (≈ 85% of the run) to close the gap, while composites (new tasks) trailed by 0.044 pass@2. Compute
+spent recovering the source model is compute not spent on headroom. The standard remedy when a pretrained network
+gains a new branch is a zero-initialised gate on the branch's output, so the network computes exactly its old
+function at step 0 and the branch earns its influence by gradient (ReZero, arXiv 2003.04887; Flamingo's tanh-gated
+cross-attention, 2204.14198; ControlNet's zero convolutions, 2302.05543; LoRA's zero B, 2106.09685; Net2Net's
+function-preserving expansion, 1511.05641).
+
+```
+no_grad: (H−2) × cycle(y, z, x, 0)                         # pre-fork cycle (state s1)
+children k = 1..K: cycle(s1, x, c_k)  with grad              # as §4.3
+no_grad: (yt, zt) = cycle(s1, x, 0)                          # the parent's own TRM cycle
+a = softmax_k(⟨W_q rms zt, W_k rms z_k⟩/√d + β sg(q_k))       # attention over children only, per cell
+(ȳ, z̄) = Σ_k a_k (y_k, z_k)
+g = tanh(w · [rms zt ‖ rms z̄] + b),  w = 0, b = 0 at init    # per-cell gate
+(y, z) = (yt, zt) + g ⊙ ((ȳ, z̄) − (yt, zt))
+(y, z) = cycle(y, z, x, 0)  with grad → readout              # TRM's graded cycle
+```
+
+- **Exactly TRM at init**: g = 0 makes every forked round TRM's round (2 no-grad cycles, 1 grad cycle) with the
+  shared weights, whatever the children compute (`test_residual_forks_are_the_source_trm_at_initialisation`).
+- **Learning order**: at g = 0 the parent's loss reaches the gate (∂L/∂g = ⟨∂L/∂y, ȳ − yt⟩) but not the children;
+  the children are trained by their own set-matching objective as proposals. The gate opens per cell where their mix
+  lowers the parent's loss, and from then on the parent's loss flows through the mix into children, codes and
+  attention: the two-cycle credit path of §1 claim 2 (`test_residual_gate_learns_first_then_children_get_the_parents_credit`).
+- **Children carry deltas, not the computation**: the parent's own continuation stays in the state, so a child is
+  rewarded for proposing where TRM's cycle is wrong rather than for reproducing it — the softmax join, where the
+  parent's share fell to 0.08, made the children *be* the computation.
+- **Instruments** keep their meaning: `parent_mass` = 1 − mean gate over grid cells, the other mass slots = gate ×
+  attention, `cf.nofork` = gate forced to 0 (exactly TRM). `join_drop_parent` forces g = 1 on dropped rows (off by
+  default for warm starts: forcing reintroduces the shock on those rows).
+- **Cost**: one more no-grad cycle per forked row (85 vs 80 passes at K = 4 without checkpointing); declined rows
+  (gate) are TRM rounds as before.
+- **Compute targeting** (§4.8): with residual forks a declined row loses nothing, so the fork rate can be capped by
+  the price controller (`train.fork_rate_target`) to keep most of TRM's sample throughput (W: forks on 94% of
+  row-rounds cost FRM 3.1× fewer samples than TRM at matched compute, which is what held its new-task scores back).
+
 ---
 
 ## 5. Objective (summary — derivation in `OBJECTIVE.md`)
@@ -573,8 +614,12 @@ one pass of transients, ≈0.6 MB per parent token in total. At 80 GB that bound
   path run alone; `cf_logits` equal an independent restatement of TRM's round; dropped parent slots give no label;
   declined rows send no gradient into the fork; the gate trains only from its loss and sends nothing into the trunk;
   decisions and exploration; declined rows' loss is exactly the K=0 loss and child terms add per forked row; gate label
-  = benefit > price, plain mean over label rows; `round_flops` boundaries and executed passes; gated training steps
-  (forced phase, price controller, resume restores the price) and `evaluate_split` (`fork.rate`, `cf.allfork/gateoff`).
+  = benefit > price, plain mean over label rows; `round_flops` boundaries and executed passes (both join modes); gated
+  training steps (forced phase, price controller, resume restores the price), the fork learning-rate multiplier, and
+  `evaluate_split` (`fork.rate`, `cf.allfork/gateoff`). Residual join (§4.10): forked rounds equal the K=0 round at
+  initialisation whatever the children compute; at g = 0 the parent's loss trains the gate and not the children, once
+  open it reaches children, codes and attention; `cf="nofork"` is the TRM round with an open gate; forced rows give no
+  join statistics.
 - `test_objective.py`: stablemax normalised, NaN-free gradients and non-zero gradients at zero logits; PAD ignored;
   assignment table one-to-one; set matching reduces to annealed WTA, sends distinct targets to distinct children and
   respects masks/spare children; each child's gradient = w_k × its own CE gradient; mixed composite/plain batches.

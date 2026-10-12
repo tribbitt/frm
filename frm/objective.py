@@ -53,10 +53,15 @@ def token_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return torch.where(valid, -picked, 0.0)
 
 
-def row_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Token-mean stablemax CE per row: [..., L, V] x [..., L] (broadcast) -> [...] (float32)."""
+def row_ce(logits: torch.Tensor, labels: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+    """Token-mean stablemax CE per row: [..., L, V] x [..., L] (broadcast) -> [...] (float32). ``weights``
+    (broadcastable to [..., L]) turn it into a weighted mean over the supervised positions."""
     valid = labels != IGNORE
-    return (token_ce(logits, labels).sum(-1) / valid.sum(-1).clamp_min(1)).float()
+    if weights is None:
+        return (token_ce(logits, labels).sum(-1) / valid.sum(-1).clamp_min(1)).float()
+    ce = token_ce(logits, labels)
+    w = weights.to(ce.dtype) * valid
+    return ((ce * w).sum(-1) / w.sum(-1).clamp_min(1e-9)).float()
 
 
 def row_exact(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -153,7 +158,14 @@ class Objective:
                 return torch.where(fork, v.float(), nan)
 
             tau = tau_at(cfg, progress)
-            ce_final = row_ce(out.child_logits, labels[:, None])  # [B, K]
+            ce_plain = row_ce(out.child_logits, labels[:, None])  # [B, K]
+            ce_final = ce_plain
+            if cfg.child_focus > 0 and out.gate_rows is not None:
+                # Boosting-style specialisation: on label rows, cells TRM's own round already gets right weigh
+                # (1 - child_focus), so the children's capacity goes where the parent is wrong. No gradient.
+                right = (out.cf_logits.argmax(-1) == labels) & out.gate_rows[:, None]
+                w = 1.0 - cfg.child_focus * right.float()
+                ce_final = row_ce(out.child_logits, labels[:, None], w[:, None])
             exact_child = row_exact(out.child_logits, labels[:, None])  # [B, K]
             if has_subgoals is None:
                 has_subgoals = "subgoals" in batch and bool(batch["subgoal_mask"].any())
@@ -168,7 +180,7 @@ class Objective:
             m.update(
                 {
                     "set": forked(set_term.detach()),
-                    "child_ce_min": forked(ce_final.detach().min(-1).values),
+                    "child_ce_min": forked(ce_plain.detach().min(-1).values),
                     "child_exact_any": forked(exact_child.any(-1)),
                     "winner": forked(best[:, 0]),
                     "distinct": forked(_distinct(out.child_logits.argmax(-1), labels)),

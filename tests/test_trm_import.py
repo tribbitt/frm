@@ -78,14 +78,15 @@ def test_versions_from_reads_trms_table_identity_first(tmp_path):
     assert table["bbbb"] == [Version.identity()]
 
 
-def test_continue_mode_keeps_table_and_gives_forks_a_fresh_start(tmp_path):
+@pytest.mark.parametrize("extra", [{}, {"join_mode": "residual", "fork_gate": True}])
+def test_continue_mode_keeps_table_and_gives_forks_a_fresh_start(tmp_path, extra):
     torch.manual_seed(0)
     src = Refiner(ModelCfg(hidden=32, heads=2, K=0, pos_encoding="trm1d"), num_ids=5)
     with torch.no_grad():
         src.puzzle_emb.table.normal_()
         src.puzzle_emb.visits[1:3] = 7
     torch.save({"model": src.state_dict(), "num_ids": 5}, tmp_path / "ck.pt")
-    dst = Refiner(ModelCfg(hidden=32, heads=2, K=4, code_rank=8, join_dim=8, pos_encoding="trm1d"), num_ids=5)
+    dst = Refiner(ModelCfg(hidden=32, heads=2, K=4, code_rank=8, join_dim=8, pos_encoding="trm1d", **extra), num_ids=5)
     fresh = {k: v.clone() for k, v in dst.state_dict().items() if k not in src.state_dict()}
     load_pretrained(dst, str(tmp_path / "ck.pt"), torch.device("cpu"), mode="continue")
     for k, v in src.state_dict().items():

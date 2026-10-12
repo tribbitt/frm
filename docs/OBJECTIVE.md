@@ -255,6 +255,24 @@ measured outcomes, never through the loss it influences:
   exploration floor and no step-index input are the mitigations; `fork.rate_by_round` and `gate_acc` vs `gate_pos`
   detect a relapse (§7).
 
+### 3.7 Error-focused children (`objective.child_focus`, gated models)
+
+Warm-started from a finished TRM, a child that reproduces TRM's own round earns its set-matching loss on every cell
+TRM already gets right, and the residual join (`DESIGN.md` §4.10) has nothing to add from it. With `child_focus` = φ the
+children's final-target CE becomes a weighted token mean, cell weight 1 − φ where the no-fork continuation (the label
+rows' `cf_logits`, already computed for the gate) predicts the cell right and 1 where it is wrong:
+
+$$
+\mathrm{CE}_\phi(\hat y_k, y) = \frac{\sum_p w_p\,\mathrm{CE}_p}{\sum_p w_p},\qquad
+w_p = 1 - \varphi\,[\arg\max \mathrm{cf}_p = y_p] .
+$$
+
+This is boosting's reweighting (later learners concentrate on the earlier learner's mistakes) applied inside one
+round: the children's capacity goes to the cells where TRM is wrong, which is exactly where the per-cell join gate can
+profit from them. Sub-goal targets are not reweighted (TRM's correctness on the final answer says nothing about an
+intermediate grid); rows without a label (no fork, dropped, counterfactual) keep uniform weights; the metric
+`child_ce_min` stays unweighted. φ = 0 (default) is the plain objective (`test_child_focus_sends_the_childrens_loss_to_cells_trm_gets_wrong`).
+
 ## 4. How the objective incentivises depth — the argument in one place
 
 1. **New information every round, even at a fixed point.** K children with fresh noise produce K new proposals each

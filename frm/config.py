@@ -41,6 +41,12 @@ class ModelCfg:
     # build on the children and the parent's loss reaches them at full strength (OBJECTIVE.md §7, response to
     # parent_mass -> 1). Evaluation never drops. 0 disables.
     join_drop_parent: float = 0.0
+    # "softmax": the join is a per-cell softmax over {parent pre-fork state, children} feeding the post cycle (§4.4).
+    # "residual": function-preserving forks for warm starts (§4.10): the parent runs its own TRM cycle, the children's
+    # attention mix is added to it through a per-cell tanh gate initialised at 0, so the model *is* the source TRM at
+    # step 0 and every fork contribution has to be learned on top (zero-init branches: ReZero, Flamingo, ControlNet).
+    # join_drop_parent then forces the gate to 1 on dropped rows.
+    join_mode: str = "softmax"
     # Adaptive forking (DESIGN.md §4.8): a gate head on the pre-fork state decides per row and round whether to fork;
     # declined rows run TRM's round. Off = every round forks. Needs fork_depth = 1.
     fork_gate: bool = False
@@ -63,6 +69,10 @@ class ObjectiveCfg:
     # fork_price nats per supervised token", on rows that forked with their own join.
     lambda_gate: float = 0.1
     fork_price: float = 0.0
+    # Error-focused children (gated models): on label rows, cells that TRM's own round (the no-fork continuation)
+    # already predicts right weigh 1 - child_focus in the children's final-target CE, so children specialise on the
+    # parent's errors (boosting). 0 = uniform. Sub-goal targets are never reweighted.
+    child_focus: float = 0.0
 
 
 @dataclass

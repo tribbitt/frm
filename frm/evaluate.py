@@ -413,6 +413,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--state_noise", type=float, default=None, help="their z noise in RMS units")
     ap.add_argument("--child_vote_weight", type=float, default=None, help="children's answers vote with this weight")
     ap.add_argument("--tag", default="", help="suffix for the output file (several settings on one checkpoint)")
+    ap.add_argument("--no_cf", action="store_true", help="skip the counterfactual reruns (faster diagnostics)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--submission", default=None, help="write Kaggle submission.json here")
     args = ap.parse_args(argv)
@@ -430,7 +431,8 @@ def main(argv: list[str] | None = None) -> int:
         if getattr(args, name) is not None:
             setattr(cfg.eval, name, getattr(args, name))
     ds = Dataset(cfg.data.root)
-    res = evaluate_split(model, ds, args.split, cfg.eval, device, dtype, cfg.eval.counterfactuals, bool(args.submission))
+    cf = cfg.eval.counterfactuals and not args.no_cf
+    res = evaluate_split(model, ds, args.split, cfg.eval, device, dtype, cf, bool(args.submission))
     if args.submission:
         Path(args.submission).write_text(json.dumps(res.pop("attempts")))
     res["ckpt"], res["step"], res["row_rounds"] = str(ckpt), ck.get("step"), ck.get("row_rounds")
