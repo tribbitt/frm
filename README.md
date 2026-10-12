@@ -103,7 +103,8 @@ same command is the local leaderboard proxy (pretrain on `a2_kaggle`, adapt on A
 ## Status
 
 Built and verified on CPU (tests, smoke, learnability) and on Kelvin's MI300X (ROCm venv, smoke incl. SIGTERM/resume,
-benchmark: `trm` ≈238, FRM K=4 ≈224–227 TFLOP/s compiled). Pilot P1: FRM ≥ TRM per step once the join's parent slot is
-dropped in training, but 3–4× the cost per step. Current direction (`docs/EXPERIMENTS.md` §4b): start from the ARC
-Prize verified TRM checkpoint (`scripts/import_trm.py`; exact import, dev pass@2 0.485 on TRM's canvas) and continue it
-as TRM and as FRM with adaptive forking (`model.fork_gate`) at matched compute.
+benchmark: `trm` ≈238, FRM K=4 ≈224–227 TFLOP/s compiled). P1 (from scratch): FRM ≥ TRM per step once the join's
+parent slot is dropped in training, 3–4× the cost per step. W (`docs/EXPERIMENTS.md` §4b, from the ARC Prize verified
+TRM, 36,000 PF per arm): FRM ahead per step throughout, equal to TRM-continued at matched compute on ARC dev, a
+steeper composite slope, behind on time-limited adaptation. Proposal R (§4c): spend forks where they pay (fork-rate
+targeting, error-focused children).

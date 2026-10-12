@@ -78,7 +78,7 @@ def test_versions_from_reads_trms_table_identity_first(tmp_path):
     assert table["bbbb"] == [Version.identity()]
 
 
-@pytest.mark.parametrize("extra", [{}, {"join_mode": "residual", "fork_gate": True}])
+@pytest.mark.parametrize("extra", [{}, {"fork_gate": True}])
 def test_continue_mode_keeps_table_and_gives_forks_a_fresh_start(tmp_path, extra):
     torch.manual_seed(0)
     src = Refiner(ModelCfg(hidden=32, heads=2, K=0, pos_encoding="trm1d"), num_ids=5)

@@ -263,9 +263,8 @@ def test_round_flops_boundaries(ckpt):
     assert g.round_flops(S, B, 0, 0, train=False) == pytest.approx(B * t.eval_flops_per_row(S))
 
 
-@pytest.mark.parametrize("join_mode", ["softmax", "residual"])
-def test_round_flops_match_executed_passes(join_mode):
-    g = make(fork_gate=True, join_mode=join_mode)
+def test_round_flops_match_executed_passes():
+    g = make(fork_gate=True)
     counts = {True: 0, False: 0}
     f = g._f
 
@@ -285,57 +284,6 @@ def test_round_flops_match_executed_passes(join_mode):
     expected = (nf * (fn + 3 * fg) + (B - nf) * (tn + 3 * tg) + ncf * cont) * g.flops_per_row_pass(S)
     assert g.round_flops(S, B, nf, ncf) == pytest.approx(expected)
 
-
-# ---------------------------------------------------------------------------------------------------- residual join
-def test_residual_forks_are_the_source_trm_at_initialisation():
-    """Function-preserving warm start: with the join gate at 0 every forked round equals TRM's round with the same
-    shared weights, whatever the children compute (they still run, train and differ by code and noise)."""
-    r, t = make(join_mode="residual"), make(K=0)
-    share(t, r)
-    with torch.no_grad():
-        r.code_up.normal_(0, 0.5)  # children far from the parent: the gate alone must keep them out
-    x, ids, _ = inputs()
-    cr = ct = r.init_carry(B, S, CPU, torch.float32)
-    for _ in range(3):
-        o_r, o_t = r.round(cr, x, ids, fork_mode="all", gen=gen()), t.round(ct, x, ids)
-        torch.testing.assert_close(o_r.logits, o_t.logits)
-        torch.testing.assert_close(o_r.carry.z, o_t.carry.z)
-        cr, ct = o_r.carry, o_t.carry
-    assert not torch.allclose(o_r.child_logits[:, 0], o_r.child_logits[:, 1])
-    assert torch.allclose(o_r.join_alpha[:, 0], torch.ones(B))  # the parent's share is 1 while the gate is 0
-
-
-def test_residual_gate_learns_first_then_children_get_the_parents_credit():
-    """At g = 0 the parent's loss reaches the gate head but not the children (their own set loss trains them); once
-    the gate opens, the parent's loss flows through the mix into children, codes and the join's attention."""
-    r = make(join_mode="residual")
-    x, ids, labels = inputs()
-    row_ce(r.round(warm_carry(r, x, ids), x, ids, fork_mode="all", gen=gen()).logits, labels).mean().backward()
-    assert r.join_gate.weight.grad.abs().sum() > 0
-    assert r.codes.grad is None or r.codes.grad.abs().sum() == 0
-    r.zero_grad(set_to_none=True)
-    with torch.no_grad():
-        r.join_gate.bias.fill_(1.0)
-    row_ce(r.round(warm_carry(r, x, ids), x, ids, fork_mode="all", gen=gen()).logits, labels).mean().backward()
-    for p in (r.codes, r.join_q.weight, r.join_k.weight, r.code_up):  # code_down waits for code_up, as ungated
-        assert p.grad is not None and p.grad.abs().sum() > 0
-
-
-def test_residual_nofork_counterfactual_and_forced_rows():
-    """cf="nofork" is the TRM round even with an open gate; a dropped row takes the children's mix whole."""
-    r, t = make(join_mode="residual", join_drop_parent=1.0), make(K=0)
-    share(t, r)
-    with torch.no_grad():
-        r.join_gate.bias.fill_(2.0)
-    x, ids, _ = inputs()
-    c = r.init_carry(B, S, CPU, torch.float32)
-    r.eval()
-    with torch.no_grad():
-        torch.testing.assert_close(r.round(c, x, ids, cf="nofork", fork_mode="all", gen=gen()).logits,
-                                   t.round(c, x, ids).logits)
-    r.train()
-    out = r.round(c, x, ids, fork_mode="all", gen=gen())
-    assert torch.isnan(out.join_alpha).all()  # every row forced: no join statistics from forced rows
 
 # ---------------------------------------------------------------------------------------------------- end to end
 @pytest.fixture(scope="module")

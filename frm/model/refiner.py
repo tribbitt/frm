@@ -87,15 +87,6 @@ class Refiner(nn.Module):
             self.join_beta = nn.Parameter(torch.zeros(()))
             if cfg.noise_dim:
                 self.code_noise = CastedLinear(cfg.noise_dim, D, std=cfg.noise_init / math.sqrt(cfg.noise_dim))
-        # Residual join gate (join_mode="residual"): zero weights and bias, so tanh(gate) = 0 and the forked round is
-        # exactly TRM's round at initialisation; built after the fork modules so they initialise as in softmax mode.
-        if cfg.join_mode not in ("softmax", "residual"):
-            raise ValueError(f"join_mode {cfg.join_mode!r} not in ('softmax', 'residual')")
-        self.join_gate: CastedLinear | None = None
-        if cfg.K > 0 and cfg.join_mode == "residual":
-            if cfg.fork_depth != 1 or cfg.grad_cycles != 1 or cfg.H_cycles < 3:
-                raise ValueError("join_mode=residual needs fork_depth=1, grad_cycles=1 and H_cycles >= 3")
-            self.join_gate = CastedLinear(2 * D, 1, bias=True, std=0.0)
         # Gate head (DESIGN.md §4.8), built last so the other parameters initialise as in an ungated model. A declined
         # row must reproduce TRM's round from the pre-fork state, which already used H-2 of TRM's H-grad no-grad cycles.
         self.gate: nn.Module | None = None
@@ -217,44 +208,8 @@ class Refiner(nn.Module):
             ent = ent.masked_fill(drop, float("nan"))
         return y_new, z_new, mass, ent, drop
 
-    def _join_residual(self, yt, zt, ys, zs, q_children, cf, sham_perm):
-        """Function-preserving join (join_mode="residual"): the parent's own continuation (yt, zt) plus a per-cell gated
-        correction toward the children's attention mix, gate = tanh(join_gate([rms zt, rms z_mix])) starting at 0.
-        Stats match ``_join``: slot 0 of the mass is the parent's share 1 - gate, slot k the gate times child k's
-        attention weight; the entropy is that of the attention over children."""
-        if cf == "sham":
-            perm = sham_perm if sham_perm is not None else torch.roll(torch.arange(ys.shape[0], device=ys.device), 1)
-            ys, zs, q_children = ys[perm], zs[perm], q_children[perm]
-        eps = self.cfg.rms_eps
-        qv = self.join_q(rms_norm(zt, eps))  # [B, L, d]
-        kv = self.join_k(rms_norm(zs, eps))  # [B, K, L, d]
-        s = torch.einsum("bld,bkld->bkl", qv, kv).float() / math.sqrt(qv.shape[-1])
-        s = s + self.join_beta * q_children.detach()[:, :, None]
-        attn = s.softmax(dim=1)  # [B, K, L]
-        a = attn.to(ys.dtype)[..., None]
-        y_mix, z_mix = (a * ys).sum(1), (a * zs).sum(1)
-        g = torch.tanh(self.join_gate(torch.cat([rms_norm(zt, eps), rms_norm(z_mix, eps)], dim=-1)).float())  # [B,L,1]
-        drop = None
-        if self.training and self.cfg.join_drop_parent > 0 and cf is None:
-            drop = torch.rand(g.shape[0], device=g.device) < self.cfg.join_drop_parent  # rows that take the mix whole
-            g = torch.where(drop[:, None, None], torch.ones_like(g), g)
-        if cf == "nofork":
-            g = torch.zeros_like(g)
-        gd = g.to(yt.dtype)
-        y_new, z_new = yt + gd * (y_mix - yt), zt + gd * (z_mix - zt)
-        P = self.cfg.prefix_len
-        gg, aa = g[:, P:, 0].detach(), attn[:, :, P:].detach()  # [B, S*S], [B, K, S*S]
-        mass = torch.cat([(1 - gg).mean(-1, keepdim=True), (gg[:, None] * aa).mean(-1)], dim=1)  # [B, K+1]
-        ent = -(aa.clamp_min(1e-9).log() * aa).sum(1).mean(-1)
-        if drop is not None:
-            mass = mass.masked_fill(drop[:, None], float("nan"))
-            ent = ent.masked_fill(drop, float("nan"))
-        return y_new, z_new, mass, ent, drop
-
     def _node(self, y, z, x, c, depth: int, cos, sin, cf, sham_perm=None, gen=None):
         """Fork K children (each a node one level deeper), join them, run the post cycle. Returns children too.
-        With join_mode="residual" the parent first runs its own no-grad TRM cycle and the join corrects that state, so
-        the round is TRM's round whenever the join gate is 0.
 
         Counterfactual modes apply to the root join only (depth 0)."""
         cfg = self.cfg
@@ -272,12 +227,7 @@ class Refiner(nn.Module):
             yk, zk = self._cycle_fn(yk, zk, xk, codes, cos, sin, n_child, ckpt)
         ys, zs = yk.view(B, K, L, D), zk.view(B, K, L, D)
         q_children = self._q(yk).view(B, K)
-        if self.join_gate is not None:  # the parent's own (no-grad) TRM cycle, then the gated correction toward the mix
-            with torch.no_grad():
-                yt, zt = self._cycle_fn(y, z, x, c, cos, sin, cfg.L_cycles)
-            y, z, alpha, ent, drop = self._join_residual(yt, zt, ys, zs, q_children, cf, sham_perm)
-        else:
-            y, z, alpha, ent, drop = self._join(y, z, ys, zs, self._q(y), q_children, cf, sham_perm)
+        y, z, alpha, ent, drop = self._join(y, z, ys, zs, self._q(y), q_children, cf, sham_perm)
         y, z = self._cycle_fn(y, z, x, c, cos, sin, cfg.L_cycles)
         return y, z, (ys, q_children, alpha, ent, drop)
 
@@ -437,8 +387,7 @@ class Refiner(nn.Module):
             return cfg.K * nc + n, cfg.K * nc
 
         grad, leaf = node(0)
-        own = n if self.join_gate is not None else 0  # residual join: the parent's own no-grad TRM cycle
-        return (cfg.H_cycles - 2) * n + own, grad, leaf if cfg.grad_ckpt_children else 0
+        return (cfg.H_cycles - 2) * n, grad, leaf if cfg.grad_ckpt_children else 0
 
     def flops_per_row_pass(self, S: int) -> float:
         cfg = self.cfg
