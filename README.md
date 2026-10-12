@@ -25,6 +25,7 @@ split per bucket, per-pass activation checkpointing of children, FLOP-budgeted t
 
 | doc | read for |
 |---|---|
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | **continuing the project**: state, constraints, results, the open decision, commands |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | the design and the code contract (start here) |
 | [`docs/DEPTH.md`](docs/DEPTH.md) | why recursive refiners stop using depth, and frm's answer per mechanism |
 | [`docs/OBJECTIVE.md`](docs/OBJECTIVE.md) | loss research and the objective, term by term |
@@ -45,10 +46,12 @@ frm/evaluate.py        per-round voting, pass@k, fork/depth instruments, counter
 frm/adapt.py           Kaggle adaptation -> submission.json
 frm/monitor/           the live monitor's source (Kelvin over the ssh master), run state, charts, pages
 configs/                  pilots trm_a1, frm_a1, frm2_a1, frm_a1_arc; optional trm_h2_a1, nest_a1; final frm_a2_kaggle;
-                          warm start from TRM: trm_import, trmc_a1tn (TRM continued), frmc_a1tn (FRM continued, gated)
+                          warm start from TRM: trm_import, trmc_a1tn (TRM continued), frmc_a1tn (FRM continued, gated),
+                          frmc40_a1tn / frmcf40_a1tn (proposal R: fork-rate targeting / + error-focused children)
 kelvin/                   Kelvin2 job kit
 scripts/                  fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py, monitor.py,
-                          import_trm.py (published TRM checkpoint -> frm checkpoint aligned with a frm dataset)
+                          import_trm.py (published TRM checkpoint -> frm checkpoint aligned with a frm dataset),
+                          arm_curves.py (two arms' curves: pooled paired windows, slopes, matched steps/PF)
 tests/                    unit tests + the end-to-end smoke
 ```
 
