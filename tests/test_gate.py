@@ -3,6 +3,7 @@ the gate learns from measured counterfactual benefit only, and the accounting fo
 
 import dataclasses
 import json
+import math
 
 import numpy as np
 import pytest
@@ -11,9 +12,10 @@ import torch.nn.functional as F
 
 from frm.config import Cfg, ModelCfg, ObjectiveCfg
 from frm.data import build as build_mod
+from frm.data.build import SOURCE_CODES
 from frm.data.composite import generate
-from frm.data.loader import Dataset
-from frm.evaluate import evaluate_split
+from frm.data.loader import Dataset, eval_batches
+from frm.evaluate import _rows_per_batch, evaluate_split, gate_skill
 from frm.model.refiner import Carry, Refiner, RoundOut
 from frm.objective import Objective, row_ce
 from frm.train import Trainer
@@ -55,7 +57,9 @@ def warm_carry(m, x, ids):
 def force_decision(m, mask):
     """Make fork_mode="gate" take the given decision (the gate's own logits are tested elsewhere)."""
     inner = m._decide
-    m._decide = lambda logit, mode, explore, n, dev: mask.clone() if mode == "gate" else inner(logit, mode, explore, n, dev)
+    m._decide = lambda logit, mode, explore, n, dev, *rest: (
+        mask.clone() if mode == "gate" else inner(logit, mode, explore, n, dev, *rest)
+    )
 
 
 def gen(seed=7):
@@ -177,6 +181,9 @@ def test_decide_gate_and_exploration():
     assert g._decide(neg, "gate", 1.0, B, CPU).all()  # exploration forks declined rows
     assert g._decide(neg, "all", 0.0, B, CPU).all() and not g._decide(pos, "none", 0.0, B, CPU).any()
     assert u._decide(None, "gate", 0.0, B, CPU).all()  # ungated: "gate" means every row forks
+    ranked = torch.arange(B, dtype=torch.float32) - B  # every logit < 0: the gate itself would fork no row
+    top = g._decide(ranked, "gate", 0.0, B, CPU, top=0.25)
+    assert top.tolist() == [i >= B - math.ceil(0.25 * B) for i in range(B)]  # the highest-logit quarter forks
 
 
 # ---------------------------------------------------------------------------------------------------- objective
@@ -322,6 +329,70 @@ def test_gated_training_steps_price_and_resume(data_dir, tmp_path):
     assert again.price == pytest.approx(tr.price)
 
 
+def test_training_logs_where_the_forks_go_by_source(data_dir, tmp_path):
+    """``{metric}_by_source``: per-row metrics averaged over each source's rows. Odd rows of every draw are relabelled
+    as BARC rows and forced to fork; composite rows are declined."""
+    cfg = tiny_cfg(data_dir)
+    tr = Trainer(cfg, tmp_path / "run", "none")
+    barc = SOURCE_CODES["barc"]
+    for ts in tr.streams.values():
+        def take(n, take=ts.take):
+            b = take(n)
+            b["source"] = np.where(np.arange(n) % 2, barc, b["source"]).astype(np.uint8)
+            return b
+        ts.take = take
+    tr.train_step()  # fills the carries with relabelled rows
+    tr.stats.summary()
+    st = next(iter(tr.states.values()))
+    force_decision(tr.model, st.batch["source"] == barc)
+    tr.cfg.train.fork_force_frac = 0.0
+    tr.states = {st.S: st}
+    tr.buckets, tr.bucket_p = [st.S], np.ones(1)
+    st.halted[:] = False  # keep the same rows for the logged step
+    tr.train_step()
+    s = tr.stats.summary()
+    assert s["fork_rate_by_source"] == {"composite": 0.0, "barc": 1.0}
+    assert set(s["exact_by_source"]) == {"composite", "barc"} and set(s["gate_says_by_source"]) == {"composite", "barc"}
+
+
+def test_lr_decay_over_the_end_of_the_budget(data_dir, tmp_path):
+    cfg = tiny_cfg(data_dir)
+    cfg.train.decay_frac, cfg.train.decay_to, cfg.train.max_steps = 0.5, 0.1, 8  # progress = step / 8
+    tr = Trainer(cfg, tmp_path / "run", "none")
+    lrs = []
+    for _ in range(8):
+        tr.train_step()
+        lrs.append(tr.opt.param_groups[0]["lr"] / cfg.train.lr)
+    # warm-up (2 steps), constant until half the budget, then (1-sqrt) down to 0.1 x lr at the budget's end
+    assert lrs[:5] == pytest.approx([0.5, 1.0, 1.0, 1.0, 1.0])
+    assert lrs[5:] == pytest.approx([0.1 + 0.9 * (1 - math.sqrt((p - 0.5) / 0.5)) for p in (5 / 8, 6 / 8, 7 / 8)])
+    tr.step = 8
+    assert tr.lr_factor() == pytest.approx(0.1)
+
+
+def test_branch_resumes_a_shared_stretch_and_stops_without_moving_the_schedule(data_dir, tmp_path):
+    """resume_from: a new run continues another run's full state and keeps its own best.pt; its own last.pt wins once
+    written. stop_pflops ends a run early with the schedule of budget_pflops. max_hours counts earlier links."""
+    cfg = tiny_cfg(data_dir)
+    shared = Trainer(cfg, tmp_path / "shared", "none")
+    for _ in range(4):
+        shared.train_step()
+    shared.best, shared.hours_before = 0.7, 5.0
+    shared.save()
+    cfg.train.resume_from = str(tmp_path / "shared" / "last.pt")
+    branch = Trainer(cfg, tmp_path / "branch", "auto")
+    assert (branch.step, branch.flops, branch.best) == (4, shared.flops, -1.0)
+    assert branch.price == pytest.approx(shared.price) and branch.hours() >= 5.0
+    assert all(branch.streams[S].state_dict() == shared.streams[S].state_dict() for S in shared.streams)
+    branch.train_step()
+    branch.save()
+    assert Trainer(cfg, tmp_path / "branch", "auto").step == 5
+    cfg.train.max_hours = 10.0
+    assert branch.progress() >= 0.5 and not branch.done()
+    cfg.train.max_hours, cfg.train.stop_pflops = 0.0, shared.flops / 1e15
+    assert branch.done() and branch.progress() < 1.0  # stopped, though the schedule's budget is not spent
+
+
 def test_fork_lr_mult_scales_only_the_fork_modules(data_dir, tmp_path):
     cfg = tiny_cfg(data_dir)
     cfg.train.fork_lr_mult = 4.0
@@ -354,3 +425,40 @@ def test_gated_evaluate_split_reports_rates_and_counterfactuals(data_dir):
     res = evaluate_split(model, ds, "dev_composite", ec, CPU, torch.float32, counterfactuals=True)
     assert res["fork"]["rate"] == 1.0 and res["fork"]["forked_rows"] == res["rows"]
     assert res["cf"]["allfork"] == 0.0 and np.isfinite(res["fork"]["distinct"])
+
+
+def test_fork_top_forks_a_fixed_share_of_the_real_rows_and_measures_skill(data_dir):
+    """fork_top overrides logit > 0: a gate that declines everything still forks ceil(top * n) real rows per batch
+    and round (padding never takes a slot); at fork_top = 1 every row forks and carries a label, so the skill block
+    covers every labelled row-round, and the gate's own rule is reported beside the forced rate."""
+    cfg = tiny_cfg(data_dir)
+    torch.manual_seed(0)
+    ds = Dataset(str(data_dir))
+    model = Refiner(cfg.model, ds.num_ids)
+    with torch.no_grad():
+        model.gate[-1].bias.fill_(-10.0)
+    ec = dataclasses.replace(cfg.eval, fork_top=0.5)
+    res = evaluate_split(model, ds, "dev_composite", ec, CPU, torch.float32)
+    trained = model.puzzle_emb.trained().numpy()
+    sizes = [len(b["keys"]) for S in ds.buckets if ds.has_split(S, "dev_composite")
+             for b in eval_batches(ds, "dev_composite", S, _rows_per_batch(model, S, ec), ec.max_versions,
+                                   trained=trained)]
+    assert res["fork"]["rate"] == pytest.approx(sum(math.ceil(0.5 * n) for n in sizes) / sum(sizes))
+    assert res["fork"]["gate_rate"] == 0.0 and res["fork"]["top"] == 0.5
+    res = evaluate_split(model, ds, "dev_composite", dataclasses.replace(ec, fork_top=1.0), CPU, torch.float32)
+    skill = res["fork"]["skill"]
+    assert res["fork"]["rate"] == 1.0 and skill["rows"] == res["fork"]["gate_rows"] > 0
+    assert set(skill["by_round"]) == {"r1", "r2-4"}  # 3 eval rounds
+
+
+def test_gate_skill_ranks_within_batch_rounds():
+    a, b = np.array([3.0, 2.0, 1.0, 0.0]), np.array([3.0, 1.5, 0.5, -1.0])
+    perfect = [(0, 0, a, np.array([0.3, 0.1, -0.05, -0.05])), (1, 4, b, np.array([0.2, -0.01, -0.01, -0.08]))]
+    s = gate_skill(perfect, rhos=(0.25, 0.5))
+    assert s["auc"] == pytest.approx(1.0) and s["rows"] == 8
+    assert s["top0.25"]["share"] == pytest.approx(0.5 / 0.4)  # the top row of each batch-round: 0.3 + 0.2 of 0.4
+    assert s["top0.5"]["precision"] == pytest.approx(3 / 4) and set(s["by_round"]) == {"r1", "r5+"}
+    flipped = [(g, r, -lg, ben) for g, r, lg, ben in perfect]
+    assert gate_skill(flipped)["auc"] == pytest.approx(0.0)
+    tied = [(0, 0, np.zeros(4), np.array([0.1, -0.1, 0.1, -0.1]))]
+    assert gate_skill(tied)["auc"] == pytest.approx(0.5)

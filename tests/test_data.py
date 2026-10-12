@@ -11,7 +11,7 @@ import pytest
 
 from frm.data.arc import load_subset
 from frm.data.augment import DIHEDRAL_INVERSE, Version, _puzzle_hash, dihedral, inverse_dihedral, make_versions
-from frm.data.build import build, dev_ids, parse_args
+from frm.data.build import SOURCE_CODES, build, dev_ids, parse_args
 from frm.data.encode import EOS, IGNORE, PAD, crop, encode_grid, labels_from
 from frm.data.loader import Dataset, TrainStream, eval_batches
 from frm.data.sizerule import BUCKETS, choose_bucket, fits, predict_output_size
@@ -493,8 +493,14 @@ def test_source_weights(ds):
     S = next(S for S in ds.buckets if ds.meta["counts"]["train"][str(S)].get("composite"))
     only_comp = TrainStream(ds, S, np.random.default_rng(0), source_weights={"arc": 0.0, "composite": 1.0}).take(100)
     assert all(ds.identifiers[p].startswith("comp:") for p in only_comp["puzzle_ids"])
+    assert np.all(only_comp["source"] == SOURCE_CODES["composite"])
     only_arc = TrainStream(ds, S, np.random.default_rng(0), source_weights={"arc": 1.0}).take(100)
     assert not any(ds.identifiers[p].startswith("comp:") for p in only_arc["puzzle_ids"])
+    assert np.all(only_arc["source"] == SOURCE_CODES["arc"])
+    mixed = TrainStream(ds, S, np.random.default_rng(1)).take(400)  # each row's code is its own task's source
+    want = [SOURCE_CODES["composite"] if ds.identifiers[p].startswith("comp:") else SOURCE_CODES["arc"]
+            for p in mixed["puzzle_ids"]]
+    assert mixed["source"].tolist() == want and len(set(want)) == 2
 
 
 def test_state_dict_resume(ds):

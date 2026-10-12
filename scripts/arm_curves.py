@@ -82,6 +82,25 @@ def main() -> int:
             ci = boot(pa - pb, rng)
             print(f"  {split:14s} {lo:6d}-{hi:<6d} ({len(sel):2d} evals) A {pa.mean():.3f} B {pb.mean():.3f} "
                   f"d {(pa - pb).mean():+.4f} CI ({ci[0]:+.4f}, {ci[1]:+.4f})")
+    print("pooled row exact (r16), A − B, 90% CI: paired over tasks when both arms log per-task row exact, else over "
+          "the matched evaluations")
+    for w in wins:
+        lo, hi = map(int, w.split("-"))
+        sel = [p for p in pfs if lo <= p <= hi]
+        if not sel:
+            continue
+        for split in ("dev", "dev_composite"):
+            if all("row_exact" in R[p][split]["per_task"] for R in (A, B) for p in sel):
+                tasks = sorted(A[sel[0]][split]["per_task"]["row_exact"])
+                d = np.array([[A[p][split]["per_task"]["row_exact"][t] - B[p][split]["per_task"]["row_exact"][t]
+                               for t in tasks] for p in sel]).mean(0)
+                how = "tasks"
+            else:
+                d = np.array([ex(A[p], split) - ex(B[p], split) for p in sel])
+                how = "evals"
+            ci = boot(d, rng)
+            print(f"  {split:14s} {lo:6d}-{hi:<6d} ({len(sel):2d} evals, over {how}) d {d.mean():+.4f} "
+                  f"CI ({ci[0]:+.4f}, {ci[1]:+.4f})")
     lo, hi = map(int, wins[-1].split("-"))
     sel = [p for p in pfs if lo <= p <= hi]
     if len(sel) >= 3:

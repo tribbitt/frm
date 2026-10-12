@@ -100,12 +100,14 @@ class Dataset:
 
 
 def _rows(ds: Dataset, d: SplitData, ex: np.ndarray, vid: np.ndarray, offset: np.ndarray) -> dict[str, np.ndarray]:
-    """Render rows (example index, identifier, canvas offset) into model arrays."""
+    """Render rows (example index, identifier, canvas offset) into model arrays; ``source`` is the row's
+    ``SOURCE_CODES`` value (per-source training metrics and fork prices)."""
     tid, perm = ds.version_tid[vid], ds.version_perm[vid]
     batch = {
         "inputs": render(d.inp, ex, d.inp_hw[ex], tid, perm, offset),
         "labels": labels_from(render(d.out, ex, d.out_hw[ex], tid, perm, offset)),
         "puzzle_ids": vid.astype(np.int32),
+        "source": d.source[np.searchsorted(d.ex_start, ex, side="right") - 1],
     }
     n, S2 = len(ex), d.S * d.S
     subgoals = np.full((n, M, S2), IGNORE, dtype=np.int16)

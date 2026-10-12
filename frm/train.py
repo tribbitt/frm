@@ -32,7 +32,7 @@ from frm.objective import Objective, tau_at
 
 ROUND_METRICS = (
     "exact", "ce", "q_loss", "q_acc", "set", "child_exact_any", "child_ce_min", "parent_mass", "join_entropy",
-    "distinct", "sub_coverage", "fork_rate", "gate_acc", "gate_pos", "benefit",
+    "distinct", "sub_coverage", "fork_rate", "gate_acc", "gate_pos", "benefit", "gate_says", "declined_pos",
 )
 
 
@@ -146,30 +146,46 @@ def to_device(arrays: dict[str, np.ndarray], device: torch.device) -> dict[str, 
     return out
 
 
+SOURCE_METRICS = ("exact", "ce", "fork_rate", "benefit", "gate_pos", "gate_acc", "gate_says", "declined_pos",
+                  "child_ce_min")
+SOURCE_NAMES = {code: name for name, code in SOURCE_CODES.items()}
+
+
 class RoundStats:
     """Accumulates per-row metrics by round index (1..max_rounds) between log lines.
 
     Logged as ``{name}`` (mean over all rows) and ``{name}_by_round`` (mean over rows at each round). Rates such as
     ``first_solve`` (row exact for the first time at this round) and ``regress`` (exact at r-1, wrong at r) are means
-    of 0/1 indicators, i.e. fractions of the rows seen at that round."""
+    of 0/1 indicators, i.e. fractions of the rows seen at that round. With the rows' source codes, the metrics in
+    ``SOURCE_METRICS`` are also logged as ``{name}_by_source`` ({source name: mean}), e.g. where the forks go."""
 
     def __init__(self, max_rounds: int):
         self.R = max_rounds
         self.sums: dict[str, np.ndarray] = {}
         self.counts: dict[str, np.ndarray] = {}
+        self.src_sums: dict[str, np.ndarray] = {}
+        self.src_counts: dict[str, np.ndarray] = {}
 
-    def add_many(self, rounds: torch.Tensor, metrics: dict[str, torch.Tensor]) -> None:
+    def add_many(self, rounds: torch.Tensor, metrics: dict[str, torch.Tensor], sources: torch.Tensor | None = None):
         """One device->host transfer for all per-row metrics of a step; NaN entries are skipped per metric."""
         names = list(metrics)
-        stacked = torch.stack([rounds.float()] + [metrics[n].detach().float() for n in names]).cpu().numpy()
+        head = [rounds.float()] + ([] if sources is None else [sources.float()])
+        stacked = torch.stack(head + [metrics[n].detach().float() for n in names]).cpu().numpy()
         r = np.clip(stacked[0].astype(np.int64), 1, self.R)
+        src = None if sources is None else stacked[1].astype(np.int64)
         for i, name in enumerate(names):
-            v = stacked[i + 1]
+            v = stacked[i + len(head)]
             keep = ~np.isnan(v)
             s = self.sums.setdefault(name, np.zeros(self.R + 1))
             c = self.counts.setdefault(name, np.zeros(self.R + 1))
             np.add.at(s, r[keep], v[keep])
             np.add.at(c, r[keep], 1)
+            if src is not None and name in SOURCE_METRICS:
+                n_src = len(SOURCE_NAMES)
+                s = self.src_sums.setdefault(name, np.zeros(n_src))
+                c = self.src_counts.setdefault(name, np.zeros(n_src))
+                np.add.at(s, src[keep], v[keep])
+                np.add.at(c, src[keep], 1)
 
     def summary(self) -> dict:
         out = {}
@@ -177,7 +193,10 @@ class RoundStats:
             c = self.counts[name]
             out[f"{name}_by_round"] = [round(float(s[r] / c[r]), 5) if c[r] else None for r in range(1, self.R + 1)]
             out[name] = float(s.sum() / max(c.sum(), 1))
-        self.sums, self.counts = {}, {}
+        for name, s in self.src_sums.items():
+            c = self.src_counts[name]
+            out[f"{name}_by_source"] = {SOURCE_NAMES[k]: round(float(s[k] / c[k]), 5) for k in np.flatnonzero(c)}
+        self.sums, self.counts, self.src_sums, self.src_counts = {}, {}, {}, {}
         return out
 
 
@@ -233,6 +252,7 @@ class Trainer:
         self.stats = RoundStats(tc.max_rounds)
         self.stop_requested = False
         self.t_start = time.time()
+        self.hours_before = 0.0  # training wall-clock of earlier links (restored on resume): max_hours is cumulative
         if resume != "none":
             self._maybe_resume(resume)
         (run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))
@@ -247,6 +267,7 @@ class Trainer:
             "step": self.step,
             "flops": self.flops,
             "row_rounds": self.row_rounds,
+            "hours": self.hours(),
             "price": self.price,
             "best": self.best,
             "next_eval": self.next_eval,
@@ -293,11 +314,18 @@ class Trainer:
         return p[keep] / p[keep].sum(), {S: source_w[S] for S in self.buckets}
 
     def _maybe_resume(self, resume: str) -> None:
+        """``auto``: RUN/last.pt if it exists, else (``train.resume_from``) the full training state of another run's
+        checkpoint, so two arms can branch from one shared stretch of training (the branch keeps its own best.pt)."""
         path = self.run_dir / "last.pt" if resume == "auto" else Path(resume)
+        branch = False
         if not path.exists():
             if resume != "auto":
                 raise FileNotFoundError(path)
-            return
+            if not self.cfg.train.resume_from:
+                return
+            path, branch = Path(self.cfg.train.resume_from), True
+            if not path.exists():
+                raise FileNotFoundError(f"train.resume_from: {path}")
         ck = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ck["model"])
         self.ema.shadow = {k: v.to(self.device) for k, v in ck["ema"].items()}
@@ -305,7 +333,10 @@ class Trainer:
         if self.scaler and ck["scaler"]:
             self.scaler.load_state_dict(ck["scaler"])
         self.step, self.flops, self.best, self.next_eval = ck["step"], ck["flops"], ck["best"], ck["next_eval"]
+        if branch:
+            self.best = -1.0
         self.row_rounds = ck["row_rounds"]
+        self.hours_before = ck.get("hours", 0.0)
         self.price = ck.get("price", self.price)  # checkpoints written before the fork gate carry none
         for S, st in ck["streams"].items():
             if S in self.streams:
@@ -350,7 +381,15 @@ class Trainer:
         st.prev_exact[idx] = False
 
     def lr_factor(self) -> float:
-        return min(1.0, (self.step + 1) / max(1, self.cfg.train.warmup_steps))
+        """Linear warm-up, constant, then (``decay_frac``) a (1-sqrt) cooldown to ``decay_to`` over the budget's end:
+        1 - sqrt(u) at the fraction u of the window elapsed (Hägele et al. 2024, arXiv 2405.18392: beats a linear
+        cooldown; a weight average at constant lr does not close the gap to a cooldown)."""
+        tc = self.cfg.train
+        f = min(1.0, (self.step + 1) / max(1, tc.warmup_steps))
+        if tc.decay_frac > 0:
+            u = min(1.0, max(0.0, 1.0 - (1.0 - self.progress()) / tc.decay_frac))
+            f *= tc.decay_to + (1.0 - tc.decay_to) * (1.0 - math.sqrt(u))
+        return f
 
     def progress(self) -> float:
         """Fraction of the run's budget spent: the largest of compute, steps and wall-clock fractions."""
@@ -359,8 +398,12 @@ class Trainer:
         if tc.max_steps:
             p = max(p, self.step / tc.max_steps)
         if tc.max_hours:
-            p = max(p, (time.time() - self.t_start) / (tc.max_hours * 3600))
+            p = max(p, self.hours() / tc.max_hours)
         return min(1.0, p)
+
+    def hours(self) -> float:
+        """Training wall-clock so far, over every link of the run."""
+        return self.hours_before + (time.time() - self.t_start) / 3600
 
     def train_step(self) -> dict:
         tc = self.cfg.train
@@ -418,7 +461,7 @@ class Trainer:
                 per_row.update(
                     {f"win{k}": (w == k).float().masked_fill(w.isnan(), math.nan) for k in range(self.cfg.model.K)}
                 )
-            self.stats.add_many(st.steps, per_row)
+            self.stats.add_many(st.steps, per_row, sources=st.batch["source"])
             st.solved |= exact
             st.prev_exact = exact
             halted = st.steps >= tc.max_rounds
@@ -480,9 +523,13 @@ class Trainer:
 
     # ------------------------------------------------------------------ loop
     def done(self) -> bool:
+        """The budget is spent (compute, steps or cumulative hours), or ``stop_pflops`` is reached: a stop that
+        leaves the schedule (which follows ``budget_pflops``) untouched, e.g. the shared stretch two branches start
+        from (``train.resume_from``)."""
         tc = self.cfg.train
-        over_time = tc.max_hours > 0 and time.time() - self.t_start > tc.max_hours * 3600
-        return over_time or self.flops >= tc.budget_pflops * 1e15 or (tc.max_steps > 0 and self.step >= tc.max_steps)
+        over_time = tc.max_hours > 0 and self.hours() > tc.max_hours
+        stop = tc.stop_pflops > 0 and self.flops >= tc.stop_pflops * 1e15
+        return over_time or stop or self.flops >= tc.budget_pflops * 1e15 or (0 < tc.max_steps <= self.step)
 
     def run(self) -> int:
         tc = self.cfg.train

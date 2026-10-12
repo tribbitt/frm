@@ -90,6 +90,11 @@ class TrainCfg:
     beta2: float = 0.95
     weight_decay: float = 0.1
     warmup_steps: int = 2000
+    # Warm-up, constant, then (decay_frac > 0) a (1-sqrt) cooldown over the last decay_frac of the budget to
+    # decay_to x lr (warmup-stable-decay; TRM itself trains at a constant lr). Progress is the trainer's budget fraction,
+    # so the window moves if the budget is extended later. Scales the embedding's SignSGD lr too, as TRM's schedule does.
+    decay_frac: float = 0.0
+    decay_to: float = 0.0
     emb_lr: float = 1e-2
     emb_weight_decay: float = 0.1
     grad_clip: float = 1.0
@@ -108,13 +113,19 @@ class TrainCfg:
     # them learn at their own pace. 1 keeps a single parameter group (and resumes pre-existing runs unchanged).
     fork_lr_mult: float = 1.0
     budget_pflops: float = 1000.0  # training stops when this much compute is spent
+    # Stop (checkpoint, final eval, DONE) at this compute without changing the schedule, which follows budget_pflops:
+    # the shared stretch that branches (resume_from) continue from. 0 = no early stop.
+    stop_pflops: float = 0.0
     max_steps: int = 0  # 0 = budget only
-    max_hours: float = 0.0  # 0 = no wall-clock limit (used by Kaggle adaptation)
+    max_hours: float = 0.0  # 0 = no wall-clock limit (Kaggle adaptation; a guard for a fixed-length link); cumulative
     init_from: str | None = None  # checkpoint whose weights initialise the model (see init_mode)
     # "adapt": new tasks (Kaggle adaptation): every puzzle-embedding row starts at the mean trained row, untrained.
     # "continue": the same dataset (e.g. an imported TRM, scripts/import_trm.py): the table and its visit counts are
     # kept; fork modules absent from the checkpoint (a K=0 source) keep their fresh initialisation.
     init_mode: str = "adapt"
+    # A branch: with --resume auto and no RUN/last.pt yet, resume the full training state (weights, EMA, optimizer,
+    # step, compute, data streams, RNG, fork price) of this checkpoint, e.g. another run's stop_pflops checkpoint.
+    resume_from: str | None = None
     eval_every_pflops: float = 100.0
     log_every: int = 50
     ckpt_minutes: float = 30.0
@@ -133,6 +144,9 @@ class EvalCfg:
     max_rows: int = 2048
     rounds: int = 16
     child_vote_weight: float = 0.0
+    # Gated models: 0 = the gate's own decisions (logit > 0); rho > 0 = in every eval batch and round the top rho of
+    # rows by gate logit fork (an instrument: the fork value at a fixed rate, independent of the gate's calibration).
+    fork_top: float = 0.0
     counterfactuals: bool = True
     cf_rows: int = 1024
     use_ema: bool = True

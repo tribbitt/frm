@@ -336,8 +336,16 @@ label rows (forked, own join, slot not dropped): no_grad, the declined rows' con
 - **Accounting.** The trainer charges `Refiner.round_flops(S, rows, fork_rows, cf_rows)` from the step's actual counts
   (declined rows at the K = 0 cost, forked rows at the FRM cost, label rows plus the continuation's 2 forward
   cycles); `passes_per_round`/`train_flops_per_row` remain the every-round-forks numbers (§9, bench).
-- **Evaluation** uses the gate's decisions (no exploration); `cf.allfork`/`cf.gateoff` rerun with every row / no row
-  forking (§7.2). Requires `fork_depth = 1` and `grad_cycles ≤ 2` (else `ValueError`).
+- **Evaluation** uses the gate's decisions (no exploration), or with `eval.fork_top` = ρ > 0 forks the top ρ of each
+  batch and round by gate logit (padding rows excluded), so the eval fork rate is fixed whatever the gate's calibration
+  on held-out states; `fork.gate_rate` logs the gate's own rule beside it. The handoff's "eval fork rate collapses to
+  ≈ 0" was that calibration: a 550-PF targeted gate forked 0.3% of dev row-rounds and 79% of composite ones with the
+  same weights, and W's price-0 gate already split dev 0.39 / composites 0.95 at 1k PF. On `F` (W, 36k) forking the
+  top 25% or 40% gives the dev accuracy of forking every row (`EXPERIMENTS.md` §4c G). `fork_top` = 1 forks and labels
+  every row, so `fork.skill` measures the gate's held-out ranking without selection bias (§7.2). `cf.allfork` /
+  `cf.gateoff` rerun with every row / no row forking (§7.2). Submission inference (`frm.adapt` without
+  `--solutions`) skips the gate labels' no-fork continuation. Requires `fork_depth = 1` and `grad_cycles ≤ 2` (else
+  `ValueError`).
 
 ### 4.9 Warm start from a published TRM (`scripts/import_trm.py`)
 
@@ -432,10 +440,18 @@ detached and trains only the gate, which cannot change either quantity.
   discarded. Source weights mix `arc` and `composite` (default 0.75 / 0.25 of rows).
 - **Loss scaling.** Per-row loss averaged over the rows of the step, so step gradients are comparable across buckets.
 - **Optimizers.** AdamW (fused) on dense params; SignSGD with decoupled weight decay on the touched puzzle-embedding rows;
-  gradient clip 1.0 on dense params; warm-up 2,000 steps then constant (TRM). EMA 0.999 of dense params; evaluation and
-  `best.pt` use EMA weights; `last.pt` holds raw weights + EMA + optimizer.
-- **Budget.** Training stops when the model's FLOP accounting reaches `budget_pflops` (or `max_steps`, or `max_hours`);
-  the objective's τ anneal is scheduled on the same progress fraction, so it is comparable across arms.
+  gradient clip 1.0 on dense params; warm-up 2,000 steps then constant (TRM), optionally followed by a cooldown over the
+  last `decay_frac` of the budget, lr × (1 − √u) at the fraction u of the window elapsed, down to `decay_to` × lr, for
+  the dense and the embedding lr alike (Hägele et al. 2024, arXiv 2405.18392: (1−√u) beats a linear cooldown, and a
+  weight average at constant lr leaves a gap to a cooldown; the ARC-AGI-2 final uses 15%). EMA 0.999 of dense params;
+  evaluation and `best.pt` use EMA weights; `last.pt` holds raw weights + EMA + optimizer.
+- **Budget.** Training stops when the model's FLOP accounting reaches `budget_pflops` (or `max_steps`, or `max_hours`,
+  which counts the training time of every link of the run); progress is the largest of those fractions, and the
+  objective's τ anneal, the fork schedule and the cooldown follow it, so they are comparable across arms and a
+  wall-clock-bound link ends with its cooldown done. `stop_pflops` ends a run early (checkpoint, final eval, `DONE`)
+  without changing that schedule; another run with `resume_from` = its `last.pt` continues the full training state
+  (weights, EMA, optimizer, step, compute, data streams, RNG, price) under its own config and its own `best.pt`. That
+  is how two arms branch from one shared stretch (`EXPERIMENTS.md` §4c).
 - **Fork policy (`fork_gate` only, §4.8).** Every row-round forks while progress < `fork_force_frac`; then the gate
   decides with exploration `fork_explore`; the price controller (if `fork_rate_target > 0`) runs after each gated step.
   FLOPs are charged from the step's actual fork and label-row counts, read in the step's existing device→host sync
@@ -446,7 +462,8 @@ detached and trains only the gate, which cannot change either quantity.
   state) every `ckpt_minutes`; SIGTERM/SIGUSR1 → checkpoint and exit 0; `--resume auto`. Carries are not saved (in-flight
   rows restart; harmless). `best.pt` = best dev pass@2 on the first listed eval split (ARC dev), ties to the later step.
 - **Logs.** `train.jsonl` (losses, per-round metrics by round index, first-solve and regression histograms, WTA winner
-  counts, fork stats, throughput, memory), `eval.jsonl`, `config.json`.
+  counts, fork stats, throughput, memory; `{metric}_by_source` for exact, CE, fork rate, the gate's metrics and
+  `child_ce_min`, from each row's data source), `eval.jsonl`, `config.json`.
 
 ---
 
@@ -488,11 +505,15 @@ Where each lives: training metrics in `train.jsonl` (mean and `_by_round`), eval
 | `cf.sham` | Δ exact at round 16 when every round's root join reads the children of a row from a **different task** | parent does not use child *content* |
 | `cf.nofork` | Δ exact when the root join is forced onto the parent slot | trained parent does not rely on children |
 | `sub_coverage` (train) | composites: fraction of intermediates some child reproduces exactly | no decomposition learned |
-| `fork_rate` (train), `fork.rate`, `fork.rate_by_round` (eval) | fraction of row-rounds that forked (overall; per round index) | gate never forks (→0, the model became TRM), always forks (→1, no compute saved), or became a round schedule (`rate_by_round` a step function of r) |
+| `fork_rate` (train), `fork.rate`, `fork.rate_by_round`, `fork.rate_by_bucket` (eval) | fraction of row-rounds that forked (overall; per round index; per canvas bucket) | gate never forks (→0, the model became TRM), always forks (→1, no compute saved), or became a round schedule (`rate_by_round` a step function of r) |
 | `gate_acc`, `gate_pos`, `benefit` (train) | on label rows: (gate logit > 0) == label; label rate; CE(no-fork continuation) − CE(fork) in nats/token | gate no better than the label base rate; forks that do not pay (`benefit` ≤ price) |
+| `gate_says` (train), `fork.gate_rate` (eval) | fraction of row-rounds with gate logit > 0 (the gate's own rule, whatever decided: forced phase, exploration, `fork_top`) | the gate's calibration drifts from the rate the run forks at (an eval rate ≈ 0 under logit > 0) |
+| `declined_pos` (train) | label rate on rows the gate declined that forked through exploration: the unbiased check of its "no" | the gate declines forks that would pay (`declined_pos` ≈ `gate_pos`) |
+| `{metric}_by_source` (train) | exact, CE, fork rate and the gate metrics per data source | forks spent on one source only; a source the warm start has memorised |
 | `fork.gate_precision`, `fork.benefit` (eval) | on held-out labelled rows the gate chose to fork (all rounds): fraction where the fork beat the no-fork continuation in CE; mean CE gain | the gate's forks do not pay on unseen pairs (precision ≈ 0.5, benefit ≤ 0) |
+| `fork.skill` (eval, `fork_top` = 1) | every row forks and is labelled: AUC of the gate logit for benefit > 0; per ρ the share of the summed benefit the top ρ by logit keep (per batch and round), their precision and benefit; the same by round group | the gate cannot rank forks (AUC ≈ 0.5, `share` ≈ ρ) or ranks the wrong thing (`share` < ρ: `F` at 36k keeps 8% at ρ = 0.4) |
 | `price` (train) | the current fork price (moves only with `train.fork_rate_target > 0`) | controller pinned at 0 or running away |
-| `cf.allfork`, `cf.gateoff` (gated models) | Δ exact when every row / no row forks, against the gate's own choice | gate declines forks that pay (`allfork` > 0); forking is useless (`gateoff` ≈ 0) |
+| `cf.allfork`, `cf.gateoff` (gated models) | Δ exact when every row / no row forks, against the run's own decisions | gate declines forks that pay (`allfork` > 0); forking is useless (`gateoff` ≈ 0) |
 
 With the gate, the children instruments (`parent_mass`, `join_entropy`, `distinct`, `child_exact_any`,
 `oracle_gain`, child votes) are computed over the rows that forked at the round in question: in training they are
@@ -573,13 +594,13 @@ one pass of transients, ≈0.6 MB per parent token in total. At 80 GB that bound
 
 ## 10. Gates (must pass before any GPU job)
 
-`pytest -q` (≈100 tests, ≈30 s on a laptop CPU):
+`pytest -q` (148 tests, ≈30 s on a laptop CPU):
 
 - `test_data.py`: dihedral inverse for all 8 ids; version apply/invert round trip; dedup; encode/crop round trip in every
   bucket; size rule and buckets unchanged when test outputs are poisoned (whole built dataset byte-identical except
   dev/test outputs); composite buckets ignore held-out targets; no test output in any train row; dev rule (md5 order);
   dev/test rows untranslated and keyed consistently; `take()` shapes, translation keeps content and EOS, sub-goal masks,
-  source weights, per-draw cap, exact resume.
+  source weights and each row's source code, per-draw cap, exact resume.
 - `test_external.py`: canonical digest invariant under dihedral × recolouring; ingest removes planted contamination and
   refuses held-out id overlaps; build refuses externals not filtered against its held-out ids; content filter drops a
   planted training copy of a held-out test output; generator pools split per bucket; adev files; `--exclude_ids`.
@@ -598,8 +619,11 @@ one pass of transients, ≈0.6 MB per parent token in total. At 80 GB that bound
   decisions and exploration; declined rows' loss is exactly the K=0 loss and child terms add per forked row; gate label
   = benefit > price, plain mean over label rows; error-focused children (`child_focus` = 1 ignores cells TRM's round
   gets right); `round_flops` boundaries and executed passes; gated training steps (forced phase, price controller,
-  resume restores the price), the fork learning-rate multiplier, and `evaluate_split` (`fork.rate`,
-  `cf.allfork/gateoff`).
+  resume restores the price), per-source training logs, the fork learning-rate multiplier, the (1−√u) cooldown, a
+  branch from another run's state (`resume_from`, own `best.pt`) and `stop_pflops`/cumulative `max_hours`, and
+  `evaluate_split` (`fork.rate`, `cf.allfork/gateoff`; `fork_top` forks ceil(ρ·n) real rows per batch and round,
+  padding excluded; at `fork_top` 1 the `fork.skill` block covers every labelled row-round; `gate_skill`'s AUC and
+  per-ρ benefit shares).
 - `test_objective.py`: stablemax normalised, NaN-free gradients and non-zero gradients at zero logits; PAD ignored;
   assignment table one-to-one; set matching reduces to annealed WTA, sends distinct targets to distinct children and
   respects masks/spare children; each child's gradient = w_k × its own CE gradient; mixed composite/plain batches.
@@ -639,8 +663,9 @@ frm/
   adapt.py             CLI: Kaggle adaptation (build, re-initialised ids, fine-tune, predict, write submission)
   monitor/             the live monitor (laptop side, no torch): source.py (Kelvin2 over the ssh master, incremental
                        reads; local dirs), run.py (live pass, rates, eta, liveness, alerts), charts.py, view.py
-configs/               trm_a1, frm_a1, frm2_a1, frm_a1_arc (pilots); trm_h2_a1, nest_a1 (optional); frm_a2_kaggle (final);
-                       smoke; learn (CPU check)
+configs/               trm_a1, frm_a1, frm2_a1, frm_a1_arc (pilots); trm_h2_a1, nest_a1 (optional); warm starts from TRM:
+                       trm_import, trmc_a1tn / frmc_a1tn (W), frmc40_a1tn / frmcf40_a1tn (R); the ARC-AGI-2 final:
+                       final_frm_a2tn, final_trm_a2tn (control); smoke; learn (CPU check)
 kelvin/                k2 helper (incl. push-external, monitor), submit.sh (approval thresholds), jobs/{env.sh, setup_env,
                        data, smoke, bench, train, eval}
 scripts/               fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py (paired bootstrap + McNemar),

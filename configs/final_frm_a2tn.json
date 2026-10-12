@@ -1,0 +1,43 @@
+{
+  "name": "final_frm_a2tn",
+  "model": {
+    "K": 4,
+    "pos_encoding": "trm1d",
+    "fork_gate": true,
+    "join_drop_parent": 0.25,
+    "grad_ckpt_children": false
+  },
+  "objective": {
+    "tau_anneal_frac": 0.096
+  },
+  "data": {
+    "root": "data/built/a2tn",
+    "tokens_per_step": 160000,
+    "max_rows": 4096
+  },
+  "train": {
+    "init_from": "runs/trm_v2/import_a2tn.pt",
+    "init_mode": "continue",
+    "lr": 5e-05,
+    "warmup_steps": 1000,
+    "fork_force_frac": 0.096,
+    "fork_explore": 0.1,
+    "fork_lr_mult": 4.0,
+    "budget_pflops": 50000.0,
+    "max_hours": 70.5,
+    "decay_frac": 0.15,
+    "decay_to": 0.0,
+    "eval_every_pflops": 2500.0,
+    "compile": true
+  },
+  "eval": {
+    "splits": [
+      "dev",
+      "dev_composite"
+    ],
+    "max_versions": 32,
+    "rounds": 16,
+    "fork_top": 0.4,
+    "cf_rows": 512
+  }
+}

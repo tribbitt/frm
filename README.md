@@ -45,9 +45,10 @@ frm/train.py           trainer (per-bucket ACT carries, EMA, checkpoints, SIGTER
 frm/evaluate.py        per-round voting, pass@k, fork/depth instruments, counterfactuals
 frm/adapt.py           Kaggle adaptation -> submission.json
 frm/monitor/           the live monitor's source (Kelvin over the ssh master), run state, charts, pages
-configs/                  pilots trm_a1, frm_a1, frm2_a1, frm_a1_arc; optional trm_h2_a1, nest_a1; final frm_a2_kaggle;
+configs/                  pilots trm_a1, frm_a1, frm2_a1, frm_a1_arc; optional trm_h2_a1, nest_a1;
                           warm start from TRM: trm_import, trmc_a1tn (TRM continued), frmc_a1tn (FRM continued, gated),
-                          frmc40_a1tn / frmcf40_a1tn (proposal R: fork-rate targeting / + error-focused children)
+                          frmc40_a1tn / frmcf40_a1tn (R: fork-rate targeting / + error-focused children);
+                          the ARC-AGI-2 final: final_frm_a2tn and its TRM control final_trm_a2tn
 kelvin/                   Kelvin2 job kit
 scripts/                  fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py, monitor.py,
                           import_trm.py (published TRM checkpoint -> frm checkpoint aligned with a frm dataset),
@@ -95,7 +96,7 @@ kelvin/k2 monitor                                       # live: every active run
 ## Kaggle (ARC Prize 2026, ARC-AGI-2 track)
 
 ```bash
-python -m frm.adapt --ckpt runs/frm_a2_kaggle/best.pt --challenges arc-agi_test_challenges.json \
+python -m frm.adapt --ckpt runs/final_frm_a2tn/last.pt --challenges arc-agi_test_challenges.json \
     --work /kaggle/working/frm --hours 8 --submission submission.json
 ```
 

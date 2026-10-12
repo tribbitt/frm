@@ -1,6 +1,6 @@
 """Kaggle adaptation (DESIGN.md §8): a pretrained checkpoint + unseen tasks -> submission.json.
 
-    python -m frm.adapt --ckpt runs/frm_a2_kaggle/best.pt --challenges arc-agi_test_challenges.json \
+    python -m frm.adapt --ckpt runs/final_frm_a2tn/last.pt --challenges arc-agi_test_challenges.json \
         --work /kaggle/working/frm --hours 8 [--solutions FILE] [--n_aug 300] [--submission submission.json] \
         [key=value ...]
 
@@ -66,6 +66,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg.train.max_hours = args.hours
     cfg.train.max_steps = args.max_steps
     cfg.train.budget_pflops = float("inf")
+    cfg.train.stop_pflops = 0.0  # pretraining-run controls that would misfire on the adaptation run
+    cfg.train.resume_from = None
     cfg.train.eval_every_pflops = float("inf")
     cfg.eval.splits = []
     # The pretrained children are already specialised: continue at the final WTA temperature, do not re-anneal from 1.
@@ -82,7 +84,9 @@ def main(argv: list[str] | None = None) -> int:
 
     ds = Dataset(cfg.data.root)
     trainer.ema.swap(trainer.model)
-    res = evaluate_split(trainer.model, ds, "test", cfg.eval, trainer.device, trainer.dtype, keep_attempts=True)
+    # Without solutions (Kaggle) nothing can be scored, so the gate instruments' no-fork continuation is skipped.
+    res = evaluate_split(trainer.model, ds, "test", cfg.eval, trainer.device, trainer.dtype, keep_attempts=True,
+                         gate_labels=bool(args.solutions))
     trainer.ema.swap(trainer.model)
     Path(args.submission).write_text(json.dumps(res.pop("attempts")))
     summary = {"steps": trainer.step, "pflops": trainer.flops / 1e15, "submission": args.submission,

@@ -199,11 +199,16 @@ class Objective:
             target = (benefit > (cfg.fork_price if price is None else price)).float()
             bce = F.binary_cross_entropy_with_logits(out.fork_logit, target, reduction="none")
             loss = loss + cfg.lambda_gate * torch.where(g, bce, 0.0).sum() / g.sum().clamp_min(1)
+            says = out.fork_logit > 0
             m.update(
                 {
-                    "gate_acc": torch.where(g, ((out.fork_logit > 0).float() == target).float(), nan),
+                    "gate_acc": torch.where(g, (says.float() == target).float(), nan),
                     "gate_pos": torch.where(g, target, nan),
                     "benefit": torch.where(g, benefit, nan),
+                    # the gate's own rule on every row (forced forks and exploration aside), and the label rate on
+                    # the rows it declined but that forked anyway: the unbiased check of its "no"
+                    "gate_says": says.float(),
+                    "declined_pos": torch.where(g & ~says, target, nan),
                 }
             )
         return loss, m

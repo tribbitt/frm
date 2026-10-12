@@ -248,13 +248,23 @@ class Refiner(nn.Module):
             y, z = self._cycle_fn(y, z, x, None, cos, sin, n)
         return y, z
 
-    def _decide(self, fork_logit, fork_mode: str, explore: float, B: int, device) -> torch.Tensor:
-        """[B] bool: rows that fork this round."""
+    def _decide(
+        self, fork_logit, fork_mode: str, explore: float, B: int, device, top: float = 0.0, n_valid: int | None = None
+    ) -> torch.Tensor:
+        """[B] bool: rows that fork this round. ``top`` > 0 (evaluation instrument): the ceil(top * n) rows with the
+        highest gate logits fork instead of the rows with logit > 0, among the first ``n_valid`` rows (the rest are
+        batch padding and never fork)."""
         if fork_mode == "none":
             return torch.zeros(B, dtype=torch.bool, device=device)
         if fork_mode == "all" or fork_logit is None:
             return torch.ones(B, dtype=torch.bool, device=device)
-        fork = fork_logit > 0
+        if top > 0:
+            n = B if n_valid is None else n_valid
+            score = fork_logit.masked_fill(torch.arange(B, device=device) >= n, float("-inf"))
+            fork = torch.zeros(B, dtype=torch.bool, device=device)
+            fork[score.topk(min(n, math.ceil(top * n))).indices] = True
+        else:
+            fork = fork_logit > 0
         if explore > 0:  # declined rows still fork now and then, so labels keep arriving for the states it declines
             fork = fork | (torch.rand(B, device=device) < explore)
         return fork
@@ -269,6 +279,9 @@ class Refiner(nn.Module):
         gen: torch.Generator | None = None,
         fork_mode: str = "gate",
         explore: float = 0.0,
+        fork_top: float = 0.0,
+        n_valid: int | None = None,
+        gate_labels: bool = True,
     ) -> RoundOut:
         """One deep-supervision round. Gradient flows only if grad mode is enabled by the caller.
 
@@ -280,7 +293,9 @@ class Refiner(nn.Module):
         ``fork_mode`` (K > 0): "gate" forks the rows whose gate logit is > 0, plus each declined row with probability
         ``explore`` (training); without ``fork_gate`` it means "all". "all" forks every row, "none" no row (TRM's
         round with the shared weights). Each subset is gathered and run on its own, so declined rows cost a TRM round.
-        With the gate, rows in ``gate_rows`` also get the no-fork continuation's readout (``cf_logits``, no grad)."""
+        ``fork_top`` > 0 with "gate": the top fraction of the first ``n_valid`` rows (the batch without its padding) by
+        gate logit forks (an evaluation instrument for a fixed fork rate). With the gate, rows in ``gate_rows`` also get
+        the no-fork continuation's readout (``cf_logits``, no grad), unless ``gate_labels`` is False."""
         assert cf in CF_MODES and fork_mode in FORK_MODES
         cfg = self.cfg
         S = int(round(math.sqrt(inputs.shape[1])))
@@ -301,7 +316,7 @@ class Refiner(nn.Module):
         fork_logit = None
         if self.gate is not None:  # reads the no-grad pre-fork state, so it sends no gradient into the trunk
             fork_logit = self.gate(torch.cat([y[:, 0], y[:, P:].mean(1)], dim=-1)).squeeze(-1).float()
-        fork = self._decide(fork_logit, fork_mode, explore, B, y.device)
+        fork = self._decide(fork_logit, fork_mode, explore, B, y.device, fork_top, n_valid)
         if fork_mode == "none":
             n_fork = 0
         elif fork_mode == "all" or self.gate is None:
@@ -344,10 +359,13 @@ class Refiner(nn.Module):
         cf_logits = gate_rows = None
         if self.gate is not None:
             # Label rows: a fork whose join is the model's own (no counterfactual override, parent slot not dropped),
-            # compared with the TRM continuation those rows would have run from the same pre-fork state.
+            # compared with the TRM continuation those rows would have run from the same pre-fork state. Inference that
+            # only needs answers (gate_labels=False, the submission) skips the continuation.
             gate_rows = torch.zeros_like(fork) if cf is not None else fork if drop is None else fork & ~drop
+            if not gate_labels:
+                gate_rows = torch.zeros_like(fork)
             cf_logits = torch.zeros_like(pre_logits)
-            if cf is None and n_fork:
+            if cf is None and n_fork and gate_labels:
                 with torch.no_grad():
                     idx_g = gate_rows.nonzero().squeeze(1)
                     if idx_g.numel():
