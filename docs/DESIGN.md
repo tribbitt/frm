@@ -394,8 +394,13 @@ where steps are scarce: adev adaptation in a fixed 2.5 h gave FRM 8,482 steps ag
   concentrated on the cells TRM's own round gets wrong, so a fork's benefit (and the gate's precision) can rise
   instead of the children re-deriving what TRM already knows.
 
-Adaptation (Kaggle) uses the same levers: `frm.adapt` overrides such as `train.fork_rate_target=0.25` trade forks
-for adaptation steps inside the fixed time budget.
+Measured in iteration R (`EXPERIMENTS.md` §4c): at a held 0.4 fork rate (evaluated at `fork_top` 0.4) FRM beats the
+dense-forking `F` on composites at matched PF (+0.017 pass@2, +0.014 row exact, CIs > 0), ties it and TRM-continued on
+dev, and takes 1.34× `F`'s steps per PF — although the gate's held-out ranking is no better than chance, so the forks
+it keeps are close to a random 40%. Error-focused children (R2) add on composites (+0.025) but fall behind
+TRM-continued on dev row exact, so the ARC-AGI-2 final uses R1's configuration. Adaptation (Kaggle) uses the same
+lever: `train.fork_rate_target=0.25` with `eval.fork_top=0.25` reached adev 0.235 in 2.5 h against 0.190 with dense
+forks (TRM-continued 0.252, CI ∋ 0).
 
 ---
 

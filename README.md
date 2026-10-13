@@ -97,12 +97,15 @@ kelvin/k2 monitor                                       # live: every active run
 
 ```bash
 python -m frm.adapt --ckpt runs/final_frm_a2tn/last.pt --challenges arc-agi_test_challenges.json \
-    --work /kaggle/working/frm --hours 8 --submission submission.json
+    --work /kaggle/working/frm --hours 8 --submission submission.json \
+    train.fork_rate_target=0.25 train.fork_price_lr=1e-4 eval.fork_top=0.25
 ```
 
 Builds the hidden tasks, gives their augmented versions fresh embedding rows, fine-tunes all weights on their demos for
-the time budget, votes over the versions it trained, and writes two attempts per test input. With `--solutions` the
-same command is the local leaderboard proxy (pretrain on `a2_kaggle`, adapt on ARC-AGI-2 evaluation).
+the time budget, votes over the versions it trained, and writes two attempts per test input. The three overrides hold
+the fork rate at 0.25 during adaptation and at inference (`docs/EXPERIMENTS.md` §4c `A`: adev pass@2 0.235 against
+0.190 with dense forks and 0.252 for TRM-continued in the same 2.5 h). With `--solutions` the same command scores
+itself (the local proxy).
 
 ## Status
 
@@ -110,5 +113,8 @@ Built and verified on CPU (tests, smoke, learnability) and on Kelvin's MI300X (R
 benchmark: `trm` ≈238, FRM K=4 ≈224–227 TFLOP/s compiled). P1 (from scratch): FRM ≥ TRM per step once the join's
 parent slot is dropped in training, 3–4× the cost per step. W (`docs/EXPERIMENTS.md` §4b, from the ARC Prize verified
 TRM, 36,000 PF per arm): FRM ahead per step throughout, equal to TRM-continued at matched compute on ARC dev, a
-steeper composite slope, behind on time-limited adaptation. Proposal R (§4c): spend forks where they pay (fork-rate
-targeting, error-focused children).
+steeper composite slope, behind on time-limited adaptation. R (§4c): the gate cannot rank forks, but forking the top
+25–40% at evaluation keeps all of the accuracy, and holding training at a 0.4 fork rate beats dense forking on
+composites at matched PF while tying TRM-continued on dev; targeted adaptation closes most of the adev deficit.
+**The ARC-AGI-2 final** (R1's configuration from `arc_v2_public`, 48,000 PF) and its TRM-continued control are
+training (`docs/HANDOFF.md` §8).
