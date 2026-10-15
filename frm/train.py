@@ -27,6 +27,7 @@ from frm.config import Cfg
 from frm.data.build import SOURCE_CODES
 from frm.data.loader import Dataset, TrainStream
 from frm.evaluate import evaluate_split
+from frm.model.layers import select_sdpa_backend
 from frm.model.refiner import Carry, Refiner
 from frm.objective import Objective, tau_at
 
@@ -38,9 +39,10 @@ ROUND_METRICS = (
 
 # ---------------------------------------------------------------------------------------------------- utilities
 def pick_device(name: str) -> torch.device:
-    if name != "auto":
-        return torch.device(name)
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    """The run's device; on ROCm also the attention kernel (every GPU entry point comes through here)."""
+    device = torch.device(name if name != "auto" else "cuda" if torch.cuda.is_available() else "cpu")
+    select_sdpa_backend(device)
+    return device
 
 
 def pick_dtype(precision: str, device: torch.device) -> torch.dtype:

@@ -8,7 +8,7 @@
     "grad_ckpt_children": false
   },
   "objective": {
-    "tau_anneal_frac": 0.1
+    "tau_anneal_frac": 0.048
   },
   "data": {
     "root": "data/built/a2tn",
@@ -20,11 +20,11 @@
     "init_mode": "continue",
     "lr": 5e-05,
     "warmup_steps": 1000,
-    "fork_force_frac": 0.1,
+    "fork_force_frac": 0.048,
     "fork_explore": 0.1,
     "fork_lr_mult": 4.0,
-    "budget_pflops": 48000.0,
-    "max_hours": 70.5,
+    "budget_pflops": 100000.0,
+    "max_hours": 140.0,
     "decay_frac": 0.15,
     "decay_to": 0.0,
     "eval_every_pflops": 2500.0,

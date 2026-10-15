@@ -147,7 +147,7 @@ enabling a later one. Everything that did neither failed.
 | M1 greedy credit | children are never graded on the final answer except through the set term (only the best-matched child is pushed toward y*); their computation is paid for by the parent's post-join readout through a **two-cycle credit path** (child cycle → join → post cycle). On composites, children are matched one-to-one to the final answer and the intermediate grids, so "produce the intermediate" is a rewarded move | `refiner.py` `_node`/`_join`; `objective.py` `set_match` | `cf.sham ≈ 0` (parent ignores child content); `sub_coverage ≈ 0` |
 | M2 fixed points | every round forks K children whose codes include **fresh noise drawn each round**; the join can adopt a child that escaped the parent's attractor. Without the noise this would not hold: children are then a deterministic function of the parent state, so at a parent fixed point the whole round (fork included) repeats itself — the first version of this design had exactly that hole. With it, each round contains K new proposals even when the parent has stopped moving (PTRM, [2605.19943](https://arxiv.org/abs/2605.19943): noise + Q-head selection, 87.4% → 98.75% on Sudoku-Extreme at test time) | `Refiner._child_codes` | `distinct → 1`, `fork.adopt` low, first-solve mass stays at round 1 |
 | M3 one round does all | the round's **sequential** depth is unchanged (3 cycles); the extra compute is parallel width that one trajectory cannot use. Lookup is not removed (it is the task conditioning) — depth is therefore measured on held-out test inputs and on composites, where the rule must be *applied* | `DESIGN.md` §4.2, §7.3 | `late_gain ≈ 0` on composites with k ≥ 3 |
-| M4 no demand | composite tasks f_k∘…∘f_1, k ≤ 4, ≥50% genuine detours, 25% of training rows, with intermediate grids | `frm/data/composite.py` | `depth/by_k`: accuracy at k=3,4 flat across rounds |
+| M4 no demand | composite tasks f_k∘…∘f_1, k ≤ 4, ≥50% genuine detours, 15% of training rows in the default mix, with intermediate grids | `frm/data/composite.py` | `depth/by_k`: accuracy at k=3,4 flat across rounds |
 | M5 early-exit incentives | keep TRM's correctness halting only for row turnover in training; no geometric or decaying priors; evaluation always runs 16 rounds and reports every round | `train.py`, `evaluate.py` | first-solve histogram |
 | M6 horizon | horizon grows from one cycle to two along the fork path (intermediate, not full BPTT); a `trm_h2` control isolates horizon from forking | `ModelCfg.grad_cycles` | `trm_h2` ≥ FRM at matched FLOPs → the gain was horizon, not forking |
 | M7 one hypothesis | K + 1 states per round, K hypotheses at the final round available to voting | `RoundOut.child_logits` | `fork/children_only` pass@2 ≈ parent's |
@@ -163,6 +163,12 @@ enabling a later one. Everything that did neither failed.
 - **P-D4.** `cf/reset@4` costs FRM more than the control: FRM's later rounds build on the carry instead of recomputing.
 - **P-D5.** If `trm_h2` matches FRM on P-D1–P-D3, the depth gain is the gradient horizon (M6), not forking; that is a
   finding to report, and the fork redesign (DESIGN.md §12) is the response, not removal.
+
+**Status (2026-10-15, `HANDOFF.md` §6):** P-D1–P-D4 are not supported so far. Late gain ≈ 0 in every arm (W, R1, R2:
+≤ 0.007 row exact r4 → r16 at every composition depth; both ARC-AGI-2 finals to 32.5k PF: ≤ 0.010, FRM's k = 3 mean
++0.005 against TRM's +0.002), 1–4% of first solves after round 4 (ARC-AGI-1 dev and composites), `cf.reset@4` ≈ 0.
+Children add breadth to round 1, not depth across rounds; on composites forking shows as a steeper slope per PF
+instead. P-D5 is untested (`trm_h2_a1` never ran).
 
 ## 7. What this analysis does not claim
 

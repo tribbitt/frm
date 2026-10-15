@@ -140,6 +140,29 @@ def apply_rope_1d(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torc
 ROPE_APPLY = {"2d": apply_rope_2d, "trm1d": apply_rope_1d}
 
 
+def select_sdpa_backend(device: torch.device) -> None:
+    """On ROCm GPUs, route SDPA to the memory-efficient kernel instead of flash attention.
+
+    Measured on MI300X (torch 2.9.1+rocm6.4, compiled FRM K=4 training step at S=30, no compile caches): 603 ms against
+    678 ms per forward+backward. The forward kernel is the same; the backward is one fused kernel (71 ms) instead of
+    flash's separate dk/dv and dq kernels (165 ms). Numerics match to bf16 noise (same loss, gradient rel. L2 2e-4).
+    CUDA keeps PyTorch's own choice. Process-wide; call before the first attention call and before compiling.
+
+    The compiled-graph caches (FX graph, AOTAutograd) do not key on the SDPA backend, and the node's cache directory
+    survives between jobs, so graphs lowered with flash would be reused and the switch would do nothing (measured: a
+    restarted run compiled nothing new and kept its speed). The efficient-backend graphs therefore get their own cache
+    directory."""
+    if device.type == "cuda" and torch.version.hip:
+        import os
+
+        from torch._inductor.runtime.cache_dir_utils import default_cache_dir
+
+        torch.backends.cuda.enable_flash_sdp(False)
+        base = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or default_cache_dir()
+        if not base.endswith("_sdpa_efficient"):
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = base + "_sdpa_efficient"
+
+
 class Attention(nn.Module):
     def __init__(self, hidden: int, heads: int, pos_encoding: str = "2d"):
         super().__init__()

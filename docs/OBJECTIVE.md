@@ -310,10 +310,11 @@ detached CEs) trains only the gate, which cannot move either CE.
 
 ## 6. Defaults and what deserves a sweep
 
-Only K is both expensive to get wrong and cheap to compare (each child adds ≈20 pass-units per row-round,
-`DESIGN.md` §9); `EXPERIMENTS.md` compares K ∈ {2, 4} at matched compute. λ_wta, λ_sub, ε, τ and the noise scale keep
-the values above unless an instrument in §7 fires; then the listed response is applied, not a sweep. No seed sweeps:
-single-seed arms, paired per-task statistics, seed choice at the end.
+Only K is both expensive to get wrong and cheap to compare (each child adds ≈14 pass-units per row-round, ≈19 with
+child checkpointing, `DESIGN.md` §9); `EXPERIMENTS.md` P2 was to compare K ∈ {2, 4} at matched compute but was not
+run (W replaced it), so K = 4 is untested against K = 2. λ_wta, λ_sub, ε, τ and the noise scale keep the values above
+unless an instrument in §7 fires; then the listed response is applied, not a sweep. No seed sweeps: single-seed arms,
+paired per-task statistics, seed choice at the end.
 
 ## 7. Failure signatures of the objective
 
