@@ -137,11 +137,12 @@ ARC/ConceptARC tasks at 30×30 while other sources still bucket (warm starts, §
 | `arc1` | ARC-AGI-1 training (400) + evaluation (400) + ConceptARC (160) | demos of all and training/concept test pairs → train; evaluation test pairs → **dev** for 100 tasks, **test** for the other 300 |
 | `arc2-kaggle` | `arc2` without evaluation2 | evaluation2 becomes an unseen-task adaptation test (§8) |
 | `composite` | synthetic f_k∘…∘f_1 tasks with intermediate grids (§3.5) | demos → train; 2 held-out pairs per task → `dev_composite` |
-| `barc` (external) | BARC ARC-Heavy: 28,605 LLM-written generator tasks, 827,130 pairs; programs audited upstream against the 520 ARC-AGI-1/2 evaluation tasks (623 dropped) | train only; re-filtered by frm (§3.6) |
-| `rearc` (external) | RE-ARC: generators of the 400 ARC-AGI-1 *training* tasks, 399,503 pairs | train only; split into per-bucket sub-tasks `rearc:{id}@{S}` |
+| `barc` (external) | BARC ARC-Heavy: 28,605 LLM-written generator tasks, 827,130 pairs; programs re-run in a sandbox and audited against the 520 ARC-AGI-1/2 evaluation tasks (623 dropped) by `frm/external/barc/` | train only; re-filtered by frm (§3.6) |
+| `rearc` (external) | RE-ARC: generators of the 400 ARC-AGI-1 *training* tasks, 399,503 pairs (`frm/external/corpus.py`) | train only; split into per-bucket sub-tasks `rearc:{id}@{S}` |
 | `kaggle` | hidden test challenges (or ARC-AGI-2 evaluation as proxy) | demos → train (adaptation); test inputs → test |
 
-External pools are FlatPool `.npz` files (format in `scripts/ingest_external.py`).
+External pools are FlatPool `.npz` files (format in `frm/external/flatpool.py`), built by `frm/external/` and
+filtered again by `scripts/ingest_external.py` before a build reads them.
 
 - **`a2tn`** (the final's build; command in `README.md`): `arc2` + composites + BARC + RE-ARC; ARC tasks at 30×30
   (`--min_bucket 30 --min_bucket_sources arc`) with exactly TRM's versions (`--versions_from` TRM's `identifiers.json`,
@@ -643,6 +644,11 @@ frm/
   train.py             CLI: python -m frm.train --config cfg.json --run_dir RUN_DIR [--resume auto] [key=value ...]
   evaluate.py          CLI + evaluate_split: per-round voting, pass@k, instruments, counterfactuals, submission
   adapt.py             CLI: Kaggle adaptation (build, re-initialised ids, fine-tune, predict, write submission)
+  external/
+    flatpool.py        FlatPool .npz format (data, off, hw, pair, pool_off, ids)
+    corpus.py          CLI: RE-ARC and a2_new pools from re_arc/tasks and data/raw
+    barc/              CLIs: BARC fetch (pinned), sandbox (+ --selftest), build parse|execute|filter|select|write,
+                       audit against the held-out tasks
 scripts/
   fetch_data.py        download ARC-AGI-1/2 and ConceptARC into data/raw
   ingest_external.py   filter BARC/RE-ARC/a2_new/synth FlatPool .npz pools against held-out tasks
