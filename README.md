@@ -1,102 +1,148 @@
-# frm — Forking Refinement Model for ARC-AGI
+# FRM — Forking Refinement Model for ARC-AGI
 
-**Trains forks: yes.** Every non-control configuration forks K children from the parent state in its training rounds
-(every round, or with the adaptive gate on the rows it picks: 40% of row-rounds in the ARC-AGI-2 final), runs them
-through the same tied-weight TRM refiner, and joins them back into the parent before the graded readout
-(`frm/model/refiner.py`, gated by `tests/test_model.py::test_fork_gate` and `tests/test_gate.py`). The only
-forkless configuration is the `trm` control arm.
+FRM is Samsung's [TRM](https://github.com/SamsungSAILMontreal/TinyRecursiveModels) (2-layer tied-weight transformer,
+answer state y and latent z, H/L cycles, deep supervision, ACT halting, puzzle-id embeddings, stablemax CE, EMA) with
+forking. With `K=0` it is exactly TRM. It changes three things:
 
-frm keeps Samsung's TRM (2-layer tied transformer, answer state y and latent z, H/L cycles, online deep supervision,
-ACT halting, puzzle-id embeddings, stablemax CE, EMA) and changes three things:
+1. **Fork-join inside the round.** The middle of TRM's three cycles is widened into K children, each with its own
+   learned code and fresh noise every round. A per-cell attention join over {parent, children} feeds the parent's last
+   cycle, and that cycle's readout is graded. The gradient flows through the join into the children. An adaptive gate
+   decides per row and round whether to fork.
+2. **An objective that rewards depth and meaningful forks.** It combines parent deep supervision, annealed one-to-one
+   set matching of the children to {final answer} ∪ {intermediate grids of synthetic composite tasks}, stop/score
+   heads and the gate's term ([`docs/OBJECTIVE.md`](docs/OBJECTIVE.md) §3.0).
+3. **Data.** ARC, ConceptARC, synthetic composites f_k∘…∘f_1 (k ≤ 4, with intermediate grids), BARC and RE-ARC. Every
+   source is filtered against every held-out set ([`docs/DESIGN.md`](docs/DESIGN.md) §3).
 
-1. **Fork-join inside the round.** The middle cycle of TRM's three is widened into K children with distinct learned
-   codes plus fresh noise each round; a per-cell attention join over {parent, children} feeds the parent's last cycle,
-   whose readout is graded. The gradient runs through the join into the children: a child's intermediate state (a
-   detour) is paid for by what the parent does with it, and a parent stuck at a fixed point still gets new proposals.
-2. **An objective for depth and meaningful forks.** Parent deep supervision + annealed one-to-one set matching of the
-   children to {final answer} ∪ {intermediate grids of synthetic composites} (winner-takes-all on plain rows) +
-   stop/score heads (`docs/OBJECTIVE.md` §3.0 writes it out).
-3. **Data.** ARC + ConceptARC + synthetic composite tasks f_k∘…∘f_1 (k ≤ 4, ≥50% genuine detours, with intermediate
-   grids) + BARC + RE-ARC, all filtered against every held-out set (`docs/DESIGN.md` §3.4–3.6).
-
-Plus efficiency: size-bucketed canvases with 2-D RoPE (0.34–0.49 of TRM's 30×30 token cost on ARC-AGI-1 data; warm
-starts from a TRM checkpoint keep ARC on its 30×30 canvas with TRM's 1-D RoPE), RE-ARC split per bucket, adaptive
-forking at a held rate with fixed-rate forking at inference, the memory-efficient attention kernel on ROCm, per-pass
-activation checkpointing of children, FLOP-budgeted training with a cooldown.
-
-## Documents
-
-| doc | read for |
+| doc | contents |
 |---|---|
-| [`docs/HANDOFF.md`](docs/HANDOFF.md) | **continuing the project**: state, constraints, results, the running final, commands |
-| [`docs/DESIGN.md`](docs/DESIGN.md) | the design and the code contract (start here) |
-| [`docs/DEPTH.md`](docs/DEPTH.md) | why recursive refiners stop using depth, and frm's answer per mechanism |
-| [`docs/OBJECTIVE.md`](docs/OBJECTIVE.md) | loss research and the objective, term by term |
-| [`docs/LINEAGE.md`](docs/LINEAGE.md) | audit of frmv1, tiny, tinyv2.2, tinyabstractor, frmv2, TRM, ARM: reuse / avoid |
-| [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | arms, pre-registered decision rules, compute budget |
-| [`kelvin/README.md`](kelvin/README.md) | running on Kelvin2 |
-| [`scripts/monitor.md`](scripts/monitor.md) | the live monitor: what every number means, good and bad readings |
+| [`docs/DESIGN.md`](docs/DESIGN.md) | design, decisions and the code contract |
+| [`docs/OBJECTIVE.md`](docs/OBJECTIVE.md) | the objective, term by term |
+| [`docs/DEPTH.md`](docs/DEPTH.md) | why recursive refiners stop using depth, and FRM's answer per mechanism |
 
 ## Layout
 
 ```
-frm/config.py          dataclass configs, JSON + dot-path overrides
-frm/data/              ARC loading, augmentation, encoding, size rule, build CLI, loader, composite generator
-frm/model/             layers (2-D RoPE, TRM's 1-D RoPE, SDPA kernel choice), puzzle embedding, the forking refiner
-frm/objective.py       the objective
-frm/train.py           trainer (per-bucket ACT carries, EMA, checkpoints, SIGTERM-safe, FLOP budget, cooldown)
-frm/evaluate.py        per-round voting, pass@k, fork/depth instruments, counterfactuals, fixed-rate forking
-frm/adapt.py           Kaggle adaptation -> submission.json
-frm/monitor/           the live monitor's source (Kelvin over the ssh master), run state, charts, pages
-configs/                  pilots trm_a1, frm_a1, frm2_a1, frm_a1_arc; optional trm_h2_a1, nest_a1;
-                          warm start from TRM: trm_import, trmc_a1tn (TRM continued), frmc_a1tn (FRM continued, gated),
-                          frmc40_a1tn / frmcf40_a1tn (R: fork-rate targeting / + error-focused children);
-                          the ARC-AGI-2 final: final_frm_a2tn and its TRM control final_trm_a2tn
-kelvin/                   Kelvin2 job kit
-scripts/                  fetch_data.py, ingest_external.py, make_adapt_dev.py, bench.py, compare.py, monitor.py,
-                          import_trm.py (published TRM checkpoint -> frm checkpoint aligned with a frm dataset),
-                          arm_curves.py (two arms' curves: pooled paired windows, slopes, matched steps/PF)
-tests/                    unit tests + the end-to-end smoke
+frm/config.py        dataclass configs, JSON + dot-path overrides (train.lr=3e-4)
+frm/model/           layers (2-D RoPE, TRM's 1-D RoPE), puzzle embedding, the forking refiner
+frm/objective.py     the objective
+frm/train.py         trainer: per-bucket ACT carries, EMA, FLOP budget, cooldown, resumable, SIGTERM-safe
+frm/evaluate.py      per-round voting, pass@k, fork and depth instruments
+frm/adapt.py         test-time adaptation on new tasks -> Kaggle submission.json
+frm/data/            ARC loading, augmentation, encoding, size rule, composite generator, dataset build, loader
+frm/external/        builders of the external pools: RE-ARC and a2_new (corpus.py), BARC ARC-Heavy (barc/)
+scripts/                fetch_data, ingest_external (BARC/RE-ARC filter), import_trm (TRM checkpoint import),
+                        arm_curves (paired FRM-vs-TRM comparison of two runs)
+configs/                final_frm_a2tn.json (FRM) and final_trm_a2tn.json (its K=0 TRM control)
+tests/                  unit tests and an end-to-end train/resume/eval/adapt smoke
 ```
 
-## Quick start (laptop, CPU)
+## Setup
 
 ```bash
-uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python torch numpy pytest
-.venv/bin/python -m pytest -q                                   # ~25 s
-.venv/bin/python scripts/fetch_data.py                          # ARC-AGI-1/2 + ConceptARC into data/raw
-.venv/bin/python -m frm.data.composite --n 2000 --seed 0     # data/raw/composite_s0.json
-S=../tinyabstractor/data/cache
-.venv/bin/python scripts/ingest_external.py --src $S --pools a2_new  # data/raw/external/a2_new.npz
-.venv/bin/python scripts/make_adapt_dev.py                       # data/raw/adev_*.json: 120 a2_new tasks
-.venv/bin/python scripts/ingest_external.py --src $S --pools barc rearc --heldout_pools data/raw/external/a2_new.npz
-.venv/bin/python -m frm.data.build --sources arc1 --composite data/raw/composite_s0.json --n_aug 300 \
+uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[dev]"
+.venv/bin/python -m pytest -q    # CPU; tests that need ARC data skip until data/raw exists (step 1 below)
+```
+
+## Reproducing the final run
+
+The final run continues the ARC Prize verified ARC-AGI-2 TRM checkpoint on dataset `a2tn` with two arms: FRM
+(`configs/final_frm_a2tn.json`) and a TRM control (`configs/final_trm_a2tn.json`). Each arm gets 100,000 PFLOP of
+training (`train.budget_pflops`), with a cooldown over the last 15%. Both ran on one 192 GB GPU each. The FRM arm
+peaks near 160 GB at 160k tokens per step; on smaller GPUs add `model.grad_ckpt_children=true`.
+
+**1. ARC data** (ARC-AGI-1, ARC-AGI-2, ConceptARC into `data/raw`):
+
+```bash
+python scripts/fetch_data.py
+```
+
+**2. Synthetic composite tasks:**
+
+```bash
+python -m frm.data.composite --n 2000 --seed 0          # data/raw/composite_s0.json
+```
+
+**3. External pools.** RE-ARC, `a2_new` (ARC-AGI-2 training tasks that are not ARC-AGI-1 tasks) and BARC
+(ARC-Heavy) become FlatPool `.npz` files in `data/pools`. The BARC stages run untrusted LLM-written programs in a
+sandbox (macOS `sandbox-exec`; on other platforms only with `BARC_UNSANDBOXED=1`). The audit takes hours. Details and
+pinned revisions are in the docstrings of `frm/external/corpus.py` and `frm/external/barc/`.
+
+```bash
+git clone --depth 1 https://github.com/michaelhodel/re-arc data/external/re-arc
+unzip -q data/external/re-arc/re_arc.zip -d data/external
+python -m frm.external.corpus                       # data/pools/{rearc,a2_new}.npz
+python -m frm.external.barc.fetch                   # pinned BARC dataset, BARC's common.py, sandbox venv (uv)
+python -m frm.external.barc.sandbox --selftest
+for s in parse execute filter select; do python -m frm.external.barc.build $s; done
+python -m frm.external.barc.audit
+python -m frm.external.barc.build write             # data/pools/barc.npz
+```
+
+Ingest filters the pools against every ARC-AGI-1/2 evaluation task, and filters BARC/RE-ARC against `a2_new` too:
+
+```bash
+python scripts/ingest_external.py --src data/pools --pools a2_new
+python scripts/ingest_external.py --src data/pools --pools barc rearc --heldout_pools data/raw/external/a2_new.npz
+```
+
+A rebuild matches the pools the final run used closely, but not exactly. The audit's time limits depend on the
+machine, and the original BARC selection also deduplicated against two synthetic pools that are not in this repo
+(`frm/external/barc/build.py`).
+
+**4. TRM checkpoint and its identifiers.** Download `arc_v2_public/step_723914` from the Hugging Face repo
+`arcprize/trm_arc_prize_verification` into `CKPT`. The checkpoint does not ship the puzzle identifiers its embedding
+table is indexed by, so rebuild them with TRM's own dataset builder (default seed 42) in a TinyRecursiveModels
+checkout. `TRM_DATA` is that checkout's `data/` directory:
+
+```bash
+python -m dataset.build_arc_dataset --input-file-prefix kaggle/combined/arc-agi \
+    --output-dir data/arc2concept-aug-1000 --subsets training2 evaluation2 concept --test-set-name evaluation2
+```
+
+**5. Build `a2tn`.** The source is ARC-AGI-2 training + evaluation demos + ConceptARC. ARC tasks keep TRM's exact
+versions and its 30×30 canvas, so every imported embedding row transfers. Composites and external pools use size
+buckets. Dev is the test pairs of 40 ARC-AGI-2 evaluation tasks; `test` is the other 80.
+
+```bash
+python -m frm.data.build --sources arc2 --composite data/raw/composite_s0.json --n_aug 300 \
     --external barc=data/raw/external/barc.npz rearc=data/raw/external/rearc.npz \
-    --exclude_ids data/raw/adev_ids.json --out data/built/a1
-.venv/bin/python -m frm.train --config configs/smoke.json --run_dir runs/smoke train.device=cpu
-.venv/bin/python -m frm.evaluate --run_dir runs/smoke --split dev
+    --versions_from TRM_DATA/arc2concept-aug-1000/identifiers.json --min_bucket 30 --min_bucket_sources arc \
+    --dev_subset evaluation2 --dev_n 40 --out data/built/a2tn
 ```
 
-Learnability check on CPU (≈10 min): build `data/built/learn` from 60 small composites
-(`python -m frm.data.composite --n 60 --seed 7 --depth_min 1 --depth_max 2 --max_side 6 --out data/raw/composite_learn.json`,
-then `python -m frm.data.build --composite data/raw/composite_learn.json --out data/built/learn --n_aug_composite 2`),
-then `python -m frm.train --config configs/learn.json --run_dir runs/learn`. Expected: loss ≈3.7 → ≈1.1 in 600
-steps, CE decreasing with every round.
-
-## Training and evaluation
+**6. Import the TRM checkpoint** (into a K=0 model with TRM's 1-D RoPE; every ARC row maps by identifier):
 
 ```bash
-python -m frm.train --config configs/frm_a1.json --run_dir runs/frm_a1 [key=value ...]   # resumable, SIGTERM-safe
-python -m frm.evaluate --run_dir runs/frm_a1 --split dev                               # checkpoint choice
-python -m frm.adapt --ckpt runs/frm_a1/best.pt --challenges data/raw/adev_challenges.json \
-    --solutions data/raw/adev_solutions.json --work runs/frm_a1/adev --hours 2.5          # adev: unseen tasks
-python -m frm.evaluate --run_dir runs/frm_a1 --split test --final                       # the reported number
-python scripts/compare.py runs/frm_a1/eval.jsonl runs/trm_a1/eval.jsonl --split dev [--match samples]
-python scripts/bench.py --config configs/frm_a1.json --arms "trm:model.K=0" "frm2:model.K=2" "frm4:"
-kelvin/k2 monitor                                       # live: every active run on Kelvin2 (scripts/monitor.md)
+python scripts/import_trm.py --trm CKPT/arc_v2_public/step_723914 \
+    --trm_ids TRM_DATA/arc2concept-aug-1000/identifiers.json \
+    --config configs/final_trm_a2tn.json --data data/built/a2tn --out runs/trm_v2/import_a2tn.pt
 ```
 
-## Kaggle (ARC Prize 2026, ARC-AGI-2 track)
+**7. Train both arms** (resumable with the same command; SIGTERM/SIGUSR1 checkpoint and exit; dev and dev_composite
+are evaluated every 2,500 PFLOP into `RUN/eval.jsonl`):
+
+```bash
+python -m frm.train --config configs/final_frm_a2tn.json --run_dir runs/final_frm_a2tn
+python -m frm.train --config configs/final_trm_a2tn.json --run_dir runs/final_trm_a2tn
+```
+
+**8. Compare and score.** The shipped model is `last.pt` (EMA weights after the cooldown), not `best.pt`: the 40-task
+dev set is too small to select on. `--split test` is the held-out read (80 ARC-AGI-2 evaluation tasks), and it
+requires `--final`.
+
+```bash
+python scripts/arm_curves.py runs/final_frm_a2tn runs/final_trm_a2tn \
+    --windows 2500-12500 15000-50000 52500-85000 87500-100000
+python -m frm.evaluate --run_dir runs/final_frm_a2tn --split test --final --ckpt last
+python -m frm.evaluate --run_dir runs/final_trm_a2tn --split test --final --ckpt last
+```
+
+Contamination: `arc_v2_public` trained on all of ARC-AGI-2 training, which contains the test outputs of 376 ARC-AGI-1
+evaluation tasks. ARC-AGI-1 evaluation numbers are therefore not clean for this model. Its ARC-AGI-2 evaluation numbers
+are transductive: demos were trained, test outputs never were (DESIGN.md §3.4–3.6, §4.9).
+
+## Kaggle (ARC-AGI-2)
 
 ```bash
 python -m frm.adapt --ckpt runs/final_frm_a2tn/last.pt --challenges arc-agi_test_challenges.json \
@@ -104,26 +150,8 @@ python -m frm.adapt --ckpt runs/final_frm_a2tn/last.pt --challenges arc-agi_test
     train.fork_rate_target=0.25 train.fork_price_lr=1e-4 eval.fork_top=0.25
 ```
 
-Builds the hidden tasks, gives their augmented versions fresh embedding rows, fine-tunes all weights on their demos for
-the time budget, votes over the versions it trained, and writes two attempts per test input. The three overrides hold
-the fork rate at 0.25 during adaptation and at inference (`docs/EXPERIMENTS.md` §4c `A`: adev pass@2 0.235 against
-0.190 with dense forks and 0.252 for TRM-continued in the same 2.5 h). Adaptation keeps the pretraining's 160k
-tokens/step, which needs 139–145 GB for FRM on an MI300X: on a smaller GPU add a lower `data.tokens_per_step` and
-`model.grad_ckpt_children=true` (untested there). With `--solutions` the same command scores itself; for a model
-pretrained on `a2tn` the ARC-AGI-2 evaluation demos were in pretraining, so scoring it there is transductive, not an
-unseen-task proxy.
-
-## Status
-
-Built and verified on CPU (tests, smoke, learnability) and on Kelvin's MI300X (ROCm venv, smoke incl. SIGTERM/resume;
-compiled, with the memory-efficient attention kernel: `trm` ≈266, FRM K=4 at a 0.4 fork rate ≈238 TFLOP/s). P1 (from
-scratch): FRM ≥ TRM per step once the join's parent slot is dropped in training, 3–4× the cost per step. W
-(`docs/EXPERIMENTS.md` §4b, from the ARC Prize verified TRM, 36,000 PF per arm): FRM ahead per step throughout, equal
-to TRM-continued at matched compute on ARC dev, a steeper composite slope, behind on time-limited adaptation. R
-(§4c): the gate cannot rank forks, but forking the top 25–40% at evaluation keeps all of the accuracy, and holding
-training at a 0.4 fork rate beats dense forking on composites at matched PF while tying TRM-continued on dev;
-targeted adaptation closes most of the adev deficit. **The ARC-AGI-2 final** (R1's configuration from
-`arc_v2_public`, 100,000 PF, up to 2 × 72 GPU-h) and its TRM-continued control are training, due ≈ 2026-10-17 20:15
-(TRM) and ≈ 2026-10-18 12:30 (FRM). To 32.5k PF, FRM leads on held-out composites by a growing margin (+0.067 pass@2
-pooled over 15–32.5k, CI > 0; 0.482 vs 0.381 at 32.5k) and ties on the 40-task dev, where both solve 0–2 tasks
-(`docs/HANDOFF.md` §8).
+This builds the hidden tasks and gives their augmented versions fresh embedding rows. It then fine-tunes all weights
+on the tasks' demos for the time budget, votes over the versions it trained, and writes two attempts per test input.
+The overrides hold the fork rate at 0.25 during adaptation and at inference. Adaptation keeps the pretraining's 160k
+tokens per step; on GPUs with less memory, lower `data.tokens_per_step` and set `model.grad_ckpt_children=true`. With
+`--solutions FILE` the same command scores itself.
