@@ -4,10 +4,7 @@
         --work /kaggle/working/frm --hours 8 [--solutions FILE] [--n_aug 300] [--submission submission.json] \
         [key=value ...]
 
-Hidden tasks have no puzzle identifiers in the checkpoint, so: build them (demos -> train rows, test inputs -> test
-rows), give their identifiers fresh embedding rows (mean of the trained rows), fine-tune all weights on the demos for
-the time budget (McGovern 2025: embeddings-only adaptation was not enough), then vote over versions and write two
-attempts per test input. With ``--solutions`` (the local proxy on ARC-AGI-2 evaluation) the score is printed too.
+Fresh embedding rows for the new tasks, full fine-tune on their demos, then vote; ``--solutions`` also scores.
 """
 
 from __future__ import annotations
@@ -43,14 +40,14 @@ def main(argv: list[str] | None = None) -> int:
 
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     cfg, ck_price = Cfg.from_dict(ck["cfg"]), ck.get("price")
-    del ck  # the table and optimizer state are loaded again by the trainer; do not hold a second copy
+    del ck
 
     work = Path(args.work)
     data_dir = work / "data"
     if not (data_dir / "meta.json").exists():
         build_argv = ["--sources", "kaggle", "--challenges", args.challenges, "--out", str(data_dir)]
         build_argv += ["--n_aug", str(args.n_aug)]
-        if cfg.model.pos_encoding == "trm1d":  # a model from a TRM checkpoint computes on TRM's 30x30 canvas (§4.9)
+        if cfg.model.pos_encoding == "trm1d":  # TRM's 30x30 canvas (§4.9)
             build_argv += ["--min_bucket", "30"]
         if args.solutions:
             build_argv += ["--solutions", args.solutions]
@@ -60,31 +57,29 @@ def main(argv: list[str] | None = None) -> int:
     cfg.data.buckets = None
     cfg.data.source_weights = None
     cfg.train.init_from = args.ckpt
-    cfg.train.init_mode = "adapt"  # new tasks: fresh rows at the checkpoint's mean trained row, whatever it trained with
+    cfg.train.init_mode = "adapt"
     cfg.train.lr = args.lr
     cfg.train.warmup_steps = args.warmup_steps
     cfg.train.max_hours = args.hours
     cfg.train.max_steps = args.max_steps
     cfg.train.budget_pflops = float("inf")
-    cfg.train.stop_pflops = 0.0  # pretraining-run controls that would misfire on the adaptation run
+    cfg.train.stop_pflops = 0.0
     cfg.train.resume_from = None
     cfg.train.eval_every_pflops = float("inf")
     cfg.eval.splits = []
-    # The pretrained children are already specialised: continue at the final WTA temperature, do not re-anneal from 1.
+    # Pretrained children/gate: keep final WTA temperature, no forced forks, keep the learned price.
     cfg.objective.tau_start = cfg.objective.tau_end
-    # Likewise a pretrained fork gate: no forced-fork familiarisation, and its labels keep the price it ended at.
     cfg.train.fork_force_frac = 0.0
     cfg.objective.fork_price = cfg.objective.fork_price if ck_price is None else ck_price
     for item in args.overrides:
         cfg.override(item)
 
-    trainer = Trainer(cfg, work / "run", resume="auto")  # resumes an interrupted adaptation from last.pt
+    trainer = Trainer(cfg, work / "run", resume="auto")
     if not (work / "run" / "DONE").exists():
         trainer.run()
 
     ds = Dataset(cfg.data.root)
     trainer.ema.swap(trainer.model)
-    # Without solutions (Kaggle) nothing can be scored, so the gate instruments' no-fork continuation is skipped.
     res = evaluate_split(trainer.model, ds, "test", cfg.eval, trainer.device, trainer.dtype, keep_attempts=True,
                          gate_labels=bool(args.solutions))
     trainer.ema.swap(trainer.model)
@@ -93,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
                "versions": res["versions"]}
     if args.solutions:
         summary.update({k: res[k] for k in ("pass@1", "pass@2", "n_tasks", "per_task")})
-        summary["pass@2_by_round"] = res["by_round"]["pass@2"]  # per_task feeds scripts/compare.py (paired adev tests)
+        summary["pass@2_by_round"] = res["by_round"]["pass@2"]
     (work / "adapt_summary.json").write_text(json.dumps(summary, indent=1))
     print(json.dumps(summary, indent=1))
     return 0

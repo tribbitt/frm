@@ -18,7 +18,7 @@ from frm.data.encode import IGNORE, augmented_dims, labels_from, render
 
 @dataclass
 class SplitData:
-    """Arrays of one bucket/split (see ``frm/data/build.py``); canvases stacked [plain, transposed]."""
+    """Arrays of one bucket/split; canvases stacked [plain, transposed]."""
 
     S: int
     tasks: list[str]
@@ -57,8 +57,7 @@ class Dataset:
         return list(self.meta["splits"])
 
     def tasks(self, split: str) -> dict[str, dict]:
-        """Original un-augmented tasks of an eval split ("dev", "dev_composite", "test"); ``test`` index i is the
-        ``test_index`` of eval_batches keys. Grids are lists; unknown outputs are ``None``."""
+        """Original tasks of an eval split; unknown outputs are ``None``."""
         if self._test_tasks is None:
             with open(self.root / "test_tasks.json") as f:
                 self._test_tasks = json.load(f)
@@ -100,8 +99,7 @@ class Dataset:
 
 
 def _rows(ds: Dataset, d: SplitData, ex: np.ndarray, vid: np.ndarray, offset: np.ndarray) -> dict[str, np.ndarray]:
-    """Render rows (example index, identifier, canvas offset) into model arrays; ``source`` is the row's
-    ``SOURCE_CODES`` value (per-source training metrics and fork prices)."""
+    """Render rows (example, identifier, offset) into model arrays, plus each row's ``SOURCE_CODES`` value."""
     tid, perm = ds.version_tid[vid], ds.version_perm[vid]
     batch = {
         "inputs": render(d.inp, ex, d.inp_hw[ex], tid, perm, offset),
@@ -124,14 +122,10 @@ def _rows(ds: Dataset, d: SplitData, ex: np.ndarray, vid: np.ndarray, offset: np
 
 
 class TrainStream:
-    """Group-balanced stream (TRM ``puzzle_dataset.py``) over the training tasks of one bucket.
+    """Group-balanced stream (TRM ``puzzle_dataset.py``) over one bucket's training tasks.
 
-    Each source (``SOURCE_CODES``) keeps its own epoch (a permutation of its base tasks). A draw picks a source with
-    probability set by ``source_weights`` (row fractions; ``None`` = proportional to the source's rows per epoch), the
-    next task of that source's epoch and a random version of it, and yields a random subset of
-    min(task size, ``max_pairs_per_draw``) of the task's training pairs in random order (RE-ARC tasks have ~1000 pairs:
-    uncapped, one draw would fill a batch with one rule). Row fractions and rows per draw use the capped sizes. Rows of
-    a draw not consumed by ``take`` are carried to the next call.
+    Per-source epochs; sources drawn so row fractions match ``source_weights`` (``None`` = proportional). A draw
+    yields up to ``max_pairs_per_draw`` random pairs of one task under one random version; leftovers carry over.
     """
 
     def __init__(
@@ -231,11 +225,8 @@ class TrainStream:
 
 
 def eval_versions(d, t: int, max_versions: int | None, trained: np.ndarray | None) -> np.ndarray:
-    """Identifiers of task ``t``'s versions that vote, in version order (identity first), at most ``max_versions``.
-
-    With ``trained`` (bool per identifier), only versions whose embedding row was trained vote — an untrained row tells
-    the model nothing about its task, and a crowd of such blind rows outvotes the informed ones. If no version of the
-    task is trained, the identity version alone makes a blind attempt."""
+    """Voting identifiers of task ``t`` (identity first, at most ``max_versions``); with ``trained``, only trained
+    rows vote, falling back to the identity alone."""
     v0 = int(d.vstart[t])
     vids = np.arange(v0, v0 + int(d.vcount[t]))
     if trained is not None:
@@ -253,9 +244,7 @@ def eval_batches(
     tasks: set[str] | None = None,
     trained: np.ndarray | None = None,
 ) -> Iterator[dict]:
-    """Untranslated rows of ``split`` in ``bucket``: every eval pair x the task's voting versions (``eval_versions``),
-    ordered by task, pair index, version; only tasks in ``tasks`` when given (batches stay full).
-    Yields nothing if the bucket has no such split."""
+    """Untranslated rows: every eval pair x voting version, ordered by task, pair, version."""
     if not ds.has_split(bucket, split):
         return
     d = ds.split_data(bucket, split)

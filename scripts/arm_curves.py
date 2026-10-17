@@ -1,15 +1,11 @@
-"""Two arms' learning curves side by side (the readouts of EXPERIMENTS.md §4b/§4c).
+"""Two runs' learning curves side by side: arm A against control B, printed as A − B.
 
-    kelvin/k2 pull frmc_a1tn && kelvin/k2 pull trmc_a1tn
-    python scripts/arm_curves.py runs/frmc_a1tn runs/trmc_a1tn [--windows 1000-12000 13000-24000 25000-36000]
+    python scripts/arm_curves.py runs/final_frm_a2tn runs/final_trm_a2tn \
+        --windows 2500-12500 15000-50000 52500-85000 87500-100000
 
-Reads RUN/eval.jsonl and RUN/train.jsonl of arm A and arm B (the control) and prints, for A − B:
-- per evaluation (matched PF): dev / composite pass@2 and row exact;
-- pooled windows: each arm's per-task pass@2 averaged over its evaluations inside the window, then the paired
-  difference over tasks with a 90% bootstrap CI (smooths the ±0.05 noise of single 100-task dev evaluations);
-- slopes of the eval metrics against log(PF) over the last window (± standard error);
-- training CE / exact at matched optimizer steps and at matched PF (±5% windows): the per-step and per-compute views.
-Only records scored with the trained-versions vote are used (they carry ``versions``).
+Reads RUN/eval.jsonl and RUN/train.jsonl. Prints per-evaluation dev / composite pass@2 and row exact at matched PF;
+pooled per-task pass@2 per PF window with a 90% paired bootstrap CI; log(PF) slopes over the last window; training
+CE / exact at matched steps and PF. Only records scored with the trained-versions vote (carrying ``versions``) count.
 """
 
 from __future__ import annotations

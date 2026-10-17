@@ -1,10 +1,9 @@
-"""Trainer: TRM's online deep supervision with one carry per canvas bucket (docs/DESIGN.md §6).
+"""Trainer: TRM's online deep supervision with one carry per canvas bucket (DESIGN.md §6).
 
-    python -m frm.train --config configs/frm_a1.json --run_dir runs/frm_a1 [--resume auto] [key=value ...]
+    python -m frm.train --config configs/final_frm_a2tn.json --run_dir runs/final_frm_a2tn [--resume auto] [k=v ...]
 
-Contract (kelvin/jobs/train.sbatch relies on it): checkpoints to RUN/last.pt every ``ckpt_minutes``; SIGTERM/SIGUSR1
--> checkpoint and exit 0; when the compute budget (``train.budget_pflops``) or ``train.max_steps`` is reached ->
-final checkpoint, final dev evaluation, RUN/DONE, exit 0; any failure -> nonzero exit.
+RUN/last.pt every ``ckpt_minutes``; SIGTERM/SIGUSR1 -> checkpoint, exit 0; budget reached -> checkpoint, final dev
+eval, RUN/DONE, exit 0; failure -> nonzero. ``--resume auto`` continues from RUN/last.pt.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ ROUND_METRICS = (
 
 # ---------------------------------------------------------------------------------------------------- utilities
 def pick_device(name: str) -> torch.device:
-    """The run's device; on ROCm also the attention kernel (every GPU entry point comes through here)."""
+    """Resolve the device and select the SDPA backend for it."""
     device = torch.device(name if name != "auto" else "cuda" if torch.cuda.is_available() else "cpu")
     select_sdpa_backend(device)
     return device
@@ -48,14 +47,14 @@ def pick_device(name: str) -> torch.device:
 def pick_dtype(precision: str, device: torch.device) -> torch.dtype:
     if precision == "auto":
         if device.type == "cuda":
-            # Native bf16 only (A100/H100); V100 reports emulated bf16 as "supported" and is far faster in fp16.
+            # Native bf16 only; emulated bf16 is slower than fp16.
             return torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation=False) else torch.float16
         return torch.float32
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
 
 class EMA:
-    """Exponential moving average of dense parameters (the puzzle-embedding buffer is excluded, as in TRM)."""
+    """EMA of dense parameters (puzzle-embedding buffer excluded, as in TRM)."""
 
     def __init__(self, model: torch.nn.Module, decay: float):
         self.decay = decay
@@ -68,7 +67,7 @@ class EMA:
 
     @torch.no_grad()
     def swap(self, model: torch.nn.Module) -> None:
-        """Exchange model parameters and shadow in place (call twice to restore)."""
+        """Swap model parameters and shadow in place (call twice to restore)."""
         for n, p in model.named_parameters():
             tmp = p.detach().clone()
             p.copy_(self.shadow[n])
@@ -76,16 +75,10 @@ class EMA:
 
 
 def load_pretrained(model: Refiner, path: str, device: torch.device, mode: str = "adapt") -> None:
-    """Load dense weights and fixed buffers from a checkpoint (EMA weights when present).
+    """Load weights (EMA when present) from a checkpoint.
 
-    ``mode="adapt"``: the puzzle-embedding table belongs to a new dataset's identifiers. Every row except the blank
-    becomes the mean of the checkpoint's *trained* rows (TRM's reset-to-mean, applied only to the new table; averaging
-    the never-trained zero rows too would shrink it by the checkpoint's coverage, which differs between arms), and the
-    new rows start untrained.
-
-    ``mode="continue"``: the same dataset (identifier for identifier). The table and its visit counts are kept, and
-    the model may have modules the checkpoint lacks — the fork modules of a K>0 model started from a K=0 checkpoint
-    (an imported TRM) — which keep their fresh initialisation. Every shared weight must be present.
+    ``adapt``: new dataset; every non-blank embedding row = mean of the checkpoint's trained rows.
+    ``continue``: same dataset; table kept; fork modules missing from a K=0 checkpoint keep their fresh init.
     """
     ck = torch.load(path, map_location=device, weights_only=False)
     state = dict(ck["model"])
@@ -105,7 +98,7 @@ def load_pretrained(model: Refiner, path: str, device: torch.device, mode: str =
     old = state.pop("puzzle_emb.table")
     old_visits = state.pop("puzzle_emb.visits", None)
     trained = (old_visits > 0) if old_visits is not None else (old != 0).any(-1)
-    trained[0] = False  # the blank identifier
+    trained[0] = False
     missing, unexpected = model.load_state_dict(state, strict=False)
     if sorted(missing) != ["puzzle_emb.table", "puzzle_emb.visits"] or unexpected:
         raise ValueError(f"checkpoint/model mismatch: missing {missing}, unexpected {unexpected}")
@@ -118,7 +111,7 @@ def load_pretrained(model: Refiner, path: str, device: torch.device, mode: str =
 
 
 def _forkless(cfg):
-    """The K=0 twin of a model config: its state-dict keys are the weights every arm shares."""
+    """K=0 twin of a model config: its state-dict keys are the shared (non-fork) weights."""
     fields = {f.name for f in dataclasses.fields(cfg)}
     return dataclasses.replace(cfg, K=0, **({"fork_gate": False} if "fork_gate" in fields else {}))
 
@@ -133,7 +126,7 @@ class BucketState:
     halted: torch.Tensor  # [B] bool
     solved: torch.Tensor  # [B] bool: row has been exact at some earlier round
     prev_exact: torch.Tensor  # [B] bool
-    has_sub: np.ndarray  # [B] bool, host copy: row carries sub-goals (avoids a device sync in the objective)
+    has_sub: np.ndarray  # [B] bool, host copy: row has sub-goals
 
 
 def to_device(arrays: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
@@ -154,12 +147,8 @@ SOURCE_NAMES = {code: name for name, code in SOURCE_CODES.items()}
 
 
 class RoundStats:
-    """Accumulates per-row metrics by round index (1..max_rounds) between log lines.
-
-    Logged as ``{name}`` (mean over all rows) and ``{name}_by_round`` (mean over rows at each round). Rates such as
-    ``first_solve`` (row exact for the first time at this round) and ``regress`` (exact at r-1, wrong at r) are means
-    of 0/1 indicators, i.e. fractions of the rows seen at that round. With the rows' source codes, the metrics in
-    ``SOURCE_METRICS`` are also logged as ``{name}_by_source`` ({source name: mean}), e.g. where the forks go."""
+    """Per-row metrics by round (1..max_rounds) between log lines: ``{name}``, ``{name}_by_round`` and, for
+    ``SOURCE_METRICS``, ``{name}_by_source``."""
 
     def __init__(self, max_rounds: int):
         self.R = max_rounds
@@ -169,7 +158,7 @@ class RoundStats:
         self.src_counts: dict[str, np.ndarray] = {}
 
     def add_many(self, rounds: torch.Tensor, metrics: dict[str, torch.Tensor], sources: torch.Tensor | None = None):
-        """One device->host transfer for all per-row metrics of a step; NaN entries are skipped per metric."""
+        """One device->host transfer per step; NaN entries skipped."""
         names = list(metrics)
         head = [rounds.float()] + ([] if sources is None else [sources.float()])
         stacked = torch.stack(head + [metrics[n].detach().float() for n in names]).cpu().numpy()
@@ -231,9 +220,9 @@ class Trainer:
         self.ema = EMA(self.model, tc.ema)
         self.step = 0
         self.flops = 0.0
-        self.row_rounds = 0  # training rows x rounds processed (for matched-sample comparisons between arms)
+        self.row_rounds = 0  # training rows x rounds processed
         self.best = -1.0
-        self.price = cfg.objective.fork_price  # fork price (nats/token) behind the gate's labels; a controller moves it
+        self.price = cfg.objective.fork_price  # gate-label fork price (nats/token)
         self.next_eval = tc.eval_every_pflops
         if "test" in cfg.eval.splits:
             raise ValueError("eval.splits must not contain 'test': checkpoints are selected on dev (DESIGN.md D14)")
@@ -254,7 +243,7 @@ class Trainer:
         self.stats = RoundStats(tc.max_rounds)
         self.stop_requested = False
         self.t_start = time.time()
-        self.hours_before = 0.0  # training wall-clock of earlier links (restored on resume): max_hours is cumulative
+        self.hours_before = 0.0  # wall-clock of earlier sessions (max_hours is cumulative)
         if resume != "none":
             self._maybe_resume(resume)
         (run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))
@@ -288,13 +277,8 @@ class Trainer:
         os.replace(tmp, path)
 
     def _sampling_weights(self) -> tuple[np.ndarray, dict[int, dict[str, float]]]:
-        """Bucket probabilities and per-bucket source weights such that (a) source s supplies a fraction w_s of all
-        training rows and (b) every task of a source is visited at the same rate, whatever its bucket.
-
-        A draw of a task yields min(size, max_pairs_per_draw) rows, so with n[s,S] = sum over the source's tasks in
-        bucket S of that capped size and n[s] = sum over buckets, rows of (s, S) should be a fraction
-        e[s,S] = w_s * n[s,S] / n[s]; bucket S is drawn with probability ∝ sum_s e[s,S] / rows_S and its stream mixes
-        sources ∝ e[s,S]."""
+        """Bucket probabilities and per-bucket source weights: source s gives fraction w_s of rows, and every task of
+        a source is visited at the same rate whatever its bucket (e[s,S] = w_s * n[s,S] / n[s], capped draw sizes)."""
         cap = self.cfg.data.max_pairs_per_draw
         n: dict[int, dict[str, float]] = {}
         for S in self.buckets:
@@ -316,8 +300,7 @@ class Trainer:
         return p[keep] / p[keep].sum(), {S: source_w[S] for S in self.buckets}
 
     def _maybe_resume(self, resume: str) -> None:
-        """``auto``: RUN/last.pt if it exists, else (``train.resume_from``) the full training state of another run's
-        checkpoint, so two arms can branch from one shared stretch of training (the branch keeps its own best.pt)."""
+        """``auto``: RUN/last.pt if present, else ``train.resume_from`` (a branch; best score reset)."""
         path = self.run_dir / "last.pt" if resume == "auto" else Path(resume)
         branch = False
         if not path.exists():
@@ -339,7 +322,7 @@ class Trainer:
             self.best = -1.0
         self.row_rounds = ck["row_rounds"]
         self.hours_before = ck.get("hours", 0.0)
-        self.price = ck.get("price", self.price)  # checkpoints written before the fork gate carry none
+        self.price = ck.get("price", self.price)
         for S, st in ck["streams"].items():
             if S in self.streams:
                 self.streams[S].load_state_dict(st)
@@ -368,7 +351,7 @@ class Trainer:
         return self.states[S]
 
     def _refill(self, st: BucketState) -> None:
-        """Replace halted rows with fresh rows from the bucket's stream (one device->host sync for the indices)."""
+        """Replace halted rows with fresh rows from the bucket's stream."""
         idx_np = st.halted.nonzero().squeeze(-1).cpu().numpy()
         if idx_np.size == 0:
             return
@@ -383,9 +366,7 @@ class Trainer:
         st.prev_exact[idx] = False
 
     def lr_factor(self) -> float:
-        """Linear warm-up, constant, then (``decay_frac``) a (1-sqrt) cooldown to ``decay_to`` over the budget's end:
-        1 - sqrt(u) at the fraction u of the window elapsed (Hägele et al. 2024, arXiv 2405.18392: beats a linear
-        cooldown; a weight average at constant lr does not close the gap to a cooldown)."""
+        """Linear warm-up, constant, then optional (1-sqrt) cooldown to ``decay_to`` (arXiv 2405.18392)."""
         tc = self.cfg.train
         f = min(1.0, (self.step + 1) / max(1, tc.warmup_steps))
         if tc.decay_frac > 0:
@@ -394,7 +375,7 @@ class Trainer:
         return f
 
     def progress(self) -> float:
-        """Fraction of the run's budget spent: the largest of compute, steps and wall-clock fractions."""
+        """Budget fraction spent: max of compute, steps and wall-clock fractions."""
         tc = self.cfg.train
         p = self.flops / (tc.budget_pflops * 1e15)
         if tc.max_steps:
@@ -404,7 +385,7 @@ class Trainer:
         return min(1.0, p)
 
     def hours(self) -> float:
-        """Training wall-clock so far, over every link of the run."""
+        """Cumulative training wall-clock."""
         return self.hours_before + (time.time() - self.t_start) / 3600
 
     def train_step(self) -> dict:
@@ -417,8 +398,7 @@ class Trainer:
         for g in self.opt.param_groups:
             g["lr"] = tc.lr * f * g["lr_mult"]
         progress = self.progress()
-        # Fork policy: every row-round forks while the gate familiarises itself with what forks do, then the gate
-        # decides, with an exploration floor (ignored by ungated models, where "gate" means every row forks).
+        # Forced forks early, then the gate decides with an exploration floor (ungated models always fork).
         forced = progress < tc.fork_force_frac
         fork_mode, explore = ("all", 0.0) if forced else ("gate", tc.fork_explore)
         out = self.model.round(
@@ -432,7 +412,7 @@ class Trainer:
         else:
             loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), tc.grad_clip)
-        host = [loss.detach().float(), gnorm.float()]  # one device->host sync for the scalars and the fork counts
+        host = [loss.detach().float(), gnorm.float()]
         if out.fork is not None:
             host.append(out.fork.sum().float())
         if out.gate_rows is not None:
@@ -458,7 +438,7 @@ class Trainer:
             per_row = {name: m[name] for name in ROUND_METRICS if name in m}
             per_row["first_solve"] = exact & ~st.solved
             per_row["regress"] = st.prev_exact & ~exact
-            if "winner" in m:  # NaN on rows that did not fork
+            if "winner" in m:
                 w = m["winner"]
                 per_row.update(
                     {f"win{k}": (w == k).float().masked_fill(w.isnan(), math.nan) for k in range(self.cfg.model.K)}
@@ -495,12 +475,12 @@ class Trainer:
                     res[split] = evaluate_split(
                         self.model, self.ds, split, ec, self.device, self.dtype, counterfactuals=ec.counterfactuals
                     )
-            # best.pt is chosen on the first listed split (ARC dev); the others are reported, not selected on.
+            # best.pt is selected on the first listed split.
             primary = next((res[s] for s in ec.splits if s in res), {})
             score = primary.get("pass@2", 0.0)
-            score = 0.0 if score != score else score  # NaN (no labelled tasks) counts as 0
+            score = 0.0 if score != score else score
             res["score"] = float(score)
-            if score >= self.best:  # ties go to the later (longer-trained) checkpoint
+            if score >= self.best:
                 self.best = float(score)
                 torch.save(
                     {
@@ -525,9 +505,7 @@ class Trainer:
 
     # ------------------------------------------------------------------ loop
     def done(self) -> bool:
-        """The budget is spent (compute, steps or cumulative hours), or ``stop_pflops`` is reached: a stop that
-        leaves the schedule (which follows ``budget_pflops``) untouched, e.g. the shared stretch two branches start
-        from (``train.resume_from``)."""
+        """Budget spent (compute, steps or cumulative hours) or ``stop_pflops`` reached."""
         tc = self.cfg.train
         over_time = tc.max_hours > 0 and self.hours() > tc.max_hours
         stop = tc.stop_pflops > 0 and self.flops >= tc.stop_pflops * 1e15

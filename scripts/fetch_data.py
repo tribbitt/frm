@@ -1,10 +1,7 @@
-"""Populate data/raw with arc-agi_{subset}_{challenges,solutions}.json for ARC-AGI-1, ARC-AGI-2 and ConceptARC.
+"""Download ARC-AGI-1 (fchollet/ARC-AGI), ARC-AGI-2 (arcprize/ARC-AGI-2) and ConceptARC (TRM repo's kaggle/combined)
+into data/raw as arc-agi_{subset}_{challenges,solutions}.json.
 
-Copies from ../trm-samsung/kaggle/combined when present (offline); otherwise downloads:
-ARC-AGI-1 from github fchollet/ARC-AGI, ARC-AGI-2 from github arcprize/ARC-AGI-2 (per-task files, combined here),
-ConceptARC from the TRM repo's kaggle/combined files.
-
-    python scripts/fetch_data.py [--dest data/raw] [--local ../trm-samsung/kaggle/combined]
+    python scripts/fetch_data.py [--dest data/raw] [--local DIR]
 """
 
 from __future__ import annotations
@@ -17,7 +14,6 @@ import urllib.request
 
 SUBSETS = ("training", "evaluation", "concept", "training2", "evaluation2")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOCAL = os.path.join(ROOT, "..", "trm-samsung", "kaggle", "combined")
 
 TRM_RAW = "https://raw.githubusercontent.com/SamsungSAILMontreal/TinyRecursiveModels/main/kaggle/combined"
 # subset -> (GitHub repo, branch, directory of per-task JSON files)
@@ -50,14 +46,14 @@ def _download_github(subset: str) -> tuple[dict, dict]:
     return challenges, solutions
 
 
-def fetch(dest: str, local: str) -> None:
+def fetch(dest: str, local: str | None) -> None:
     os.makedirs(dest, exist_ok=True)
     for subset in SUBSETS:
         names = [f"arc-agi_{subset}_{kind}.json" for kind in ("challenges", "solutions")]
         if all(os.path.isfile(os.path.join(dest, n)) for n in names):
             print(f"{subset}: present")
             continue
-        if all(os.path.isfile(os.path.join(local, n)) for n in names):
+        if local and all(os.path.isfile(os.path.join(local, n)) for n in names):
             for n in names:
                 shutil.copyfile(os.path.join(local, n), os.path.join(dest, n))
             print(f"{subset}: copied from {local}")
@@ -77,7 +73,7 @@ def fetch(dest: str, local: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dest", default=os.path.join(ROOT, "data", "raw"))
-    ap.add_argument("--local", default=LOCAL)
+    ap.add_argument("--local", default=None, help="optional directory of TRM kaggle/combined files to copy instead")
     args = ap.parse_args()
     fetch(args.dest, args.local)
 

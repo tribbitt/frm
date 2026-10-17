@@ -1,20 +1,13 @@
 """Synthetic composite tasks f_k∘…∘f_1 with recorded intermediate grids (DESIGN §3.5).
 
-A task samples k primitives from `PRIMITIVES`, fixes their parameters, and applies the chain to 8–12 random
-ARC-shaped inputs. Every example stores the k−1 intermediates g_1 = f_1(x), g_2 = f_2(g_1), … as sub-goals.
+k parameterised primitives applied to 8–12 random inputs; each example stores intermediates g_j = f_j(g_{j-1}).
+Filters (rejected attempts are resampled): every step changes every example; no step returns to an earlier grid;
+no consecutive steps share a family; outputs non-trivial and ≤ 30×30; no shorter program (single primitive on any
+window of ≥ 2 steps, any one step dropped, sampled length-2 compositions for k ≥ 3) reproduces the demos.
+Detour: some g_j is, on every example, not strictly Hamming-closer to the output than the input (shape mismatch =
+not closer). Deterministic in `seed`.
 
-Filters (a rejected attempt is resampled from scratch):
-  * every step changes its input on every example; no step returns to an earlier grid of the chain on every
-    example and no two consecutive steps share a closed family (dihedral, block, colour, translate), so no pair
-    cancels or collapses into one primitive of the same family;
-  * outputs differ from inputs, are not all identical and are not a single colour; all grids ≤ 30×30;
-  * no shorter program reproduces the demos: no single primitive (any parameter setting) maps the endpoints of
-    any window of ≥ 2 consecutive steps (the whole program included), dropping any one step does not reproduce
-    the outputs, and for k ≥ 3 a sampled set of length-2 compositions does not either.
-
-Detour: an intermediate g_j is *closer* on an example when its cell Hamming distance to the output is strictly below
-the input's (shape mismatch = not closer). A k ≥ 2 task is a detour when some intermediate is not closer on any
-example; `generate` enforces a minimum detour fraction among k ≥ 2 tasks.
+Usage: python -m frm.data.composite --n 2000 --seed 0
 """
 
 from __future__ import annotations
@@ -63,11 +56,7 @@ def _eq(a: Grid, b: Grid) -> bool:
 
 
 def _components(g: Grid, bg: int) -> tuple[np.ndarray, np.ndarray]:
-    """4-connected single-colour components of non-background cells.
-
-    Returns labels (0 = background, 1..n) and sizes (index 0 unused). Min-label propagation with pointer jumping:
-    every label is the flat index of a cell of the same component, so `flat[flat]` stays inside it.
-    """
+    """4-connected single-colour components: labels (0 = background) and sizes; min-label pointer jumping."""
     h, w = g.shape
     fg = g != bg
     big = h * w
@@ -454,12 +443,8 @@ def _vector_space(colours: Sequence[int]) -> list[Params]:
 
 @dataclass(frozen=True)
 class Primitive:
-    """A grid transform with per-task parameters.
-
-    `space` enumerates the settings a shortcut search tries for a pair with the given colours; primitives whose
-    space is too large to enumerate (colour_map) set `space=None` and decide reproduction with `fit` instead.
-    Consecutive steps sharing a non-empty `family` are never sampled (each family is closed under composition).
-    """
+    """Parameterised grid transform. `space` enumerates settings for the shortcut search (`fit` when too large);
+    consecutive steps never share a non-empty `family`."""
 
     name: str
     fn: Callable[..., Grid | None]
@@ -516,8 +501,7 @@ PRIMITIVES: tuple[Primitive, ...] = (
     Primitive("symmetrize", _symmetrize, _choice_param(("h", "v")), _choice_space(("h", "v"))),
 )
 BY_NAME: dict[str, Primitive] = {p.name: p for p in PRIMITIVES}
-# Draw weights: primitives that need specific input structure (solid or hollow objects, blocky grids, aligned pairs,
-# a unique largest object) are infeasible on most inputs, so they are proposed more often to balance usage.
+# Structure-dependent primitives are often infeasible, so they are proposed more often.
 SAMPLING_WEIGHT = {
     "hollow": 12.0, "fill_enclosed": 12.0, "downscale_x2": 6.0, "connect": 4.0, "keep_largest": 4.0,
     "crop_content": 3.0, "recolour_largest": 3.0, "remove_smallest": 3.0, "recolour_by_size": 2.0, "gravity": 2.0,
@@ -864,12 +848,7 @@ def generate(
     depth_weights: Sequence[float] | None = None,
     min_side: int = 3,
 ) -> list[dict]:
-    """`n_tasks` composite tasks; deterministic in `seed`.
-
-    Depths are drawn from depth_range (inclusive) uniformly or with `depth_weights` (one weight per depth). Among
-    k ≥ 2 tasks at least `detour_frac` are detours: a task is required to be one whenever the running detour count
-    would otherwise fall below the fraction.
-    """
+    """`n_tasks` composite tasks; deterministic in `seed`. At least `detour_frac` of k ≥ 2 tasks are detours."""
     depths = np.arange(depth_range[0], depth_range[1] + 1)
     p = None if depth_weights is None else np.asarray(depth_weights, dtype=float) / np.sum(depth_weights)
     rng = np.random.default_rng(seed)

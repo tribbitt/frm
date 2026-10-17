@@ -2,13 +2,9 @@
 
     python -m frm.evaluate --run_dir runs/X --split dev [--ckpt best|last|PATH] [--final] [--max_versions N]
 
-Voting follows TRM (trm-samsung/evaluators/arc.py:107-177): each version's prediction is cropped, de-augmented and
-hashed; candidates rank by (votes, mean sigmoid(q)); the top two are the attempts. Score = mean over tasks of the
-fraction of their test inputs with a correct attempt (official ARC metric). Reading split ``test`` needs ``--final``.
-Only versions whose puzzle-embedding row was trained vote (``loader.eval_versions``): TRM trains every version it votes
-with, while a budgeted run trains a fraction of them, and the untrained rest would vote blind (the result's
-``versions`` block reports coverage and voters). Per-task outcomes are stored so arms can be compared with paired
-statistics (``scripts/compare.py``).
+Voting follows TRM (`evaluators/arc.py`): predictions are cropped, de-augmented and hashed; candidates rank by
+(votes, mean sigmoid(q)); the top two are the attempts. Score = mean over tasks of the fraction of test inputs with a
+correct attempt. Only versions whose puzzle embedding was trained vote. Split ``test`` requires ``--final``.
 """
 
 from __future__ import annotations
@@ -66,7 +62,7 @@ class Votes:
 
 
 def score(votes: Votes, tasks: dict[str, dict]) -> dict:
-    """Official ARC scoring for tasks with known outputs, plus per-task pass@2 for paired comparisons."""
+    """Official ARC scoring for tasks with known outputs, plus per-task pass@2."""
     p1, per_task = [], {}
     for tid, task in tasks.items():
         s1 = s2 = 0.0
@@ -90,7 +86,7 @@ def score(votes: Votes, tasks: dict[str, dict]) -> dict:
 
 
 def attempts(votes: Votes, tasks: dict[str, dict]) -> dict[str, list[dict]]:
-    """Kaggle submission dict: one {attempt_1, attempt_2} per test input, padded by repeating attempt 1."""
+    """Kaggle submission: {attempt_1, attempt_2} per test input, attempt 1 repeated if needed."""
     sub = {}
     for tid, task in tasks.items():
         entries = []
@@ -109,7 +105,7 @@ def _rows_per_batch(model: Refiner, S: int, ecfg: EvalCfg) -> int:
 
 
 def _pad(t: torch.Tensor, rows: int) -> torch.Tensor:
-    """Repeat row 0 up to ``rows`` so every batch of a bucket has one shape (one compiled graph)."""
+    """Repeat row 0 up to ``rows``: one shape per bucket (one compiled graph)."""
     return t if t.shape[0] == rows else torch.cat([t, t[:1].expand(rows - t.shape[0], *t.shape[1:])])
 
 
@@ -138,10 +134,8 @@ def _trim(out: RoundOut, n: int) -> RoundOut:
 
 
 def sham_perm(tasks: list[str], device: torch.device) -> torch.Tensor:
-    """perm[b] = a row of a *different* task (searching from half a batch away); the next row if the batch has one task.
-
-    Neighbouring eval rows are other versions of the same test input, so rolling by one would hand a row children that
-    solve its own task in another orientation."""
+    """perm[b] = a row of a different task (searched from half a batch away; neighbours are versions of the same
+    input); the next row if the batch has one task."""
     B = len(tasks)
     perm = []
     for b in range(B):
@@ -163,12 +157,8 @@ def _auc(score: np.ndarray, pos: np.ndarray) -> float | None:
 
 
 def gate_skill(records: list[tuple[int, int, np.ndarray, np.ndarray]], rhos=(0.1, 0.25, 0.4, 0.6)) -> dict:
-    """The gate's held-out ranking from (batch, round, gate logits, benefits) of runs where every row forked.
-
-    ``auc``: gate logit vs "benefit > 0" (0.5 = no skill). ``top{rho}``: forking only the top rho rows by logit in each
-    batch and round (what ``fork_top`` does) keeps ``share`` of the summed per-round benefit (None if the sum is not
-    positive; random choice keeps rho), with ``precision`` and mean ``benefit`` of the kept rows. ``by_round``: the
-    same base quantities at round 1, 2-4 and 5+ (round 1 starts from the init carry)."""
+    """Gate ranking from (batch, round, logits, benefits) of all-fork runs. ``auc``: logit vs benefit > 0.
+    ``top{rho}``: forking the top rho rows per batch-round keeps ``share`` of total benefit (random keeps rho)."""
 
     def summary(lg, b):
         return {"rows": int(len(b)), "benefit": float(b.mean()), "base_rate": float((b > 0).mean()),
@@ -197,12 +187,9 @@ def run_rounds(
     model: Refiner, inputs, ids, rounds: int, dtype, cf=None, perm=None, reset_at=None, seed: int = 0, fork_mode="gate",
     state_noise: float = 0.0, fork_top: float = 0.0, n_valid: int | None = None, gate_labels: bool = True,
 ) -> list[RoundOut]:
-    """Run ``rounds`` rounds from the init carry; one RoundOut per round, without its carry (only the next round needs
-    it, and 16 kept carries would cost ~16x the state memory). Children's noise comes from a generator seeded with
-    ``seed``, so a batch evaluates identically every time and its counterfactual reruns see the same noise.
-    ``fork_mode`` as in ``Refiner.round`` (no exploration at evaluation); ``fork_top`` > 0 forks the batch's top
-    fraction by gate logit instead of logit > 0. ``state_noise`` > 0 adds Gaussian noise of that many RMS units to the
-    latent z between rounds (PTRM's test-time noisy trajectories, arXiv 2605.19943)."""
+    """Run ``rounds`` rounds from the init carry; RoundOuts without carry. Noise is seeded by ``seed`` (reruns see the
+    same noise). ``fork_top`` > 0: fork the top fraction by gate logit. ``state_noise`` > 0: Gaussian noise in RMS
+    units on z between rounds (PTRM noisy trajectories)."""
     S = int(round(inputs.shape[1] ** 0.5))
     carry = model.init_carry(inputs.shape[0], S, inputs.device, dtype)
     gen = torch.Generator(device=inputs.device).manual_seed(seed)
@@ -234,40 +221,35 @@ def evaluate_split(
     keep_attempts: bool = False,
     gate_labels: bool = True,
 ) -> dict:
-    """Per-round voted pass@k plus the fork and depth instruments of DESIGN.md §7 on one split. ``gate_labels=False``
-    skips the no-fork continuation behind the gate instruments (answers only, e.g. the submission).
-
-    With ``ecfg.fork_top >= 1`` every row forks at every round and carries a gate label, so ``fork.skill`` measures the
-    gate's held-out ranking without selection bias: AUC of the gate logit for "the fork beat the TRM round", and for a
-    fork rate rho the share of the total per-round CE benefit that the top rho rows by logit (per batch and round)
-    would keep (random choice keeps rho)."""
+    """Voted pass@k per round plus the DESIGN.md §7 instruments on one split. ``gate_labels=False`` skips the no-fork
+    continuation. ``ecfg.fork_top >= 1`` forks every row, giving an unbiased ``fork.skill``."""
     model.eval()
     R, K = ecfg.rounds, model.cfg.K
     tasks = ds.tasks(split)
-    if split != "test" and ecfg.max_tasks and len(tasks) > ecfg.max_tasks:  # test (and Kaggle) is always complete
+    if split != "test" and ecfg.max_tasks and len(tasks) > ecfg.max_tasks:  # test is always complete
         keep = sorted(tasks, key=lambda t: hashlib.sha1(t.encode()).hexdigest())[: ecfg.max_tasks]
         tasks = {t: tasks[t] for t in keep}
     versions: dict[int, Version] = {}
     per_round = [Votes() for _ in range(R)]
     child_votes = Votes()
     exact_r = np.zeros(R)  # labelled rows exact at round r
-    first_solve = np.zeros(R)  # labelled rows exact for the first time at round r
-    regress = np.zeros(R)  # labelled rows exact at r-1 and wrong at r
-    by_k: dict[int, np.ndarray] = {}  # composites: exact rows by round, per composition depth k
+    first_solve = np.zeros(R)  # first exact at round r
+    regress = np.zeros(R)  # exact at r-1, wrong at r
+    by_k: dict[int, np.ndarray] = {}  # composites: exact by round per depth k
     n_k: dict[int, int] = defaultdict(int)
     n_rows = n_labeled = 0
     fork: dict[str, float] = defaultdict(float)
     fork_r = np.zeros(R)  # rows that forked at round r
-    fork_b: dict[int, list[float]] = defaultdict(lambda: [0.0, 0.0])  # bucket -> [forked row-rounds, row-rounds]
+    fork_b: dict[int, list[float]] = defaultdict(lambda: [0.0, 0.0])  # bucket -> [forked, total] row-rounds
     cf_acc: dict[str, float] = defaultdict(float)
     cf_rows = 0
-    task_rows: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # task -> [labelled rows, exact at the last round]
-    skill: list[tuple[int, int, np.ndarray, np.ndarray]] = []  # (batch, round, gate logits, benefits): fork_top >= 1
+    task_rows: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # task -> [labelled rows, exact at last round]
+    skill: list[tuple[int, int, np.ndarray, np.ndarray]] = []  # fork_top >= 1 only
     skill_batch = 0
     buckets = [S for S in ds.buckets if ds.has_split(S, split)]
-    cf_budget = ecfg.cf_rows // max(1, len(buckets))  # counterfactual rows per bucket: every canvas size is represented
+    cf_budget = ecfg.cf_rows // max(1, len(buckets))  # per bucket
     trained = model.puzzle_emb.trained().cpu().numpy()
-    coverage, voters, blind = [], [], 0  # per evaluated task: fraction of its versions trained, versions that vote
+    coverage, voters, blind = [], [], 0  # per task: trained-version fraction, voting versions
     for S in buckets:
         d = ds.split_data(S, split)
         for t, tid in enumerate(d.tasks):
@@ -282,7 +264,7 @@ def evaluate_split(
         for bi, batch in enumerate(eval_batches(ds, split, S, rows, ecfg.max_versions, set(tasks), trained)):
             keys = batch["keys"]
             n = len(keys)
-            seed = S * 1_000_003 + bi  # reproducible noise per batch, shared by its counterfactual reruns
+            seed = S * 1_000_003 + bi  # shared by the counterfactual reruns
             inputs = _pad(torch.from_numpy(batch["inputs"]).long().to(device), rows)
             ids = _pad(torch.from_numpy(batch["puzzle_ids"]).long().to(device), rows)
             labels = torch.from_numpy(batch["labels"]).long().to(device)
@@ -290,7 +272,7 @@ def evaluate_split(
             top = ecfg.fork_top
             outs = [_trim(o, n) for o in run_rounds(model, inputs, ids, R, dtype, seed=seed, fork_top=top,
                                                     n_valid=n, gate_labels=gate_labels)]
-            extra = [  # PTRM-style noisy trajectories: extra voters only, instruments stay on the clean run
+            extra = [  # noisy trajectories: extra voters only
                 [_trim(o, n) for o in run_rounds(model, inputs, ids, R, dtype, seed=seed + 7919 * s,
                                                  state_noise=ecfg.state_noise, fork_top=top, n_valid=n,
                                                  gate_labels=False)]
@@ -302,7 +284,7 @@ def evaluate_split(
             exact_np = exact.cpu().numpy()
             exact_r += exact_np.sum(1)
             lab_np = labeled.cpu().numpy()
-            for b, key in enumerate(keys):  # per task: labelled rows (versions x test inputs) exact at the last round
+            for b, key in enumerate(keys):
                 if lab_np[b]:
                     task_rows[key[0]][0] += 1
                     task_rows[key[0]][1] += int(exact_np[-1, b])
@@ -313,7 +295,7 @@ def evaluate_split(
                     regress[r] += (exact_np[r - 1] & ~exact_np[r]).sum()
                 seen |= exact_np[r]
             comp = np.array([k[0].startswith("comp:") for k in keys])
-            if comp.any():  # composition depth k = 1 + number of intermediates (buckets without any store none)
+            if comp.any():  # depth k = 1 + number of intermediates
                 ks = batch["subgoal_mask"].sum(-1) + 1 if "subgoal_mask" in batch else np.ones(n, dtype=np.int64)
                 for k in np.unique(ks[comp]):
                     sel = comp & (ks == k)
@@ -326,7 +308,7 @@ def evaluate_split(
                          [torch.sigmoid(o.q).float().cpu().numpy() for o in e]) for e in extra]
             last = outs[-1]
             child_np = cq_np = forked_np = None
-            if K > 0:  # children instruments over the rows that forked at the round in question
+            if K > 0:  # over rows that forked
                 forks = torch.stack([o.fork for o in outs]).sum(1).cpu().numpy()
                 fork_r += forks
                 fork_b[S][0] += float(forks.sum())
@@ -343,21 +325,21 @@ def evaluate_split(
                 fork["child_exact_any"] += float(child_exact.sum())
                 fork["oracle"] += float((child_exact | (exact[-1] & f)).sum())
                 fork["oracle_base"] += float((exact[-1] & f).sum())
-                for r, o in enumerate(outs):  # adoption: pre-fork parent wrong and some child right -> joined parent right?
+                for r, o in enumerate(outs):  # adoption: pre-fork wrong, some child right -> joined right?
                     chance = labeled & o.fork & ~row_exact(o.pre_logits, labels)
                     chance &= row_exact(o.child_logits, labels[:, None]).any(-1)
                     fork["adopt_den"] += float(chance.sum())
                     fork["adopt_num"] += float((chance & row_exact(o.logits, labels)).sum())
-                    if o.fork_logit is not None:  # the gate's own rule, whatever decided this run
+                    if o.fork_logit is not None:
                         fork["gate_says"] += float((o.fork_logit > 0).sum())
-                    if o.gate_rows is not None:  # did the forks the gate chose beat the TRM round on held-out rows?
+                    if o.gate_rows is not None:  # gate's forks vs the TRM round
                         g = o.gate_rows & labeled
                         if bool(g.any()):
                             b = row_ce(o.cf_logits[g], labels[g]) - row_ce(o.logits[g], labels[g])
                             fork["gate_n"] += float(g.sum())
                             fork["gate_hit"] += float((b > 0).sum())
                             fork["benefit"] += float(b.sum())
-                            if top >= 1:  # every row forked: an unbiased (logit, benefit) sample of this batch-round
+                            if top >= 1:  # unbiased (logit, benefit) sample
                                 skill.append((skill_batch, r, o.fork_logit[g].cpu().numpy(), b.cpu().numpy()))
                 skill_batch += 1
             for b, (tid, ti, pid) in enumerate(keys):
@@ -370,7 +352,7 @@ def evaluate_split(
                         per_round[r].add((tid, ti), v.invert(crop(ep[r][b], S)), float(eq[r][b]))
                 if child_np is not None and forked_np[b]:
                     answers = [v.invert(crop(child_np[b, k], S)) for k in range(K)]
-                    fork["distinct"] += len({_hash(a) for a in answers})  # distinct cropped answers (what is voted)
+                    fork["distinct"] += len({_hash(a) for a in answers})  # on cropped answers
                     for k in range(K):
                         child_votes.add((tid, ti), answers[k], float(cq_np[b, k]))
             if counterfactuals and K > 0 and cf_done < cf_budget and bool(labeled.any()):
@@ -381,7 +363,7 @@ def evaluate_split(
                 variants = [
                     ("nofork", {"cf": "nofork"}), ("sham", {"cf": "sham", "perm": perm}), ("reset@4", {"reset_at": 4})
                 ]
-                if model.gate is not None:  # every row forks / no row forks, against the gate's own choice
+                if model.gate is not None:
                     variants += [("allfork", {"fork_mode": "all"}), ("gateoff", {"fork_mode": "none"})]
                 for name, kw in variants:
                     o = _trim(run_rounds(model, inputs, ids, R, dtype, seed=seed, fork_top=top, n_valid=n,
@@ -392,9 +374,9 @@ def evaluate_split(
     scored = [score(v, tasks) for v in per_round]
     final = scored[-1]
     res.update({k: final[k] for k in ("pass@1", "pass@2", "n_tasks")})
-    res["per_task"] = {"pass@2": final["per_task"],  # row_exact: unvoted, every voting version's rows
+    res["per_task"] = {"pass@2": final["per_task"],  # row_exact: unvoted
                        "row_exact": {t: round(e / n, 5) for t, (n, e) in sorted(task_rows.items())}}
-    res["versions"] = {  # the vote rule's inputs: compare arms only on records that carry this block
+    res["versions"] = {
         "rule": "trained",
         "max": ecfg.max_versions,
         "coverage": float(np.mean(coverage)) if coverage else float("nan"),
@@ -422,10 +404,10 @@ def evaluate_split(
         def per(key: str, den: float) -> float | None:
             return fork[key] / den if den else None
 
-        # Denominators: rows that forked at the final round (forked_rows; forked_labeled for the labelled-row rates).
+        # Denominators: final-round forked rows (forked_labeled for labelled-row rates).
         res["fork"] = {
             "rate": float(fork_r.sum() / max(n_rows * R, 1)),
-            "top": ecfg.fork_top,  # 0: the gate's own decisions (logit > 0); > 0: the top fraction by gate logit
+            "top": ecfg.fork_top,  # 0: gate logit > 0; > 0: top fraction by logit
             "rate_by_round": (fork_r / max(n_rows, 1)).round(5).tolist(),
             "rate_by_bucket": {str(S): round(f / max(t, 1), 5) for S, (f, t) in sorted(fork_b.items())},
             "forked_rows": int(forked),
@@ -439,9 +421,9 @@ def evaluate_split(
             "adopt_chances": int(fork["adopt_den"]),
             "children_only": {k: children[k] for k in ("pass@1", "pass@2", "n_tasks")},
         }
-        if model.gate is not None:  # the gate's own rule (logit > 0), also when fork_top decided the run
+        if model.gate is not None:  # gate's own rule
             res["fork"]["gate_rate"] = fork["gate_says"] / max(n_rows * R, 1)
-        if fork["gate_n"]:  # the gate's chosen forks, all rounds, labelled rows: benefit = CE(TRM round) - CE(fork)
+        if fork["gate_n"]:  # benefit = CE(TRM round) - CE(fork)
             res["fork"]["gate_precision"] = fork["gate_hit"] / fork["gate_n"]
             res["fork"]["benefit"] = fork["benefit"] / fork["gate_n"]
             res["fork"]["gate_rows"] = int(fork["gate_n"])

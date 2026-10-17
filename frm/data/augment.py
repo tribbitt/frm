@@ -15,7 +15,7 @@ RETRIES_FACTOR = 5
 
 
 def dihedral(grid: np.ndarray, tid: int) -> np.ndarray:
-    """The 8 dihedral symmetries, numbered as in ``trm-samsung/dataset/common.py``."""
+    """The 8 dihedral symmetries, numbered as in TRM `dataset/common.py`."""
     if tid == 0:
         return grid
     if tid == 1:
@@ -77,11 +77,8 @@ def _puzzle_hash(pairs: list[tuple[np.ndarray, np.ndarray | None]]) -> str:
 
 
 def make_versions(task: Task, n: int, rng: np.random.Generator) -> list[Version]:
-    """Identity + up to ``n`` random distinct versions (TRM ``build_arc_dataset.py:126-164``).
-
-    Deduplication hashes the augmented demos and test *inputs* only, so the version table never depends on test
-    outputs (TRM also hashed test outputs).
-    """
+    """Identity + up to ``n`` random distinct versions (TRM `dataset/build_arc_dataset.py`); dedup ignores test
+    outputs."""
     pairs = [(np.asarray(ex["input"], dtype=np.uint8), np.asarray(ex["output"], dtype=np.uint8)) for ex in task["train"]]
     pairs += [(np.asarray(ex["input"], dtype=np.uint8), None) for ex in task["test"]]
     versions = [Version.identity()]

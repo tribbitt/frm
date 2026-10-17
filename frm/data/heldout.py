@@ -1,10 +1,4 @@
-"""Content contamination filter: canonical digests of held-out pairs and grids, equal up to the 8 dihedral transforms
-and any relabelling of the 10 colours.
-
-A candidate pair (a, b) is contaminated when its joint canonical form equals a held-out pair's (``'pair'``), or when
-either grid is *informative* and equals an informative held-out grid (``'grid'``). Small or nearly blank grids
-(e.g. a 3x3 of one colour) occur in many unrelated tasks and are not grid-level evidence.
-"""
+"""Contamination filter: canonical digests of held-out pairs and informative grids, up to dihedral + recolouring."""
 
 from __future__ import annotations
 
@@ -33,8 +27,7 @@ def _relabel(gs: list[np.ndarray]) -> list[np.ndarray]:
 
 
 def canon(*grids: np.ndarray) -> bytes:
-    """16-byte digest of the grids' joint canonical form: the least, over the 8 dihedral transforms (the same one
-    applied to every grid), of shape + cells after relabelling colours by first appearance."""
+    """16-byte digest of the grids' joint form, minimised over dihedrals after first-appearance relabelling."""
     gs = [np.asarray(g, dtype=np.uint8) for g in grids]
     best = None
     for k in range(8):
@@ -52,11 +45,7 @@ def informative(g: np.ndarray) -> bool:
 
 
 class HeldOut:
-    """Canonical digests of the held-out tasks' pairs and informative grids.
-
-    ``demos``: include the tasks' demonstration pairs (else test pairs only). ``inputs``: informative input grids are
-    grid-level targets too (else only outputs). Test pairs with an unknown output contribute their input grid only.
-    """
+    """Digests of held-out pairs (demos too if ``demos``) and informative outputs (inputs too if ``inputs``)."""
 
     def __init__(self, tasks: dict[str, Task], demos: bool = True, inputs: bool = True):
         self.ids: set[str] = set(tasks)

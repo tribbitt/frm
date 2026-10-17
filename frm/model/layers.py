@@ -1,8 +1,6 @@
-"""TRM building blocks: post-norm block, SwiGLU, SDPA attention with 2D RoPE (or TRM's 1-D RoPE).
+"""TRM building blocks (port of TRM ``models/layers.py``): post-norm block, SwiGLU, SDPA attention.
 
-Port of ``trm-samsung/models/layers.py``. frm's own models use 2D (row, col) positions so canvases of any bucket
-size share the same geometry, with prefix tokens unrotated. ``RopeTRM1D`` reproduces TRM's 1-D RoPE instead, with each
-cell at its index on TRM's 30x30 canvas, so an imported TRM checkpoint sees exactly its trained relative positions.
+Positions: 2D (row, col) RoPE with unrotated prefix, or ``RopeTRM1D`` for imported TRM checkpoints.
 """
 
 from __future__ import annotations
@@ -15,7 +13,7 @@ from torch import nn
 
 
 def trunc_normal_(t: torch.Tensor, std: float = 1.0, lower: float = -2.0, upper: float = 2.0) -> torch.Tensor:
-    """JAX-style truncated normal whose std is the requested std (TRM ``trunc_normal_init_``)."""
+    """JAX-style truncated normal with the requested true std (TRM ``trunc_normal_init_``)."""
     with torch.no_grad():
         if std == 0:
             return t.zero_()
@@ -104,9 +102,7 @@ def apply_rope_2d(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torc
 
 
 class RopeTRM1D(nn.Module):
-    """TRM's 1-D RoPE (``RotaryEmbedding``: inv_freq over the whole head, angles concatenated twice) evaluated at
-    TRM's positions: prefix token i at i, cell (r, c) of an S x S canvas at ``prefix_len + 30 r + c``. On S = 30 this is
-    TRM's table; on a smaller bucket every pair of tokens keeps the offset it would have on TRM's canvas."""
+    """TRM's 1-D RoPE at TRM's 30x30 positions (cell (r, c) at ``prefix_len + 30 r + c``), so relative offsets match."""
 
     STRIDE = 30
 
@@ -141,17 +137,9 @@ ROPE_APPLY = {"2d": apply_rope_2d, "trm1d": apply_rope_1d}
 
 
 def select_sdpa_backend(device: torch.device) -> None:
-    """On ROCm GPUs, route SDPA to the memory-efficient kernel instead of flash attention.
+    """On ROCm, use the memory-efficient SDPA kernel (faster fused backward). Process-wide; call before compiling.
 
-    Measured on MI300X (torch 2.9.1+rocm6.4, compiled FRM K=4 training step at S=30, no compile caches): 603 ms against
-    678 ms per forward+backward. The forward kernel is the same; the backward is one fused kernel (71 ms) instead of
-    flash's separate dk/dv and dq kernels (165 ms). Numerics match to bf16 noise (same loss, gradient rel. L2 2e-4).
-    CUDA keeps PyTorch's own choice. Process-wide; call before the first attention call and before compiling.
-
-    The compiled-graph caches (FX graph, AOTAutograd) do not key on the SDPA backend, and the node's cache directory
-    survives between jobs, so graphs lowered with flash would be reused and the switch would do nothing (measured: a
-    restarted run compiled nothing new and kept its speed). The efficient-backend graphs therefore get their own cache
-    directory."""
+    Inductor caches don't key on the SDPA backend, so this backend gets its own cache directory."""
     if device.type == "cuda" and torch.version.hip:
         import os
 

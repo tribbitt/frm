@@ -1,21 +1,16 @@
-"""Ingest external training pools (tinyabstractor FlatPool npz) with frm's own contamination filter.
+"""Ingest external FlatPool .npz training pools with frm's contamination filter.
 
-    python scripts/ingest_external.py --src ../tinyabstractor/data/cache --raw data/raw --out data/raw/external \
-        --pools barc rearc a2_new [synth] [--heldout_pools data/raw/external/a2_new.npz] --workers 8
+Pools: barc = BARC ARC-Heavy, rearc = RE-ARC, a2_new = ARC-AGI-2 training tasks that are not ARC-AGI-1 tasks,
+synth (optional). FlatPool layout: ``data`` int8, ``off`` int64 [G+1], ``hw`` int16 [G, 2], ``pair`` int32 [P, 2],
+``pool_off`` int32 [T+1], ``ids`` [T].
 
-Held-out = every ARC-AGI-1 evaluation and ARC-AGI-2 evaluation task in ``--raw``, demos and test pairs, inputs and
-outputs (``frm.data.heldout``), plus every pair of every task of each ``--heldout_pools`` FlatPool (the a2_new
-pool: the adaptation-dev candidates, ``scripts/make_adapt_dev.py``). Per pool:
+    python scripts/ingest_external.py --src POOLS --pools a2_new
+    python scripts/ingest_external.py --src POOLS --pools barc rearc --heldout_pools data/raw/external/a2_new.npz
 
-- any task id that is a held-out id: abort;
-- ``barc``, ``rearc``, ``synth`` (many instances of one rule): contaminated pairs are dropped; ``a2_new`` (fixed
-  ARC tasks): a task with any contaminated pair is dropped whole;
-- exact duplicate pairs inside a task are dropped; tasks left with fewer than 3 pairs are dropped.
-
-Writes ``{out}/{pool}.npz`` (FlatPool layout: ``data`` int8, ``off`` int64 [G+1], ``hw`` int16 [G, 2], ``pair`` int32
-[P, 2], ``pool_off`` int32 [T+1], ``ids`` [T]; plus ``heldout_ids`` = the sorted held-out ids it was filtered against
-and ``source`` = the ``frm.data.build`` source code name) and ``{out}/{pool}_report.json``.
-``synth_gap`` (designed by looking at ARC-AGI-1 evaluation) and ARC-GEN (contaminated) are never ingested.
+Held-out: every pair of ARC-AGI-1/ARC-AGI-2 evaluation tasks in ``--raw`` plus each ``--heldout_pools`` pool.
+Held-out task id in a pool: abort. barc/rearc/synth drop contaminated pairs; a2_new drops the whole task. Duplicate
+pairs are dropped; tasks with < 3 pairs are dropped. Writes ``{out}/{pool}.npz`` (plus ``heldout_ids``, ``source``)
+and ``{out}/{pool}_report.json``.
 """
 
 from __future__ import annotations
@@ -191,7 +186,7 @@ def ingest(pool: str, src: str, out_dir: str, held: HeldOut, workers: int, heldo
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--src", default="../tinyabstractor/data/cache", help="directory of the input {pool}.npz files")
+    ap.add_argument("--src", required=True, help="directory holding the input {pool}.npz FlatPool files")
     ap.add_argument("--raw", default="data/raw", help="ARC raw directory (held-out evaluation sets)")
     ap.add_argument("--out", default="data/raw/external")
     ap.add_argument("--pools", nargs="+", default=["barc", "rearc", "a2_new"], choices=list(POOL_SOURCE))

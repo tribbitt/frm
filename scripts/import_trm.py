@@ -1,16 +1,13 @@
-"""Import a TRM checkpoint (Samsung's TinyRecursiveModels, e.g. the ARC Prize verified ``arc_v1_public/step_518071``)
-into a frm checkpoint aligned with a frm dataset.
+"""Import a TRM checkpoint (SamsungSAILMontreal/TinyRecursiveModels) into a frm checkpoint for a frm dataset.
 
-    python scripts/import_trm.py --trm .../arc_v1_public/step_518071 --trm_ids .../arc1concept-aug-1000/identifiers.json \
-        --config configs/trm_import.json --data data/built/a1t --out runs/trm_v1/import.pt
+    python scripts/import_trm.py --trm CKPT/arc_v2_public/step_723914 \
+        --trm_ids TRM_DATA/arc2concept-aug-1000/identifiers.json --config configs/final_trm_a2tn.json \
+        --data data/built/a2tn --out runs/trm_v2/import_a2tn.pt
 
-The dense weights map one to one (frm's refiner is TRM's: same block, SwiGLU width, qkv layout, H_init/L_init,
-lm_head; q_head keeps TRM's halt row). The model must use ``pos_encoding="trm1d"`` so attention sees TRM's relative
-positions. TRM's puzzle embedding is indexed by its dataset's identifiers; the frm dataset must be built with
-``--versions_from`` the same identifiers.json so its ARC versions are TRM's. Each frm identifier found in TRM's
-list gets TRM's row and one recorded visit (trained); the others (BARC, RE-ARC, composites) start at the mean TRM row,
-untrained. The output loads with ``frm.evaluate --ckpt PATH`` and initialises training with
-``train.init_from=PATH train.init_mode=continue`` (also into K>0 models: the fork modules start fresh).
+Dense weights map one to one; the model must be K=0 with ``pos_encoding="trm1d"``. The dataset must be built with
+``--versions_from`` the same identifiers.json. Identifiers found in TRM's list get TRM's puzzle-embedding row;
+others start at the mean row, untrained. Load with ``frm.evaluate --ckpt PATH`` or train from it with
+``train.init_from=PATH train.init_mode=continue`` (K>0 models: fork modules start fresh).
 """
 
 from __future__ import annotations

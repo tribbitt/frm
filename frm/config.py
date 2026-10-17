@@ -20,9 +20,7 @@ class ModelCfg:
     prefix_len: int = 16
     vocab: int = 12
     rope_theta: float = 10000.0
-    # "2d": row/column RoPE, prefix unrotated (frm's own models). "trm1d": TRM's 1-D RoPE with every cell at its
-    # 30x30-canvas index (prefix i -> i, cell (r, c) -> prefix_len + 30r + c), so a TRM checkpoint sees the relative
-    # positions it was trained with on any bucket (scripts/import_trm.py).
+    # "2d": row/column RoPE, prefix unrotated. "trm1d": TRM's 1-D RoPE at 30x30-canvas indices (imported TRM).
     pos_encoding: str = "2d"
     rms_eps: float = 1e-5
     # Forking. K=0 is the forkless TRM control.
@@ -32,20 +30,15 @@ class ModelCfg:
     code_rank: int = 64
     code_init_std: float = 0.5
     join_dim: int = 64
-    # Fresh per-round, per-child latent noise xi ~ N(0, I) mapped into the child code (IMLE-style stochastic children):
-    # without it, children are a deterministic function of the parent state and repeat themselves at a parent fixed
-    # point. 0 disables. The map is learned; noise_init is the initial RMS of its output.
+    # Per-round, per-child latent noise dim mapped into the child code; 0 disables. noise_init: initial output RMS.
     noise_dim: int = 16
     noise_init: float = 0.25
-    # Training only: probability per row and round that the join's parent slot is masked, so the post-join cycle must
-    # build on the children and the parent's loss reaches them at full strength (OBJECTIVE.md §7, response to
-    # parent_mass -> 1). Evaluation never drops. 0 disables.
+    # Training only: per row/round probability of masking the join's parent slot (OBJECTIVE.md §7); 0 disables.
     join_drop_parent: float = 0.0
-    # Adaptive forking (DESIGN.md §4.8): a gate head on the pre-fork state decides per row and round whether to fork;
-    # declined rows run TRM's round. Off = every round forks. Needs fork_depth = 1.
+    # Adaptive forking (DESIGN.md §4.8); off = every round forks. Needs fork_depth = 1.
     fork_gate: bool = False
     gate_hidden: int = 128
-    # Gradient window of the K=0 control (TRM = 1 cycle; trm_h2 = 2), and of the rows a fork gate declines.
+    # Gradient window (cycles) of the K=0 control and of gate-declined rows; TRM = 1.
     grad_cycles: int = 1
     grad_ckpt_children: bool = False
 
@@ -59,27 +52,24 @@ class ObjectiveCfg:
     tau_start: float = 1.0
     tau_end: float = 0.02
     tau_anneal_frac: float = 0.3
-    # Fork gate (OBJECTIVE.md §3.6): BCE of the gate logit against "forking beat the no-fork continuation by more than
-    # fork_price nats per supervised token", on rows that forked with their own join.
+    # Fork gate BCE (OBJECTIVE.md §3.6); fork_price in nats per supervised token.
     lambda_gate: float = 0.1
     fork_price: float = 0.0
-    # Error-focused children (gated models): on label rows, cells that TRM's own round (the no-fork continuation)
-    # already predicts right weigh 1 - child_focus in the children's final-target CE, so children specialise on the
-    # parent's errors (boosting). 0 = uniform. Sub-goal targets are never reweighted.
+    # Gated models: weight 1 - child_focus on cells the no-fork continuation gets right in child CE; 0 = uniform.
     child_focus: float = 0.0
 
 
 @dataclass
 class DataCfg:
     root: str = "data/built/a1"
-    # Fractions of training rows per source (sources absent from the dataset are dropped and the rest renormalised).
+    # Row fractions per source; absent sources dropped, rest renormalised.
     source_weights: dict[str, float] | None = field(
         default_factory=lambda: {"arc": 0.5, "composite": 0.15, "barc": 0.25, "rearc": 0.10}
     )
     translate_p: float = 0.75
-    tokens_per_step: int = 120_000  # parent tokens (prefix included) per optimizer step; T2 bench re-sizes it
+    tokens_per_step: int = 120_000  # parent tokens (prefix included) per optimizer step
     max_rows: int = 4096
-    max_pairs_per_draw: int = 16  # a draw yields at most this many pairs of one task (RE-ARC tasks have ~1000)
+    max_pairs_per_draw: int = 16  # max pairs of one task per draw
     buckets: list[int] | None = None  # None = every bucket in the dataset
 
 
@@ -90,9 +80,7 @@ class TrainCfg:
     beta2: float = 0.95
     weight_decay: float = 0.1
     warmup_steps: int = 2000
-    # Warm-up, constant, then (decay_frac > 0) a (1-sqrt) cooldown over the last decay_frac of the budget to
-    # decay_to x lr (warmup-stable-decay; TRM itself trains at a constant lr). Progress is the trainer's budget fraction,
-    # so the window moves if the budget is extended later. Scales the embedding's SignSGD lr too, as TRM's schedule does.
+    # Warmup-stable-decay: (1-sqrt) cooldown over the last decay_frac of the budget to decay_to x lr; 0 = constant.
     decay_frac: float = 0.0
     decay_to: float = 0.0
     emb_lr: float = 1e-2
@@ -101,30 +89,23 @@ class TrainCfg:
     ema: float = 0.999
     max_rounds: int = 16
     halt_explore: float = 0.1
-    # Fork gate schedule: every row-round forks for the first fork_force_frac of training (familiarisation), then the
-    # gate decides and a declined row forks anyway with probability fork_explore. fork_rate_target > 0 turns the price
-    # into a controller: after each gated step price = max(0, price + fork_price_lr * (fork rate - target)).
+    # Gate schedule: forced forks for the first fork_force_frac, then declined rows fork w.p. fork_explore.
+    # fork_rate_target > 0: price = max(0, price + fork_price_lr * (fork rate - target)) per gated step.
     fork_force_frac: float = 0.3
     fork_explore: float = 0.1
     fork_rate_target: float = 0.0
     fork_price_lr: float = 0.01
-    # Learning-rate multiplier for the fork modules (the parameters a K=0 model lacks: codes, join, noise map, gate).
-    # After a warm start from a trained TRM they start from scratch while the shared weights only fine-tune; > 1 lets
-    # them learn at their own pace. 1 keeps a single parameter group (and resumes pre-existing runs unchanged).
+    # lr multiplier for fork modules (codes, join, noise map, gate); 1 = single parameter group.
     fork_lr_mult: float = 1.0
     budget_pflops: float = 1000.0  # training stops when this much compute is spent
-    # Stop (checkpoint, final eval, DONE) at this compute without changing the schedule, which follows budget_pflops:
-    # the shared stretch that branches (resume_from) continue from. 0 = no early stop.
+    # Early stop at this compute; schedule still follows budget_pflops. 0 = off.
     stop_pflops: float = 0.0
     max_steps: int = 0  # 0 = budget only
-    max_hours: float = 0.0  # 0 = no wall-clock limit (Kaggle adaptation; a guard for a fixed-length link); cumulative
+    max_hours: float = 0.0  # cumulative wall-clock limit; 0 = none
     init_from: str | None = None  # checkpoint whose weights initialise the model (see init_mode)
-    # "adapt": new tasks (Kaggle adaptation): every puzzle-embedding row starts at the mean trained row, untrained.
-    # "continue": the same dataset (e.g. an imported TRM, scripts/import_trm.py): the table and its visit counts are
-    # kept; fork modules absent from the checkpoint (a K=0 source) keep their fresh initialisation.
+    # "adapt": new tasks, embedding rows start at the mean trained row. "continue": same dataset, table kept.
     init_mode: str = "adapt"
-    # A branch: with --resume auto and no RUN/last.pt yet, resume the full training state (weights, EMA, optimizer,
-    # step, compute, data streams, RNG, fork price) of this checkpoint, e.g. another run's stop_pflops checkpoint.
+    # With --resume auto and no RUN/last.pt: resume the full training state from this checkpoint.
     resume_from: str | None = None
     eval_every_pflops: float = 100.0
     log_every: int = 50
@@ -139,19 +120,17 @@ class TrainCfg:
 class EvalCfg:
     splits: list[str] = field(default_factory=lambda: ["dev", "dev_composite"])
     max_versions: int = 32
-    max_tasks: int = 256  # per split, deterministic hash-ordered subset (0 = all); ARC dev has ~140 tasks
+    max_tasks: int = 256  # per split, hash-ordered subset; 0 = all
     tokens_per_batch: int = 400_000
     max_rows: int = 2048
     rounds: int = 16
     child_vote_weight: float = 0.0
-    # Gated models: 0 = the gate's own decisions (logit > 0); rho > 0 = in every eval batch and round the top rho of
-    # rows by gate logit fork (an instrument: the fork value at a fixed rate, independent of the gate's calibration).
+    # Gated models: 0 = gate decides (logit > 0); rho > 0 = top rho of rows by gate logit fork per batch and round.
     fork_top: float = 0.0
     counterfactuals: bool = True
     cf_rows: int = 1024
     use_ema: bool = True
-    # Test-time noisy trajectories (PTRM): noise_samples - 1 extra runs per row with Gaussian noise of state_noise RMS
-    # units added to z between rounds; their predictions are extra voters (the clean run keeps the instruments).
+    # Test-time noisy runs: noise_samples - 1 extra voters with state_noise RMS Gaussian noise on z between rounds.
     noise_samples: int = 1
     state_noise: float = 0.0
 

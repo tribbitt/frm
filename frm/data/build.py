@@ -1,32 +1,24 @@
 """Build a dataset directory from ARC sources, composite JSON and ingested external pools.
 
     python -m frm.data.build --raw data/raw --sources arc1 [--composite c.json ...] \
-        [--external SOURCE=data/raw/external/POOL.npz ...] --out data/built/NAME
+        [--external SOURCE=POOL.npz ...] --out data/built/NAME
 
-Splits (DESIGN.md §3.4). The dev rule: the ``--dev_n`` tasks of the dev pool (``--dev_subset``, default ARC-AGI-1
-evaluation) with >= 3 demos, ordered by the md5 hex digest of the task id (tinyv2.2 / tinyabstractor's development
-tasks). ``arc1``: their test pairs -> dev, the other evaluation tasks' test pairs -> test, every training/concept test
-pair -> train. ``arc2``/``arc2-kaggle``: training2 tasks with a dev id -> their test pairs -> dev; evaluation2 test pairs
--> test (``arc2``); with ``--dev_subset evaluation2`` the dev tasks are evaluation2 tasks instead. Demos of every
-task are training data. External pools (``scripts/ingest_external.py``) are training pairs only; generator pools
-(RE-ARC, synth) are split into per-bucket sub-tasks ``{source}:{id}@{S}``, other tasks stay whole.
+Splits (DESIGN.md §3.4). dev = the ``--dev_n`` tasks of ``--dev_subset`` (default ARC-AGI-1 evaluation; e.g.
+``--dev_subset evaluation2 --dev_n 40``) with >= 3 demos, by md5(task id). Their test pairs -> dev, other held-out
+test pairs -> test, training/concept test pairs -> train; composite held-out pairs -> dev_composite. All demos train.
+External pools are training-only; generator pools split into per-bucket sub-tasks ``{source}:{id}@{S}``.
+``--versions_from`` reuses a TRM dataset's versions; ``--min_bucket[_sources]`` lifts buckets (30 = TRM canvas);
+``--exclude_ids`` fails the build if a listed task enters. Training data matching held-out test pairs/outputs is
+dropped (``frm.data.heldout``); external pools must have been filtered against every dev/test/excluded task.
 
-Content filter: ARC/ConceptARC training tasks and composite pairs are checked against the build's held-out set (dev
-and test tasks' test pairs and informative test outputs, up to dihedral transforms and colour relabelling,
-``frm.data.heldout``); a hit drops the ARC task whole, or the composite pair (and its task below 3 pairs).
-External pools were filtered at ingest against a superset: the build checks that their ``heldout_ids`` cover every
-dev and test task.
-
-Layout of ``out/`` (augmentation and translation happen in the loader, so each base grid is stored once):
+Layout of ``out/`` (augmentation and translation happen in the loader):
 
 - ``meta.json``, ``identifiers.json`` (id -> ``"{task}|||t{tid}|||{perm}"``, id 0 = ``"<blank>"``),
   ``versions_tid.npy`` uint8 [num_ids], ``versions_perm.npy`` uint8 [num_ids, 10],
-  ``test_tasks.json`` = {split: {task_id: {"train": demos, "test": [{"input", "output" | None}]}}} for eval splits.
-- ``b{S}/{split}/``: ``tasks.json`` (task ids), ``task_vstart``/``task_vcount`` int32 [T] (identifier range of the
-  task's versions, identity first), ``task_source`` uint8 [T] (``SOURCE_CODES``), ``task_ex_start`` int32 [T+1],
-  ``ex_index`` int16 [E] (pair index inside the task), ``inp``/``out`` uint8 [E, S, S] raw colours at top-left,
-  ``inp_hw``/``out_hw`` uint8 [E, 2] (``out_hw`` = 0 when the output is unknown), and when any pair has sub-goals
-  ``sub`` uint8 [E, M, S, S], ``sub_hw`` uint8 [E, M, 2] (0 = absent).
+  ``test_tasks.json`` = {split: {task_id: {"train", "test"}}} for eval splits.
+- ``b{S}/{split}/``: ``tasks.json``, ``task_vstart``/``task_vcount`` int32 [T], ``task_source`` uint8 [T],
+  ``task_ex_start`` int32 [T+1], ``ex_index`` int16 [E], ``inp``/``out`` uint8 [E, S, S] raw colours top-left,
+  ``inp_hw``/``out_hw`` uint8 [E, 2] (0 = unknown), optional ``sub`` uint8 [E, M, S, S], ``sub_hw`` uint8 [E, M, 2].
 """
 
 from __future__ import annotations
@@ -50,37 +42,36 @@ M = 3
 SOURCE_CODES = {"arc": 0, "composite": 1, "barc": 2, "rearc": 3, "synth": 4}
 SPLIT_ORDER = ("train", "dev", "dev_composite", "test")
 
-# source -> (subsets whose test pairs are training data except dev tasks, subsets whose test pairs are dev/test)
+# source -> (subsets whose test pairs train, except dev tasks; subsets whose test pairs are dev/test)
 ARC_SOURCES = {
     "arc1": (("training", "concept"), ("evaluation",)),
     "arc2": (("training2", "concept"), ("evaluation2",)),
     "arc2-kaggle": (("training2", "concept"), ()),
 }
-DEV_SUBSET = "evaluation"  # the dev rule's pool: ARC-AGI-1 evaluation
+DEV_SUBSET = "evaluation"
 DEV_MIN_DEMOS = 3
 MIN_PAIRS = 3
-GENERATOR_SOURCES = ("rearc", "synth")  # external tasks that are instances of a generator: split by bucket
+GENERATOR_SOURCES = ("rearc", "synth")  # split by bucket
 
 
 @dataclass
 class Record:
-    """One base task as it enters the dataset."""
+    """One base task."""
 
     task_id: str
     source: str  # a key of SOURCE_CODES
-    original: Task  # as loaded (test outputs possibly unknown)
-    train: list[dict]  # labelled training pairs (demos, plus test pairs when they are training data)
+    original: Task
+    train: list[dict]  # labelled training pairs
     eval_split: str | None = None
     eval_pairs: list[dict] = field(default_factory=list)
-    external: bool = False  # from an ingested pool (--external)
+    external: bool = False
     bucket: int = 0
     vstart: int = 0
     vcount: int = 0
 
 
 def dev_ids(raw: str, n: int, subset: str = DEV_SUBSET) -> list[str]:
-    """The ``n`` tasks of ``subset`` (default ARC-AGI-1 evaluation) with >= 3 demos with the smallest md5(task id) hex
-    digests, sorted."""
+    """The ``n`` tasks of ``subset`` with >= 3 demos and smallest md5(task id), sorted."""
     with open(os.path.join(raw, f"arc-agi_{subset}_challenges.json")) as f:
         tasks = json.load(f)
     ok = sorted((k for k, t in tasks.items() if len(t["train"]) >= DEV_MIN_DEMOS),
@@ -96,8 +87,7 @@ def _check_grid(grid: list[list[int]] | np.ndarray) -> np.ndarray:
 
 
 def arc_records(tasks: dict[str, Task], role: str, dev: set[str]) -> list[Record]:
-    """role "train": test pairs are training data unless the task is a dev task; role "test": test pairs are eval
-    pairs, of `dev` for dev tasks and of `test` otherwise."""
+    """role "train": test pairs train unless dev; role "test": test pairs are dev or test eval pairs."""
     recs = []
     for tid, t in tasks.items():
         if tid in dev:
@@ -123,7 +113,7 @@ def composite_records(path: str) -> list[Record]:
 
 
 def _bucket(rec: Record) -> int:
-    """Smallest bucket for demos (with their sub-goals), held-out inputs and the size rule; never held-out targets."""
+    """Smallest bucket for demos, sub-goals, held-out inputs and the size rule; never held-out targets."""
     S = choose_bucket({"train": rec.train, "test": [{"input": ex["input"]} for ex in rec.eval_pairs]})
     demo_sub = [g for ex in rec.train for g in ex.get("subgoals", [])]
     if demo_sub:
@@ -132,9 +122,7 @@ def _bucket(rec: Record) -> int:
 
 
 def bucket_groups(pairs: list[dict]) -> list[tuple[int, list[dict]]]:
-    """A generator task's pairs grouped by the smallest bucket fitting each pair, ascending, in their original order
-    inside a group. A group of fewer than MIN_PAIRS pairs merges into the next larger group (the largest into the one
-    below it); a group's bucket is the largest of its pairs'."""
+    """Generator pairs grouped by smallest fitting bucket; groups below MIN_PAIRS merge upward."""
     by: dict[int, list[dict]] = {}
     for ex in pairs:
         side = max(*np.shape(ex["input"]), *np.shape(ex["output"]))
@@ -155,10 +143,7 @@ def bucket_groups(pairs: list[dict]) -> list[tuple[int, list[dict]]]:
 
 
 def external_records(source: str, path: str, need: set[str]) -> list[Record]:
-    """An ingested pool (``scripts/ingest_external.py``): every pair a training pair. ``need``: the build's dev, test
-    and excluded task ids, which the pool's ``heldout_ids`` must cover. Generator tasks (``GENERATOR_SOURCES``: many
-    independent instances of one rule) are split into per-bucket sub-tasks ``{source}:{id}@{S}`` (``bucket_groups``),
-    so small instances do not pay for the generator's largest grid; other tasks stay whole."""
+    """An ingested pool: all pairs train; its ``heldout_ids`` must cover ``need``. Generator tasks split by bucket."""
     if source not in SOURCE_CODES:
         raise ValueError(f"--external {source}={path}: source must be one of {list(SOURCE_CODES)}")
     z = np.load(path, allow_pickle=False)
@@ -191,9 +176,7 @@ def _contaminated(held: HeldOut, ex: dict) -> bool:
 
 
 def content_filter(recs: list[Record]) -> tuple[list[Record], dict]:
-    """Drop ARC/ConceptARC training tasks with any pair, and composite pairs (and their tasks below MIN_PAIRS), that
-    match a dev or test task's test pair or informative test output (``frm.data.heldout``, outputs only: test
-    inputs are visible at inference; demos of dev/test tasks are training data by design)."""
+    """Drop ARC training tasks and composite pairs matching a dev/test test pair or informative test output."""
     held = HeldOut({r.task_id: {"train": [], "test": r.eval_pairs} for r in recs
                     if r.eval_split in ("dev", "test") and r.eval_pairs}, demos=False, inputs=False)
     kept: list[Record] = []
@@ -221,7 +204,7 @@ def content_filter(recs: list[Record]) -> tuple[list[Record], dict]:
 
 
 def collect(args: argparse.Namespace) -> tuple[list[Record], list[str], dict]:
-    """Records of every source, the dev rule's task ids and the content filter's report."""
+    """Records of every source, dev ids and the content filter's report."""
     recs: list[Record] = []
     dev = dev_ids(args.raw, args.dev_n, args.dev_subset) if any(s in ARC_SOURCES for s in args.sources) else []
     for src in args.sources:
@@ -233,7 +216,7 @@ def collect(args: argparse.Namespace) -> tuple[list[Record], list[str], dict]:
         train_subsets, test_subsets = ARC_SOURCES[src]
         for sub in train_subsets:
             recs += arc_records(load_subset(args.raw, sub), "train", set(dev))
-        for sub in test_subsets:  # the dev pool's tasks give dev pairs; every other held-out task gives test pairs
+        for sub in test_subsets:
             recs += arc_records(load_subset(args.raw, sub), "test", set(dev) if sub == args.dev_subset else set())
     for path in args.composite:
         recs += composite_records(path)
@@ -242,12 +225,11 @@ def collect(args: argparse.Namespace) -> tuple[list[Record], list[str], dict]:
     if args.exclude_ids:
         with open(args.exclude_ids) as f:
             exclude = set(json.load(f))
-    # external pools must have been filtered against every dev/test task and every excluded task
+    # external pools must cover every dev/test/excluded task
     need = {r.task_id for r in recs if r.eval_split in ("dev", "test") and r.eval_pairs} | exclude
     for source, path in args.external:
         recs += external_records(source, path, need)
-    # A training task dropped by the content filter is a copy of a held-out task's rule; its RE-ARC generator teaches the
-    # same rule with fresh instances that no pair-level filter can catch, so it goes too.
+    # RE-ARC generators of dropped (copied) training tasks go too
     copied = set(info["arc_tasks_dropped"])
     info["generator_tasks_dropped"] = sorted(r.task_id for r in recs if r.source in GENERATOR_SOURCES and _base_id(r) in copied)
     recs = [r for r in recs if not (r.source in GENERATOR_SOURCES and _base_id(r) in copied)]
@@ -264,7 +246,7 @@ def collect(args: argparse.Namespace) -> tuple[list[Record], list[str], dict]:
 
 
 def _base_id(r: Record) -> str:
-    """The task id without the build's ``{source}:`` prefix and generator ``@{S}`` suffix."""
+    """Task id without ``{source}:`` prefix and generator ``@{S}`` suffix."""
     tid = r.task_id.removeprefix(f"{r.source}:")
     return tid.rsplit("@", 1)[0] if r.source in GENERATOR_SOURCES else tid
 
@@ -296,7 +278,7 @@ def _write_split(path: str, S: int, recs: list[Record], pairs_of, overflow: list
                 if split == "train":
                     raise AssertionError(f"train grid of {r.task_id} overflows its bucket {S}")
                 overflow.append([split, r.task_id, int(i), *g.shape, S])
-                g = g[:S, :S]  # canvas cannot hold it: stored as a full-canvas crop without EOS (always wrong)
+                g = g[:S, :S]  # cropped without EOS (always wrong)
             out[e, : g.shape[0], : g.shape[1]] = g
             out_hw[e] = g.shape
         for m, sg in enumerate(ex.get("subgoals", [])):
@@ -329,9 +311,7 @@ def _write_split(path: str, S: int, recs: list[Record], pairs_of, overflow: list
 
 
 def trm_versions(path: str) -> dict[str, list[Version]]:
-    """Version table of a TRM dataset's ``identifiers.json`` (``"<blank>"``, then per task its plain id = identity,
-    followed by ``"task|||t{tid}|||{perm}"``; frm's names use the same dihedral numbering and colour-permutation
-    semantics, ``augment.Version``). Reusing it lets an imported TRM checkpoint keep every trained embedding row."""
+    """Version table from a TRM ``identifiers.json`` (same naming), so imported embedding rows carry over."""
     with open(path) as f:
         names = json.load(f)
     table: dict[str, list[Version]] = {}
@@ -471,21 +451,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help=f"ingested pool npz (scripts/ingest_external.py); SOURCE in {list(SOURCE_CODES)}")
     ap.add_argument("--n_aug_external", type=int, default=8)
     ap.add_argument("--dev_n", type=int, default=100,
-                    help="dev = this many tasks of --dev_subset with >= 3 demos, by md5 of the task id")
+                    help="dev = this many --dev_subset tasks with >= 3 demos")
     ap.add_argument("--dev_subset", default=DEV_SUBSET, choices=("evaluation", "evaluation2"),
-                    help="the dev pool: ARC-AGI-1 evaluation (default) or ARC-AGI-2 evaluation, for models whose "
-                    "pretraining saw ARC-AGI-2 training test outputs (an imported arc_v2_public TRM); the rest of the "
-                    "pool's tasks give test pairs")
-    ap.add_argument("--exclude_ids", help="JSON list of task ids that must not enter the build through any source "
-                    "(e.g. data/raw/adev_ids.json, scripts/make_adapt_dev.py): the build fails if one would")
-    ap.add_argument("--versions_from", help="a TRM dataset's identifiers.json: ARC/ConceptARC tasks listed there get "
-                    "exactly its versions (in its order), so an imported TRM checkpoint's embedding rows carry over "
-                    "(scripts/import_trm.py); other tasks get --n_aug random versions")
+                    help="dev pool; the rest of its tasks give test pairs")
+    ap.add_argument("--exclude_ids", help="JSON list of task ids (e.g. adaptation-dev ids) that must not enter")
+    ap.add_argument("--versions_from", help="TRM identifiers.json whose versions ARC tasks reuse")
     ap.add_argument("--min_bucket", type=int, default=0,
-                    help="place tasks in a bucket of at least this size (30 = TRM's single 30x30 canvas)")
+                    help="minimum bucket size (30 = TRM canvas)")
     ap.add_argument("--min_bucket_sources", nargs="*", default=[], choices=list(SOURCE_CODES),
-                    help="sources --min_bucket applies to (default: all); e.g. arc keeps an imported TRM on its "
-                    "native canvas while the new sources stay bucketed")
+                    help="sources --min_bucket applies to (default: all)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
     if not args.sources and not args.composite and not args.external:
