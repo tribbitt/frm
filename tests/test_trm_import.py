@@ -1,5 +1,4 @@
-"""Importing a TRM checkpoint: TRM's 1-D RoPE geometry, the identifier-aligned embedding transfer, TRM's version
-table in the build, and warm starts that keep the table and give a K>0 model fresh fork modules."""
+"""Importing a TRM checkpoint: 1-D RoPE geometry, identifier-aligned embedding transfer, warm starts."""
 
 import json
 import os
@@ -20,7 +19,7 @@ from import_trm import DENSE, PREFIX, convert  # noqa: E402
 
 
 def trm_rotary(dim: int, positions: int, base: float = 10000.0):
-    """Independent restatement of trm-samsung/models/layers.py RotaryEmbedding."""
+    """Independent restatement of TRM `models/layers.py` RotaryEmbedding."""
     inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     freqs = torch.outer(torch.arange(positions, dtype=torch.float32), inv_freq)
     emb = torch.cat((freqs, freqs), dim=-1)

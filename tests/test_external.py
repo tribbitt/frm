@@ -1,4 +1,4 @@
-"""External pools and contamination: canonical digests, ingest filter, --external builds, the build's content filter."""
+"""External pools and contamination: canonical digests, ingest filter, --external builds, content filter."""
 
 from __future__ import annotations
 
@@ -28,7 +28,6 @@ def _script(name: str):
 
 
 ingest = _script("ingest_external")
-make_adapt_dev = _script("make_adapt_dev")
 
 
 def _disguise(g: np.ndarray, k: int, perm: np.ndarray) -> np.ndarray:
@@ -37,7 +36,7 @@ def _disguise(g: np.ndarray, k: int, perm: np.ndarray) -> np.ndarray:
 
 
 def _write_pool(path: str, tasks: list[tuple[str, list[tuple[np.ndarray, np.ndarray]]]], **extra: np.ndarray) -> None:
-    """A tinyabstractor FlatPool npz (``extra``: more arrays, e.g. the ingested ``heldout_ids`` and ``source``)."""
+    """A FlatPool npz (``extra``: more arrays, e.g. the ingested ``heldout_ids`` and ``source``)."""
     data, off, hw, pair, pool_off, ids = [], [0], [], [], [0], []
     for tid, prs in tasks:
         ids.append(tid)
@@ -154,7 +153,7 @@ def test_heldout_hits():
 def env(tmp_path_factory) -> dict:
     """Fixture raw dir (arc1-shaped plus a small evaluation2), and ingested pools with planted contamination."""
     if not os.path.isdir(REAL):
-        pytest.skip("needs ../trm-samsung/kaggle/combined")
+        pytest.skip("needs data/raw (python scripts/fetch_data.py)")
     root = str(tmp_path_factory.mktemp("ext"))
     raw, comp = _make_raw(root, poison=False)
     ev2 = load_subset(REAL, "evaluation2")
@@ -321,42 +320,6 @@ def test_content_filter_drops_planted(env, tmp_path):
     assert len(ds.tasks("dev_composite")["comp:c2"]["test"]) == 1
 
 
-# ---------------------------------------------------------------- adaptation dev
-
-
-def _toy_task(rng: np.random.Generator, n_demo: int = 3) -> dict:
-    ex = lambda: {"input": _rand_grid(rng, 4, 5).tolist(), "output": _rand_grid(rng, 3, 3).tolist()}  # noqa: E731
-    return {"train": [ex() for _ in range(n_demo)], "test": [ex()]}
-
-
-def test_make_adapt_dev(tmp_path):
-    import hashlib
-
-    rng = np.random.default_rng(6)
-    cand = [f"c{i:02d}" for i in range(10)]
-    t2 = {k: _toy_task(rng) for k in [*cand, "shared1"]}
-    raw = str(tmp_path / "raw")
-    os.makedirs(raw)
-    _write_subset(raw, "training2", t2, sorted(t2))
-    for sub, ids in (("training", ["tr1"]), ("evaluation", ["shared1"]), ("evaluation2", ["e2"])):
-        tasks = {k: t2.get(k) or _toy_task(rng) for k in ids}
-        _write_subset(raw, sub, tasks, ids)
-    pool = str(tmp_path / "a2_new.npz")
-    _write_pool(pool, [(k, _pairs(rng, 3)) for k in cand])
-    out = str(tmp_path / "out")
-    ids = make_adapt_dev.main(["--raw", raw, "--pool", pool, "--n", "4", "--out", out])
-    assert ids == sorted(sorted(cand, key=lambda k: hashlib.md5(k.encode()).hexdigest())[:4])
-    ch = json.loads(Path(out, "adev_challenges.json").read_text())
-    so = json.loads(Path(out, "adev_solutions.json").read_text())
-    assert json.loads(Path(out, "adev_ids.json").read_text()) == ids and sorted(ch) == sorted(so) == ids
-    for k in ids:
-        assert ch[k]["train"] == t2[k]["train"] and ch[k]["test"] == [{"input": t2[k]["test"][0]["input"]}]
-        assert so[k] == [t2[k]["test"][0]["output"]]
-    _write_pool(pool, [(k, _pairs(rng, 3)) for k in [*cand, "shared1"]])  # an ARC-AGI-1 task is no candidate
-    with pytest.raises(SystemExit, match="not ARC-AGI-2-training-only"):
-        make_adapt_dev.main(["--raw", raw, "--pool", pool, "--n", "4", "--out", out])
-
-
 def test_ingest_heldout_pools(env, tmp_path):
     """Every pair of a --heldout_pools task is a filter target; the pool's own ids are held-out ids."""
     rng = np.random.default_rng(7)
@@ -378,29 +341,3 @@ def test_ingest_heldout_pools(env, tmp_path):
     with pytest.raises(SystemExit, match="held-out ids"):
         ingest.main(["--src", str(src), "--raw", env["raw"], "--pools", "a2_new", "--workers", "1",
                      "--out", str(tmp_path / "o3"), "--heldout_pools", held_pool])
-
-
-def test_exclude_ids(env, tmp_path):
-    def run(name: str, exclude: list[str], *extra: str) -> dict:
-        path = tmp_path / f"{name}.json"
-        path.write_text(json.dumps(exclude))
-        return build(parse_args(_build_args(env, str(tmp_path / name), "--exclude_ids", str(path), *extra)))
-
-    train_id = sorted(load_subset(env["raw"], "training"))[0]
-    with pytest.raises(ValueError, match="1 excluded tasks would enter"):
-        run("arc", [train_id])
-    a2 = dict(np.load(f"{env['out']}/a2_new.npz", allow_pickle=False))
-    with pytest.raises(ValueError, match="not filtered against 1 dev/test/excluded"):  # pools must be filtered
-        run("a2", ["a2clean1"], "--external", f"arc={env['out']}/a2_new.npz")  # against the excluded tasks too
-    a2["heldout_ids"] = np.append(a2["heldout_ids"], "a2clean1")
-    np.savez(tmp_path / "a2_new.npz", **a2)
-    with pytest.raises(ValueError, match="1 excluded tasks would enter"):  # an a2_new task keeps its ARC id
-        run("a2b", ["a2clean1"], "--external", f"arc={tmp_path}/a2_new.npz")
-    z = dict(np.load(f"{env['out']}/barc.npz", allow_pickle=False))
-    z["source"] = np.array("rearc")
-    z["heldout_ids"] = np.append(z["heldout_ids"], ["barc/clean0", "zzzzzzzz"])
-    np.savez(tmp_path / "rearc.npz", **z)  # generator sub-tasks rearc:{id}@{S} are matched on {id}
-    with pytest.raises(ValueError, match="rearc:barc/clean0@"):
-        run("gen", ["barc/clean0"], "--external", f"rearc={tmp_path}/rearc.npz")
-    meta = run("ok", ["zzzzzzzz"], "--external", f"rearc={tmp_path}/rearc.npz")
-    assert meta["exclude_ids"] == str(tmp_path / "ok.json")

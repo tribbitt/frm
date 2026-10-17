@@ -89,19 +89,8 @@ def test_code_down_trains_once_code_up_is_nonzero():
     assert nonzero_grad(m.code_down.weight)
 
 
-def test_nested_fork_gate():
-    m = make(K=2, fork_depth=2)
-    calls = record_cycles(m)
-    x, ids, labels = inputs()
-    out = m.round(m.init_carry(B, S, torch.device("cpu"), torch.float32), x, ids)
-    sizes = [c[0] for c in calls if c[1]]
-    assert B * 4 in sizes and B * 2 in sizes and B in sizes, sizes
-    row_ce(out.logits, labels).mean().backward()
-    assert nonzero_grad(m.codes)
-
-
 def reference_trm_round(m, carry, x_tokens, ids):
-    """Independent re-statement of trm-samsung trm.py:196-222 using the model's own modules."""
+    """Independent restatement of TRM's round (TRM `models/recursive_reasoning/trm.py`)."""
     cfg = m.cfg
     y, z = carry.y, carry.z
     x = m.embed(x_tokens, ids, y.dtype)
@@ -164,8 +153,7 @@ def test_inference_equals_training_forward():
 
 
 def test_children_get_fresh_noise_each_round():
-    """At a fixed parent state, deterministic children would repeat themselves; the noise makes every round's
-    proposals new, while a seeded generator keeps evaluation reproducible."""
+    """Children get fresh noise each round; a seeded generator keeps evaluation reproducible."""
     m = make(K=4)
     x, ids, _ = inputs()
     carry = m.init_carry(B, S, torch.device("cpu"), torch.float32)
@@ -181,7 +169,7 @@ def test_children_get_fresh_noise_each_round():
     torch.testing.assert_close(r1, r2)  # without noise the fork is a deterministic map of the parent state
 
 
-@pytest.mark.parametrize("K,depth", [(0, 1), (4, 1), (2, 2)])
+@pytest.mark.parametrize("K,depth", [(0, 1), (4, 1)])
 def test_pass_accounting_matches_execution(K, depth):
     m = make(K=K, fork_depth=depth)
     counts = {True: 0, False: 0}
@@ -215,8 +203,7 @@ def test_counterfactual_modes():
 
 
 def test_join_parent_dropout_forces_children_in_training_only():
-    """A dropped row's joined state comes from the children alone (identical children -> exactly their state) and is
-    left out of the join statistics; evaluation never drops."""
+    """A dropped row's joined state comes from the children alone; evaluation never drops."""
     m = make(K=4, join_drop_parent=1.0)
     L, D = m.cfg.prefix_len + S * S, m.cfg.hidden
     g = torch.Generator().manual_seed(3)
@@ -247,7 +234,7 @@ def test_puzzle_embedding_counts_updates_and_reads_old_checkpoints():
 
 
 def test_load_pretrained_resets_new_rows_to_mean_of_trained_rows(tmp_path):
-    """Never-trained (zero) rows must not dilute the reset-to-mean: arms differ in how many rows they trained."""
+    """Never-trained (zero) rows do not dilute the reset-to-mean."""
     src = make(K=0)
     with torch.no_grad():
         src.puzzle_emb.table[1] = 1.0

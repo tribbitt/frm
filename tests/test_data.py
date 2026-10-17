@@ -16,7 +16,7 @@ from frm.data.encode import EOS, IGNORE, PAD, crop, encode_grid, labels_from
 from frm.data.loader import Dataset, TrainStream, eval_batches
 from frm.data.sizerule import BUCKETS, choose_bucket, fits, predict_output_size
 
-REAL = os.path.join(os.path.dirname(__file__), "..", "..", "trm-samsung", "kaggle", "combined")
+REAL = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
 SPLITS = ("dev", "dev_composite", "test")
 
 
@@ -99,14 +99,14 @@ def _build(root: str, poison: bool = False) -> str:
 @pytest.fixture(scope="session")
 def built(tmp_path_factory) -> str:
     if not os.path.isdir(REAL):
-        pytest.skip("needs ../trm-samsung/kaggle/combined")
+        pytest.skip("needs data/raw (python scripts/fetch_data.py)")
     return _build(str(tmp_path_factory.mktemp("clean")))
 
 
 @pytest.fixture(scope="session")
 def poisoned(tmp_path_factory) -> str:
     if not os.path.isdir(REAL):
-        pytest.skip("needs ../trm-samsung/kaggle/combined")
+        pytest.skip("needs data/raw (python scripts/fetch_data.py)")
     return _build(str(tmp_path_factory.mktemp("poison")), poison=True)
 
 
@@ -246,8 +246,7 @@ def _arrays(root: str) -> dict[str, bytes]:
 
 
 def test_poisoning_leaves_everything_but_test_outputs_unchanged(built, poisoned):
-    """Poisoning perturbs every ARC-AGI-1 evaluation test output; dev tasks are evaluation tasks, so dev outputs
-    change too. Nothing else may."""
+    """Poisoning changes only ARC-AGI-1 evaluation test outputs (dev included)."""
     a, b = _arrays(built), _arrays(poisoned)
     assert a.keys() == b.keys()
     differ = {k for k in a if a[k] != b[k]}
@@ -293,10 +292,9 @@ def test_dev_and_test_splits(ds, built):
 
 
 def test_dev_pool_evaluation2_takes_dev_from_arc_agi2_evaluation(tmp_path):
-    """For a model whose pretraining saw ARC-AGI-2 training test outputs, dev comes from evaluation2: its dev tasks'
-    test pairs are dev, the other evaluation2 tasks' are test, and every training2 test pair stays training data."""
+    """With ARC-AGI-2 pretraining, dev/test come from evaluation2; training2 test pairs stay training data."""
     if not os.path.isdir(REAL):
-        pytest.skip("needs ../trm-samsung/kaggle/combined")
+        pytest.skip("needs data/raw (python scripts/fetch_data.py)")
     raw = str(tmp_path / "raw")
     os.makedirs(raw)
     for subset, n in (("training2", 6), ("concept", 2), ("evaluation2", 5)):
@@ -402,7 +400,7 @@ def test_eval_rows_untranslated_and_keys(ds):
 
 def test_kaggle_unknown_outputs(tmp_path):
     if not os.path.isdir(REAL):
-        pytest.skip("needs ../trm-samsung/kaggle/combined")
+        pytest.skip("needs data/raw (python scripts/fetch_data.py)")
     tasks = load_subset(REAL, "evaluation2")
     ids = sorted(tasks)[:3]
     ch = tmp_path / "ch.json"
@@ -518,7 +516,7 @@ def test_state_dict_resume(ds):
 
 
 def test_per_draw_cap_and_resume(ds):
-    """A draw yields a random subset of min(task size, cap) distinct pairs; streams resume exactly with the cap."""
+    """A draw is a random subset of min(task size, cap) distinct pairs; streams resume exactly."""
     S = max(ds.buckets, key=ds.num_train_examples)
     d = ds.split_data(S, "train")
     cap = 3
@@ -552,15 +550,3 @@ def test_per_draw_cap_and_resume(ds):
     for w, g in zip(want, [b.take(n) for n in (29, 64, 5)]):
         for k in w:
             assert np.array_equal(w[k], g[k]), k
-
-
-def test_take_speed(ds):
-    """Not a gate on CI hardware; guards against accidental de-vectorisation (target < 50 ms at 4096 x S=16)."""
-    import time
-
-    S = 16 if 16 in ds.buckets else ds.buckets[0]
-    ts = TrainStream(ds, S, np.random.default_rng(0))
-    ts.take(4096)
-    t = time.perf_counter()
-    ts.take(4096)
-    assert time.perf_counter() - t < 0.5

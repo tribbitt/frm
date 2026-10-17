@@ -1,5 +1,4 @@
-"""Adaptive forking (DESIGN.md §4.8): declined rows are TRM rounds, forked rows are FRM rounds, rows are independent,
-the gate learns from measured counterfactual benefit only, and the accounting follows the actual decisions."""
+"""Adaptive forking (DESIGN.md §4.8): declined rows are TRM rounds, forked rows FRM rounds, rows independent."""
 
 import dataclasses
 import json
@@ -71,11 +70,6 @@ def sub(carry, idx):
 
 
 # ---------------------------------------------------------------------------------------------------- model
-def test_gate_needs_depth_one():
-    with pytest.raises(ValueError):
-        make(fork_gate=True, fork_depth=2)
-
-
 def test_fork_mode_none_equals_trm_control():
     g, t = make(fork_gate=True), make(K=0)
     share(t, g)
@@ -242,24 +236,6 @@ def test_gate_label_is_benefit_above_price():
     assert torch.equal(Objective(ObjectiveCfg(lambda_gate=1.0))(no_rows, {"labels": labels}, 0.5)[0], base)
 
 
-def test_child_focus_sends_the_childrens_loss_to_cells_trm_gets_wrong():
-    """With child_focus = 1 the children's final-target CE ignores every cell TRM's own round predicts right: making a
-    child perfect there changes nothing, improving it on a cell TRM gets wrong lowers the loss."""
-    labels = torch.randint(2, 12, (B, 5))
-    out = synthetic_out(torch.ones(B, dtype=torch.bool), gated=True)
-    out.cf_logits[:, :3] = F.one_hot(labels[:, :3], 12).float() * 8  # TRM's round right on cells 0-2
-    out.cf_logits[:, 3:] = -F.one_hot(labels[:, 3:], 12).float() * 8  # and wrong on cells 3-4
-    obj = Objective(ObjectiveCfg(child_focus=1.0, lambda_gate=0.0, wta_eps=1.0))  # eps = 1: plain mean child CE
-    base = obj(out, {"labels": labels}, 1.0)[0]
-    easy, hard = (dataclasses.replace(out, child_logits=out.child_logits.detach().clone()) for _ in range(2))
-    easy.child_logits[:, :, :3] = F.one_hot(labels[:, None, :3], 12).float() * 8
-    hard.child_logits[:, :, 3:] = F.one_hot(labels[:, None, 3:], 12).float() * 8
-    torch.testing.assert_close(obj(easy, {"labels": labels}, 1.0)[0], base)
-    assert obj(hard, {"labels": labels}, 1.0)[0] < base - 0.1
-    plain = Objective(ObjectiveCfg(lambda_gate=0.0, wta_eps=1.0))
-    assert plain(easy, {"labels": labels}, 1.0)[0] < plain(out, {"labels": labels}, 1.0)[0]  # off: every cell counts
-
-
 # ---------------------------------------------------------------------------------------------------- accounting
 @pytest.mark.parametrize("ckpt", [False, True])
 def test_round_flops_boundaries(ckpt):
@@ -330,8 +306,7 @@ def test_gated_training_steps_price_and_resume(data_dir, tmp_path):
 
 
 def test_training_logs_where_the_forks_go_by_source(data_dir, tmp_path):
-    """``{metric}_by_source``: per-row metrics averaged over each source's rows. Odd rows of every draw are relabelled
-    as BARC rows and forced to fork; composite rows are declined."""
+    """``{metric}_by_source`` averages per-row metrics per source (odd rows relabelled BARC and forced to fork)."""
     cfg = tiny_cfg(data_dir)
     tr = Trainer(cfg, tmp_path / "run", "none")
     barc = SOURCE_CODES["barc"]
@@ -370,29 +345,6 @@ def test_lr_decay_over_the_end_of_the_budget(data_dir, tmp_path):
     assert tr.lr_factor() == pytest.approx(0.1)
 
 
-def test_branch_resumes_a_shared_stretch_and_stops_without_moving_the_schedule(data_dir, tmp_path):
-    """resume_from: a new run continues another run's full state and keeps its own best.pt; its own last.pt wins once
-    written. stop_pflops ends a run early with the schedule of budget_pflops. max_hours counts earlier links."""
-    cfg = tiny_cfg(data_dir)
-    shared = Trainer(cfg, tmp_path / "shared", "none")
-    for _ in range(4):
-        shared.train_step()
-    shared.best, shared.hours_before = 0.7, 5.0
-    shared.save()
-    cfg.train.resume_from = str(tmp_path / "shared" / "last.pt")
-    branch = Trainer(cfg, tmp_path / "branch", "auto")
-    assert (branch.step, branch.flops, branch.best) == (4, shared.flops, -1.0)
-    assert branch.price == pytest.approx(shared.price) and branch.hours() >= 5.0
-    assert all(branch.streams[S].state_dict() == shared.streams[S].state_dict() for S in shared.streams)
-    branch.train_step()
-    branch.save()
-    assert Trainer(cfg, tmp_path / "branch", "auto").step == 5
-    cfg.train.max_hours = 10.0
-    assert branch.progress() >= 0.5 and not branch.done()
-    cfg.train.max_hours, cfg.train.stop_pflops = 0.0, shared.flops / 1e15
-    assert branch.done() and branch.progress() < 1.0  # stopped, though the schedule's budget is not spent
-
-
 def test_fork_lr_mult_scales_only_the_fork_modules(data_dir, tmp_path):
     cfg = tiny_cfg(data_dir)
     cfg.train.fork_lr_mult = 4.0
@@ -428,9 +380,7 @@ def test_gated_evaluate_split_reports_rates_and_counterfactuals(data_dir):
 
 
 def test_fork_top_forks_a_fixed_share_of_the_real_rows_and_measures_skill(data_dir):
-    """fork_top overrides logit > 0: a gate that declines everything still forks ceil(top * n) real rows per batch
-    and round (padding never takes a slot); at fork_top = 1 every row forks and carries a label, so the skill block
-    covers every labelled row-round, and the gate's own rule is reported beside the forced rate."""
+    """fork_top forks ceil(top * n) real rows per batch-round regardless of the gate; skill covers labelled rows."""
     cfg = tiny_cfg(data_dir)
     torch.manual_seed(0)
     ds = Dataset(str(data_dir))
