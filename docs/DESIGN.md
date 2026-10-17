@@ -408,26 +408,35 @@ forks (TRM-continued 0.252, CI ∋ 0).
 
 ## 5. Objective (summary — derivation in `OBJECTIVE.md`)
 
-Per round, per row (mean over rows); written out symbol by symbol in `OBJECTIVE.md` §3.0:
+Per round, per row $b$, averaged over the step's rows. Every symbol, the code behind each term and what each term
+does in the running final are in `OBJECTIVE.md` §3.
 
-```
-L = CE(parent, y*)                                                      # deep supervision on the post-join readout
-  + λ_wta · [(1−ε) · Σ_π w_π · c_π  +  ε · mean_k CE(child_k, y*)]       # children: annealed one-to-one set matching
-  + λ_q   · [BCE(q_parent, exact_parent) + mean_k BCE(q_k, exact_k)]     # stop / score heads
+$$
+\mathcal{L}_b \;=\; \mathrm{CE}(\hat y_b, y_b) \;+\; \lambda_q\,\mathrm{BCE}(q_b, e_b)
+\;+\; f_b\Big[\lambda_{\mathrm{wta}}\Big((1-\varepsilon)\sum_{\pi} w_{b\pi}\,c_{b\pi} + \frac{\varepsilon}{K}\sum_{k=1}^{K}\mathrm{CE}(\hat y_{bk}, y_b)\Big)
+\;+\; \frac{\lambda_q}{K}\sum_{k=1}^{K}\mathrm{BCE}(q_{bk}, e_{bk})\Big]
+$$
 
-c_π = CE(child_π(final), y*) + (λ_sub/λ_wta) · mean_{t matched} CE(child_π(t), g_t)    # g_t: composite intermediates
-w   = softmax_π(−c / τ) over one-to-one assignments of {y*} ∪ intermediates to distinct children, no gradient
-```
+$$
+c_{b\pi} \;=\; \mathrm{CE}\big(\hat y_{b,\pi(\star)}, y_b\big) + \frac{\lambda_{\mathrm{sub}}}{\lambda_{\mathrm{wta}}}\,\frac{1}{\lvert T_\pi\rvert}\sum_{t\in T_\pi}\mathrm{CE}\big(\hat y_{b,\pi(t)}, g_{bt}\big),
+\qquad
+w_{b\pi} \;=\; \operatorname{softmax}_\pi\big(-\operatorname{sg}(c_{b\pi})/\tau\big)
+$$
 
-With `fork_gate` the children's terms apply to the rows that forked (a declined row's loss is exactly the K = 0
-loss) and the gate adds `λ_gate · mean_{label rows} BCE(g, [CE(no-fork continuation) − CE(parent) > price])`
-(`OBJECTIVE.md` §3.6).
+$\hat y_b$ is the parent's readout after the fork, the join and the post-join cycle, so its gradient reaches the
+children. $w$ is a soft-min, without gradient, over one-to-one assignments $\pi$ of the final answer $\star$ and the
+composite intermediates $g_{bt}$ to distinct children. $f_b = 1$ if row $b$ forked, so a declined row's loss is exactly
+the $K = 0$ loss. With `fork_gate` the gate adds
+$\lambda_{\mathrm{gate}}\,\frac{1}{\lvert G\rvert}\sum_{b\in G}\mathrm{BCE}\big(\gamma_b,\,\mathbb{1}[\mathrm{CE}(\tilde y_b, y_b) - \mathrm{CE}(\hat y_b, y_b) > p]\big)$
+over its label rows $G$, with $\tilde y_b$ TRM's own round from the same pre-fork state (`OBJECTIVE.md` §3.6).
 
-CE is TRM's stablemax cross-entropy, token-mean per row over non-PAD labels. Defaults: λ_wta = 0.5, λ_sub = 0.5,
-λ_q = 0.5, ε = 0.05, τ annealed log-linearly 1.0 → 0.02 over the first 30% of the budget, λ_gate = 0.1, price 0.
-Plain rows (no intermediates) reduce to annealed relaxed winner-takes-all. Uniform weight per round (no discounting).
-No term rewards a difference between two model-controlled quantities: the gate's label is such a difference, but it is
-detached and trains only the gate, which cannot change either quantity.
+CE is TRM's stablemax cross-entropy, a token mean per row over non-PAD labels. Defaults:
+$\lambda_{\mathrm{wta}} = \lambda_{\mathrm{sub}} = \lambda_q = 0.5$, $\varepsilon = 0.05$, $\tau$ annealed log-linearly $1 \to 0.02$ over the first
+`tau_anneal_frac` of the budget (0.3; the ARC-AGI-2 final: its first 4,800 PF), $\lambda_{\mathrm{gate}} = 0.1$, price
+0 (the final moves it to hold a 0.4 fork rate). Plain rows (no intermediates) reduce to annealed relaxed
+winner-takes-all. Uniform weight per round (no discounting). No term rewards a difference between two
+model-controlled quantities: the gate's label is such a difference, but it is detached and trains only the gate, which
+cannot change either quantity.
 
 ---
 

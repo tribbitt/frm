@@ -110,82 +110,142 @@ training was the only neural lever with measured gains in the lineage [M: frmv1 
 
 ### 3.0 Written out
 
-For a step on bucket S (B rows, the carry of each row at its own round r_b; one optimizer step per round, carry detached
-between rounds, as in TRM), the loss is the mean over rows:
+One optimizer step runs one round on the $B$ rows of one canvas bucket. Every row is at its own round
+$r_b \in \lbrace 1, \dots, 16 \rbrace$, and its carry $(y, z)$ comes from the previous round with the gradient cut (TRM's
+online deep supervision). The step's loss is
 
 $$
-\mathcal{L} \;=\; \frac{1}{B}\sum_{b=1}^{B}\Big[\;
+\mathcal{L} \;=\; \frac{1}{B}\sum_{b=1}^{B} \mathcal{L}_b \;+\; \lambda_{\mathrm{gate}}\,\mathcal{L}_{\mathrm{gate}}
+$$
+
+with, for row $b$,
+
+$$
+\mathcal{L}_b \;=\;
 \underbrace{\mathrm{CE}(\hat y_b, y_b)}_{\text{(1) parent}}
-\;+\;\underbrace{\lambda_{\mathrm{wta}}\Big((1-\varepsilon)\sum_{\pi\in\Pi_b} w_{b\pi}\,c_{b\pi}
-\;+\;\frac{\varepsilon}{K}\sum_{k=1}^{K}\mathrm{CE}(\hat y_{bk}, y_b)\Big)}_{\text{(2) children: annealed set matching}}
-\;+\;\underbrace{\lambda_q\Big(\mathrm{BCE}(q_b, e_b) + \frac{1}{K}\sum_{k=1}^{K}\mathrm{BCE}(q_{bk}, e_{bk})\Big)}_{\text{(3) stop / score heads}}
-\;\Big]
+\;+\; \lambda_q\,\underbrace{\mathrm{BCE}(q_b, e_b)}_{\text{(3) halting}}
+\;+\; f_b \Big[\,
+\underbrace{\lambda_{\mathrm{wta}}\Big((1-\varepsilon)\sum_{\pi\in\Pi_b} w_{b\pi}\,c_{b\pi}
+\;+\; \frac{\varepsilon}{K}\sum_{k=1}^{K}\mathrm{CE}(\hat y_{bk}, y_b)\Big)}_{\text{(2) children: annealed set matching}}
+\;+\; \underbrace{\frac{\lambda_q}{K}\sum_{k=1}^{K}\mathrm{BCE}(q_{bk}, e_{bk})}_{\text{(3) children's score heads}}
+\,\Big],
 $$
 
-with, for an assignment π (a one-to-one map of row b's targets onto distinct children),
+the cost and weight of an assignment $\pi$ (a one-to-one map of row $b$'s targets onto distinct children)
 
 $$
-c_{b\pi} \;=\; \mathrm{CE}\big(\hat y_{b,\pi(\star)},\, y_b\big) \;+\; \frac{\lambda_{\mathrm{sub}}}{\lambda_{\mathrm{wta}}}
-\cdot\frac{1}{|T_\pi|}\sum_{t\in T_\pi}\mathrm{CE}\big(\hat y_{b,\pi(t)},\, g_{bt}\big),
+c_{b\pi} \;=\; \mathrm{CE}\big(\hat y_{b,\pi(\star)},\, y_b\big)
+\;+\; \frac{\lambda_{\mathrm{sub}}}{\lambda_{\mathrm{wta}}}\,\frac{1}{\lvert T_\pi\rvert}\sum_{t\in T_\pi}\mathrm{CE}\big(\hat y_{b,\pi(t)},\, g_{bt}\big),
 \qquad
-w_{b\pi} \;=\; \frac{\exp(-c_{b\pi}/\tau)}{\sum_{\pi'\in\Pi_b}\exp(-c_{b\pi'}/\tau)}\quad(\text{no gradient})
+w_{b\pi} \;=\; \frac{\exp\big(-\operatorname{sg}(c_{b\pi})/\tau\big)}{\sum_{\pi'\in\Pi_b}\exp\big(-\operatorname{sg}(c_{b\pi'})/\tau\big)}
+$$
+
+(the intermediate part is 0 when $T_\pi = \varnothing$, i.e. on every plain row), and the gate's term (4)
+
+$$
+\mathcal{L}_{\mathrm{gate}} \;=\; \frac{1}{\lvert G\rvert}\sum_{b\in G}
+\mathrm{BCE}\Big(\gamma_b,\; \mathbb{1}\big[\,\mathrm{CE}(\tilde y_b, y_b) - \mathrm{CE}(\hat y_b, y_b) > p\,\big]\Big)
+\qquad (0 \text{ if } G = \varnothing).
+$$
+
+CE is TRM's stablemax cross-entropy, a token mean over the row's supervised positions $V$ (colour and EOS cells of the
+target; PAD cells are ignored), with 12 classes:
+
+$$
+\mathrm{CE}(\hat y, y) \;=\; -\frac{1}{\lvert V\rvert}\sum_{i\in V}\log\frac{s(\hat y_{i,y_i})}{\sum_{c=1}^{12} s(\hat y_{i,c})},
+\qquad
+s(x) \;=\; \begin{cases} x + 1 & x \ge 0 \\[2pt] \dfrac{1}{1 - x} & x < 0. \end{cases}
+$$
+
+The temperature falls log-linearly with the run's progress $u$ (the largest of the spent fractions of the compute,
+step and hour budgets) and then stays at its end value:
+
+$$
+\tau(u) \;=\; \tau_0\,\Big(\frac{\tau_1}{\tau_0}\Big)^{\min(1,\; u/u_\tau)} .
 $$
 
 Symbols:
 
 | symbol | meaning |
 |---|---|
-| y_b | the row's target canvas (colour tokens + EOS border; PAD ignored) |
-| ŷ_b | parent readout after fork → join → post-join cycle; ŷ_bk: child k's readout after its cycle |
-| CE(ŷ, y) | TRM stablemax cross-entropy, mean over the row's supervised tokens: −(1/N)Σ_i log s(ŷ_i)[y_i] / Σ_c s(ŷ_i)[c], s(x) = x+1 for x ≥ 0, 1/(1−x) for x < 0 |
-| g_bt | intermediate grid t of a composite row (t = 1..k−1 for a depth-k program); none on ARC/BARC/RE-ARC rows |
-| Π_b | assignments that match the final target ⋆ to one child and min(#intermediates, K−1) intermediates T_π to other, distinct children. Plain rows: Π_b = {⋆ → k : k = 1..K} |
-| τ | temperature, log-linear from 1.0 to 0.02 nats/token over the first 30% of the run's budget, then constant |
-| e_b, e_bk | 1 if the parent / child k canvas is exactly right (every supervised token), else 0 |
-| q_b, q_bk | stop/score logits read from position 0 of y (parent / child k) |
+| $y_b$ | the row's target canvas: the output's colour tokens and its EOS border |
+| $\hat y_b$ | the parent's logits: pre-fork cycle → fork → join → post-join cycle on a forked row, TRM's round on a declined one |
+| $\hat y_{bk}$ | child $k$'s logits after its one cycle |
+| $g_{bt}$ | intermediate grid $t$ of a composite row ($t \le M = 3$); none on ARC, BARC and RE-ARC rows |
+| $\Pi_b$ | assignments of the final target $\star$ to one child and of $\min(M_b, K-1)$ of the row's $M_b$ intermediates, $T_\pi$, to other, distinct children. Plain rows: the $K$ maps $\star \mapsto k$ |
+| $e_b,\ e_{bk}$ | 1 if the parent's / child $k$'s canvas is exactly right on every supervised token, else 0 |
+| $q_b,\ q_{bk}$ | halting / score logits, `q_head` on prefix position 0 of $y$ |
+| $f_b$ | 1 if row $b$ forked this round (always 1 without `model.fork_gate`) |
+| $\gamma_b$ | the gate's logit for row $b$ |
+| $\tilde y_b$ | the no-fork continuation: TRM's remaining cycles from the same pre-fork state, no gradient |
+| $G$ | label rows: forked, with the model's own join (no counterfactual) and the parent slot not dropped |
+| $p$ | fork price, nats per supervised token |
+| $\operatorname{sg}$ | stop-gradient |
 
-Defaults: λ_wta = 0.5, λ_sub = 0.5, λ_q = 0.5 (TRM's value), ε = 0.05, K = 4. With no intermediates, term (2) reduces
-exactly to annealed relaxed winner-takes-all: child k's gradient is λ_wta·[(1−ε)·softmin_τ(CE)_k + ε/K]·∇CE_k
-(`tests/test_objective.py::test_children_gradient_is_weighted_ce_gradient`).
+Settings:
 
-Implementation: `frm/objective.py` (`set_match`, `Objective.__call__`); Π is enumerated once per (K, M) — 136
-assignments at K = 4 with up to 3 intermediates — and evaluated as one gather per step.
+| setting | default | ARC-AGI-2 final (`configs/final_frm_a2tn.json`) |
+|---|---|---|
+| $K$ | 4 | 4 |
+| $\lambda_{\mathrm{wta}},\ \lambda_{\mathrm{sub}},\ \lambda_q$ | 0.5, 0.5, 0.5 ($\lambda_q$ is TRM's value) | the same |
+| $\varepsilon$ | 0.05 | 0.05 |
+| $\tau_0 \to \tau_1$ over $u_\tau$ | $1 \to 0.02$ over $u_\tau = 0.3$ | $1 \to 0.02$ over $u_\tau = 0.048$ of 100,000 PF, i.e. the first 4,800 PF |
+| $\lambda_{\mathrm{gate}}$ | 0.1 | 0.1 |
+| $p$ | 0, fixed | a controller holding the fork rate at 0.4 (§3.6): 0 at the start, ≈ 0.002 at 45k PF |
+| `child_focus` $\varphi$ (§3.7) | 0 | 0 |
 
-With the fork gate (`model.fork_gate`, `DESIGN.md` §4.8), let f_b = 1 if row b forked this round. Terms (2) and the
-children's half of (3) are multiplied by f_b, so a declined row's loss is exactly the K = 0 loss, and the gate adds a
-fourth term, a mean over its label rows G (forked, own join, parent slot not dropped; §3.6):
+With no intermediates, term (2) reduces exactly to annealed relaxed winner-takes-all (§3.2). A declined row has
+$f_b = 0$, so its loss is exactly the $K = 0$ (TRM) loss.
 
-$$
-\mathcal{L} \;\mathrel{+}=\; \lambda_{\mathrm{gate}}\cdot\frac{1}{|G|}\sum_{b\in G}
-\mathrm{BCE}\big(g_b,\; \mathbb{1}[\,\mathrm{CE}(\tilde y_b, y_b) - \mathrm{CE}(\hat y_b, y_b) > p\,]\big)
-\qquad (0 \text{ if } G = \varnothing)
-$$
+Where each term lives:
 
-with g_b the gate logit, ỹ_b the readout of the no-fork continuation (TRM's round from the same pre-fork state, no
-grad) and p the fork price in nats per supervised token.
+| term | code | what it computes |
+|---|---|---|
+| (1) | `Objective.__call__`: `row_ce(out.logits, labels)` | $\hat y_b$ comes from `Refiner.round` (§3.1) |
+| (2) | `set_match(ce_final, ce_sub, mask, tau, λ_sub/λ_wta)`, then `set_term` masked by `out.fork` | assignments from the cached `_assignment_table(K, M)`: 4 on plain rows, 136 at $K = 4$, $M = 3$, evaluated as one gather per step |
+| (3) | `F.binary_cross_entropy_with_logits` on `out.q` and `out.child_q` | the children's mean is masked by `out.fork` |
+| (4) | `benefit = (row_ce(out.cf_logits) − ce_parent).detach()`, BCE over `out.gate_rows` | $\tilde y_b$ = `cf_logits`, from `Refiner._trm_tail` under `torch.no_grad` |
+| $\tau$, $p$ | `tau_at(cfg, progress)`; `Trainer.price` | the price controller runs in `Trainer.train_step` |
 
 ### 3.1 Term 1 — parent deep supervision (R1, R2, R3)
 
-Unchanged from TRM in form, changed in what it trains. Because the graded readout comes *after* the join and a full
-post-join cycle, its gradient runs `post cycle → join → child cycles → fork codes / shared weights`. A child that turns
-the canvas into something the parent can finish — a detour — is paid for by this term even though nothing grades the
-detour itself. The credit horizon is two cycles along the fork path (TRM: one), an intermediate horizon (§2.1).
+**What.** TRM's stablemax cross-entropy of the parent's readout against the final answer, at every round.
+
+**Why.** Unchanged from TRM in form, changed in what it trains. Because the graded readout comes *after* the join and a
+full post-join cycle, its gradient runs post cycle → join → child cycles → fork codes and shared weights. A child that
+turns the canvas into something the parent can finish — a detour — is paid for by this term even though nothing grades
+the detour itself. The credit horizon is two cycles along the fork path (TRM: one), an intermediate horizon (§2.1).
+It is also the only term that trains the join's $W_q$, $W_k$ and $\beta$ (§3.4).
 
 Uniform weight across rounds: reweighting changed nothing in three lineage attempts and decaying weights push toward early
 exit (DEPTH.md §4). No term multiplies the CE by a round-dependent factor.
 
+**Implementation.** `row_ce(out.logits, labels)`. `token_ce` computes the log-probabilities in float64, and
+`log_stablemax` clamps only the $x < 0$ branch, so the gradient at $x = 0$ is not zero. The forward behind $\hat y_b$ is
+`Refiner.round`. Every row first runs one pre-fork cycle without gradient. A forked row then runs `_node`: the $K$ child
+cycles batched as $[B \cdot K, L, D]$, `_join` and one post-join cycle, all with gradient, then `lm_head`. A declined row
+runs `_trm_tail` (one cycle without gradient, one with), so its term (1) is exactly TRM's. A cycle is $n = 4$ updates
+$z \leftarrow f(z,\, y + x + c)$ followed by one $y \leftarrow f(y,\, z)$, with the same two blocks $f$ everywhere ($c = 0$
+for the parent, the fork code $c_k$ for child $k$).
+
 ### 3.2 Term 2 — children: annealed set matching (R3, R4, R7)
 
-What makes children *non-identical* — five mechanisms, each with a different job:
+**What.** Each child is scored against the row's targets. The assignment of targets to children that fits best takes
+almost all the weight $w_{b\pi}$ (a soft-min computed without gradient), and $\varepsilon$ spreads a small share evenly
+over every child.
 
-1. **Distinct static codes** e_k (N(0, 0.5²), never zero): breaks the exact symmetry that collapsed tiny's children.
-2. **Parent-conditioned per-cell codes** A_k·B·rms(z): lets the parent give each child a different job per region.
-3. **Fresh noise every round** (model, not loss): c_k += W_ξ ξ_k, ξ_k ~ N(0, I₁₆) drawn per row, per child, per round
-   (`ModelCfg.noise_dim`, learned W_ξ with initial output RMS 0.25; seeded at evaluation for reproducibility). Children
-   become samples of a learned proposal distribution instead of fixed functions of the parent state. Two consequences:
-   min-over-children training is IMLE, which cannot collapse modes (§2.2); and a parent stuck at a fixed point still
-   receives *new* proposals each round — without noise the whole round, fork included, is a deterministic map with the
-   same fixed point (DEPTH.md M2; PTRM).
+**Why.** What makes children *non-identical* — five mechanisms, each with a different job:
+
+1. **Distinct static codes** $e_k \sim \mathcal N(0,\, 0.5^2 I)$, never zero: breaks the exact symmetry that collapsed
+   tiny's children.
+2. **Parent-conditioned per-cell codes** $A_k B\,\mathrm{rms}(z[p])$ ($B$: $512 \to 64$, shared; $A_k$: $64 \to 512$
+   per child, zero-initialised): lets the parent give each child a different job per region.
+3. **Fresh noise every round** (model, not loss): $c_k \mathrel{+}= W_\xi\,\xi_k$ with $\xi_k \sim \mathcal N(0, I_{16})$
+   drawn per row, per child, per round (`ModelCfg.noise_dim`; $W_\xi$ is learned, initial output RMS 0.25; seeded at
+   evaluation for reproducibility). Children become samples of a learned proposal distribution instead of fixed
+   functions of the parent state. Two consequences: min-over-children training is IMLE, which cannot collapse modes
+   (§2.2); and a parent stuck at a fixed point still receives *new* proposals each round — without noise the whole
+   round, fork included, is a deterministic map with the same fixed point (DEPTH.md M2; PTRM).
 4. **One-to-one matching on composite rows**: the final answer and the intermediates go to *different* children, so
    two near-identical children are pushed apart, one toward each grid
    (`test_set_match_sends_distinct_targets_to_distinct_children`). This is diversity pressure with ground truth — it
@@ -193,27 +253,66 @@ What makes children *non-identical* — five mechanisms, each with a different j
    a set, so the program's step order does not matter (frmv1's ordered trace supervision lost −2.9σ because orderings are
    not unique); the parent is never graded on intermediates, so "produce the intermediate, let the parent finish" is
    what minimises terms 1 + 2 together.
-5. **Annealed relaxed WTA on plain rows**: only the best child (in the soft sense) is pulled to y*; where the model is
-   uncertain, different children win on different rows. τ = 1 starts with every child learning the task (no early
-   monopoly); τ → 0.02 specialises (annealed MCL); ε/K per child keeps every code on a gradient (no dead children).
+5. **Annealed relaxed WTA on plain rows**: only the best child (in the soft sense) is pulled to $y_b$; where the model
+   is uncertain, different children win on different rows. $\tau = 1$ starts with every child learning the task (no
+   early monopoly); $\tau \to 0.02$ specialises (annealed MCL); $\varepsilon/K$ per child keeps every code on a gradient
+   (no dead children).
 
 Why it drives depth: when the parent is already right, children agree and the term costs nothing extra. When the parent is
-stuck, the child whose noise sample moved it closest to y* takes the gradient and term 1 trains the join to adopt it — so
-the gradient concentrates on the stuck rows at later rounds without any round-dependent weight.
+stuck, the child whose noise sample moved it closest to $y_b$ takes the gradient and term 1 trains the join to adopt it —
+so the gradient concentrates on the stuck rows at later rounds without any round-dependent weight.
+
+**Implementation.** `set_match(ce_final, ce_sub, mask, tau, sub_ratio)`:
+
+- `_assignment_table(K, M)` enumerates, once per $(K, M)$ and device, every one-to-one map of the final target plus up
+  to $K - 1$ intermediates onto distinct children (child index per target, $-1$ = unmatched).
+- The cost of every assignment is `ce_final[:, A[:, 0]]` plus $\lambda_{\mathrm{sub}}/\lambda_{\mathrm{wta}}$ ($= 1$)
+  times the mean CE of its matched intermediates, one gather from `ce_sub` $[B, K, M]$.
+- An assignment is valid if it matches exactly $\min(M_b, K - 1)$ intermediates, all of which the row has
+  (`subgoal_mask`).
+- $w$ = `softmax(-cost.detach() / tau)` over the valid assignments. `set_match` returns
+  $\sum_\pi w_{b\pi} c_{b\pi}$ and the arg-max assignment, which feeds the win and coverage logs.
+- `set_term = lambda_wta * ((1 - eps) * match + eps * ce_final.mean(-1))`, added only where `out.fork` is true; this
+  is term (2) of §3.0 line for line.
+
+Because $w$ carries no gradient, on a plain row child $k$ receives its own CE gradient scaled by
+
+$$
+\frac{\partial \mathcal{L}_b}{\partial\,\mathrm{CE}(\hat y_{bk}, y_b)} \;=\; \lambda_{\mathrm{wta}}\Big[(1-\varepsilon)\,w_{bk} + \frac{\varepsilon}{K}\Big]
+$$
+
+(`tests/test_objective.py::test_children_gradient_is_weighted_ce_gradient`). Once $\tau = 0.02$ the weights are nearly
+one-hot: about $0.481$ on the winning child and $0.00625$ on each other child, against $1$ on the parent's term (1).
 
 ### 3.3 Term 3 — stop/score heads (R7, R1)
 
-BCE(q, exact) for the parent (TRM) and for every child. Uses: training-time halting (row turnover), detached input to the
-join (prefer children predicted correct), vote tie-break at inference. Children's q heads are the "scoring head" of
-resilient MCL. Nothing rewards stopping early; evaluation always runs 16 rounds.
+**What.** $\mathrm{BCE}(q_b, e_b)$ for the parent (TRM) and $\frac{1}{K}\sum_k \mathrm{BCE}(q_{bk}, e_{bk})$ for the
+children of a forked row, both weighted by $\lambda_q$.
+
+**Why.** Uses: training-time halting (row turnover), detached input to the join (prefer children predicted correct),
+vote tie-break at inference. Children's q heads are the "scoring head" of resilient MCL. Nothing rewards stopping
+early; evaluation always runs 16 rounds.
+
+**Implementation.** `F.binary_cross_entropy_with_logits(out.q, exact_parent)`, and the children's mean masked by
+`out.fork`. `q_head` is a $512 \to 1$ linear on prefix position 0 of $y$ (weight 0, bias $-5$ at initialisation, as in
+TRM). After its round $r$ the trainer halts a row when
+
+$$
+\big(r \ge 16 \;\lor\; q_b > 0\big) \;\land\; r \ge m_b,
+\qquad
+m_b \;=\; \begin{cases} \text{uniform on } \lbrace 2, \dots, 16 \rbrace & \text{with probability } 0.1, \\[2pt] 0 & \text{otherwise,} \end{cases}
+$$
+
+and refills it with a fresh row (`Trainer._refill`). The children's $q_{bk}$ enter the join only as
+$\beta\,\operatorname{sg}(q_{bk})$ (§3.8), so the join cannot bend the score heads.
 
 ### 3.4 Gradient-flow table
 
 | parameter | term 1 | term 2 | term 3 | term 4 (gate) |
 |---|---|---|---|---|
 | shared blocks f | ✓ (parent post cycle + children via join) | ✓ (children) | ✓ | — |
-| fork codes e_k, A_k, B, noise map W_ξ | ✓ via join | ✓ | ✓ | — |
-| join W_q, W_k, β | ✓ | — | — (q enters detached) | — |
+| fork codes $e_k$, $A_k$, $B$, noise map $W_\xi$ | ✓ via join | ✓ | ✓ | — |
+| join $W_q$, $W_k$, $\beta$ | ✓ | — | — ($q$ enters detached) | — |
 | lm_head | ✓ | ✓ | — | — |
 | q_head | — | — | ✓ | — |
 | puzzle embedding | ✓ | ✓ | ✓ | — |
@@ -228,51 +327,117 @@ no parameter is left out; `tests/test_gate.py` asserts the last column and the d
 
 Token-mean CE per row makes rows of different sizes comparable; the per-step mean over rows makes step gradients
 comparable across buckets whose row counts differ by 10×. TRM sums per-row means and divides by the global batch size,
-which is the same thing at a fixed batch. In c_bπ the intermediates are averaged, so a depth-4 composite row weighs the
-same as a depth-2 one.
+which is the same thing at a fixed batch. In $c_{b\pi}$ the intermediates are averaged, so a depth-4 composite row weighs
+the same as a depth-2 one.
 
 ### 3.6 Term 4 — fork gate (only with `model.fork_gate`)
 
 The gate decides per row and round whether the round forks (`DESIGN.md` §4.8). It is trained as a classifier on
 measured outcomes, never through the loss it influences:
 
-- **Label.** On a label row, benefit b = CE(no-fork continuation, y*) − CE(parent after the fork, y*), both token-mean
-  stablemax CE from the same pre-fork state, detached; label = b > price. The continuation is exactly what the row
-  would have computed had it declined (TRM's remaining cycles, forward only), so the label answers "did this fork pay
-  at least the price" for this state.
+- **Label.** On a label row the benefit $\Delta_b = \mathrm{CE}(\tilde y_b, y_b) - \mathrm{CE}(\hat y_b, y_b)$
+  compares the no-fork continuation with the parent after the fork, both token-mean stablemax CE from the same pre-fork
+  state, detached; the label is $\mathbb{1}[\Delta_b > p]$. The continuation is exactly what the row would have
+  computed had it declined (TRM's remaining cycles, forward only), so the label answers "did this fork pay at least the
+  price" for this state.
 - **Label rows.** Rows that forked with the model's own join: not under a counterfactual, and (training) parent slot
   not dropped — a forced-children join measures a handicapped fork, not the one evaluation would run. Declined rows
   give no label; the exploration floor (`train.fork_explore`) makes the gate's "no" states fork now and then so they do.
-- **Loss.** λ_gate · mean over label rows of BCE(g, label), λ_gate = 0.1; a plain mean (not scaled by the label-row
-  fraction), 0 when there is none. The gate's inputs ([y₀ ‖ mean over cells of y] of the no-grad pre-fork state) are
-  detached, so the term trains only the gate head and terms 1–3 never reach it.
-- **Price.** `objective.fork_price` (default 0: fork whenever it helps). With `train.fork_rate_target > 0` the trainer
-  adjusts it after each gated step: price ← max(0, price + `fork_price_lr` · (fork rate − target)); the objective takes
-  the current value as `price`.
+- **Loss.** $\lambda_{\mathrm{gate}}\,\mathcal{L}_{\mathrm{gate}}$ with $\lambda_{\mathrm{gate}} = 0.1$: a plain mean
+  over label rows (not scaled by the label-row fraction), 0 when there is none. The gate computes
+  $\gamma_b = \mathrm{MLP}\big([\,y_b[0] \,\Vert\, \bar y_b\,]\big)$, $1024 \to 128 \to \mathrm{SiLU} \to 1$, where
+  $\bar y_b$ is the mean of $y_b$ over grid cells. Both inputs come from the pre-fork state, which was computed without
+  gradient, so the term trains only the gate head and terms (1)–(3) never reach it.
+- **Decision.** During the forced phase (progress $u <$ `train.fork_force_frac`: 0.3 by default, the first 4,800 PF
+  in the final) every row forks. After it, row $b$ forks if $\gamma_b > 0$, or anyway with probability `fork_explore`
+  (0.1). Evaluation forks the top `eval.fork_top` of each batch and round by $\gamma_b$ (0.4 in the final; padding
+  rows excluded).
+- **Price.** `objective.fork_price` (default 0: fork whenever it helps). With `train.fork_rate_target` $\rho > 0$ the
+  trainer moves it after each gated step: $p \leftarrow \max\big(0,\; p + \eta_p(\bar f - \rho)\big)$, where $\bar f$
+  is the step's fork rate, exploration included, and $\eta_p$ = `fork_price_lr`. The final uses $\rho = 0.4$ and
+  $\eta_p = 10^{-4}$. The price is checkpointed, and adaptation starts from the price the checkpoint ended at.
+- **Implementation.** In `Refiner.round` the label rows get $\tilde y_b$ from `_trm_tail` under `torch.no_grad`
+  (`cf_logits`: two extra forward cycles per label row, charged in `round_flops`). In `Objective.__call__`,
+  `benefit = (row_ce(cf_logits) − ce_parent).detach()`, `target = benefit > price`, and the BCE is averaged over
+  `gate_rows`.
 - **Why not a learned soft or REINFORCE gate.** frmv1's soft gate learned the cycle index (98.9% of its variance) and
   discrete decisions need high-variance estimators (§5). Supervised labels from measured counterfactual benefit, a
-  forced-fork familiarisation phase (`train.fork_force_frac` = 0.3: every row forks, every state is labelled), the
-  exploration floor and no step-index input are the mitigations; `fork.rate_by_round` and `gate_acc` vs `gate_pos`
-  detect a relapse (§7).
+  forced-fork familiarisation phase (every row forks, every state is labelled), the exploration floor and no
+  step-index input are the mitigations; `fork.rate_by_round` and `gate_acc` vs `gate_pos` detect a relapse (§7).
 
 ### 3.7 Error-focused children (`objective.child_focus`, gated models)
 
 Warm-started from a finished TRM, a child that reproduces TRM's own round earns most of its set-matching loss on cells
 TRM already gets right, and a fork that only repeats TRM's round buys nothing for its price (`DESIGN.md` §4.10). With
-`child_focus` = φ the children's final-target CE becomes a weighted token mean, cell weight 1 − φ where the no-fork
-continuation (the label rows' `cf_logits`, already computed for the gate) predicts the cell right and 1 where it is
-wrong:
+`child_focus` $= \varphi$ the children's final-target CE becomes a weighted token mean, with cell weight $1 - \varphi$
+where the no-fork continuation (the label rows' `cf_logits`, already computed for the gate) predicts the cell right and
+1 where it is wrong:
 
 $$
-\mathrm{CE}_\phi(\hat y_k, y) = \frac{\sum_p w_p\,\mathrm{CE}_p}{\sum_p w_p},\qquad
-w_p = 1 - \varphi\,[\arg\max \mathrm{cf}_p = y_p] .
+\mathrm{CE}_\varphi(\hat y_{bk}, y_b) \;=\; \frac{\sum_{i\in V}\omega_{bi}\,\mathrm{CE}_i(\hat y_{bk}, y_b)}{\sum_{i\in V}\omega_{bi}},
+\qquad
+\omega_{bi} \;=\; 1 - \varphi\;\mathbb{1}[b \in G]\;\mathbb{1}\big[\arg\max_c \tilde y_{b,i,c} = y_{b,i}\big],
 $$
+
+where $\mathrm{CE}_i$ is the stablemax CE of token $i$. It replaces $\mathrm{CE}(\hat y_{bk}, y_b)$ inside $c_{b\pi}$ and
+the $\varepsilon$ share of term (2).
 
 This is boosting's reweighting (later learners concentrate on the earlier learner's mistakes) applied inside one
 round: the children's capacity goes to the cells where TRM is wrong, which is exactly where the per-cell join can
 profit from them. Sub-goal targets are not reweighted (TRM's correctness on the final answer says nothing about an
 intermediate grid); rows without a label (no fork, dropped, counterfactual) keep uniform weights; the metric
-`child_ce_min` stays unweighted. φ = 0 (default) is the plain objective (`test_child_focus_sends_the_childrens_loss_to_cells_trm_gets_wrong`).
+`child_ce_min` stays unweighted. $\varphi = 0$ (the default, and the final) is the plain objective
+(`test_child_focus_sends_the_childrens_loss_to_cells_trm_gets_wrong`). R2 ran with $\varphi = 0.75$ and fell behind
+TRM-continued on dev row exact (`EXPERIMENTS.md` §4c).
+
+### 3.8 Around the loss: what else shapes training
+
+None of these are loss terms, but every term above depends on them (`DESIGN.md` §4 and §6 have the full design).
+
+- **Online deep supervision (TRM).** One optimizer step is one round of one bucket's carry. The carry is detached
+  between rounds, so a round's loss never reaches earlier rounds. A forked row's gradient window is its $K$ child cycles
+  plus the post-join cycle: 25 passes of $f$ with gradient, against TRM's 5.
+- **Fork codes** (`Refiner._child_codes`). Child $k$ adds
+  $c_k[p] = e_k + A_k B\,\mathrm{rms}(z[p]) + W_\xi\,\xi_k$ to the input of every one of its $z$-updates (§3.2).
+- **Join** (`Refiner._join`). For every cell $p$ and every candidate $j \in \lbrace 0, 1, \dots, K\rbrace$
+  (0 = the pre-fork parent), with $W_q, W_k : 512 \to 64$:
+
+$$
+s_j[p] \;=\; \frac{\big\langle W_q\,\mathrm{rms}(z[p]),\; W_k\,\mathrm{rms}(z_j[p])\big\rangle}{\sqrt{64}} + \beta\,\operatorname{sg}(q_j),
+\qquad
+\alpha[p] \;=\; \operatorname{softmax}_j\, s[p],
+\qquad
+(y, z)[p] \;\leftarrow\; \sum_{j=0}^{K} \alpha_j[p]\,(y_j, z_j)[p].
+$$
+
+- **Parent-slot dropout.** In training, the parent slot $j = 0$ is masked on each forked row with probability 0.25
+  (`model.join_drop_parent`), so the post-join cycle must build on the children. This fixed P1's "parent ignores
+  children" collapse (parent mass 0.95). These rows give no gate label.
+- **Fork schedule.** Forced forking, then the gate with exploration and the price controller (§3.6).
+- **Optimizer.** AdamW (betas 0.9 / 0.95, weight decay 0.1; lr $5 \cdot 10^{-5}$ in the final, the fork modules at
+  $4\times$), gradient clip 1.0, SignSGD at lr $10^{-2}$ on the puzzle-embedding rows a step touched, EMA 0.999
+  (evaluation and the shipped model use the EMA weights). Warm-up 1,000 steps, constant, then a $(1 - \sqrt{u'})$
+  cooldown to 0 over the last 15% of the budget, $u'$ being the fraction of the cooldown elapsed.
+- **Data.** Rows are 0.50 ARC, 0.15 composites (the only rows with intermediates $g_{bt}$), 0.25 BARC, 0.10 RE-ARC.
+- **Left out on purpose.** Improvement rewards across rounds, round-dependent weights, diversity bonuses and geometric
+  halting priors (§5).
+
+### 3.9 What each term does in the ARC-AGI-2 final (measured 2026-10-15)
+
+From `final_frm_a2tn`'s training log (the forced phase, 0–4,800 PF, against 40,000–47,000 PF) and its evaluations
+(32 voters; composites are held-out pairs of synthetic tasks).
+
+| term | reading |
+|---|---|
+| (1) parent | training CE 0.433 → 0.220. Held-out composites pass@2 FRM − TRM-continued +0.118 (90% CI +0.094…+0.143), pooled over 32,500–52,500 PF. On ARC-AGI-2 evaluation tasks at matched PF (≈ 53,500 PF, 4 voters) −0.006 (CI −0.031…+0.019): no transfer of the composite lead to real tasks so far |
+| (2) children | set term 0.292 → 0.189; best child's CE 0.428 → 0.297, above the parent's 0.220. Win shares 0.16 / 0.21 / 0.48 / 0.16 (no dead child); 3.45 distinct answers of 4 (composites, 45k PF); intermediates reproduced exactly by their matched child 4% → 29%. The children are proposals, not answers: children-only votes score 0.17 on composites against the parent's 0.54, yet replacing them with another task's children (`cf.sham`) costs 0.067 composite exact. The parent slot's share of the join fell from 0.45 to 0.15 |
+| (3) halting | accuracy 0.97 → 0.94, BCE 0.078 → 0.143 |
+| (4) gate | label base rate 0.59 → 0.55, gate accuracy 0.61 → 0.63, mean benefit of labelled forks +0.009 → +0.013 nats/token. Of the labelled forks the gate itself would have declined, 26% paid (45% in the forced phase, where every row forks). Price 0 → 0.0020, training fork rate 0.42 against the 0.40 target. Held-out ranking is near chance (AUC 0.56 on W's `F`, `EXPERIMENTS.md` §4c G), which is why evaluation forks a fixed top 40% |
+
+Depth (evaluations pooled over 32,500–45,000 PF): on held-out composites and ARC-AGI-2 evaluation tasks both arms gain
+from round 1 to round 4 and nothing after (composites row exact FRM 0.280 → 0.345 → 0.348 at rounds 1 / 4 / 16, TRM
+0.200 → 0.275 → 0.276). At 45k PF, resetting FRM's carry at round 4 changes composite exact by −0.0005, and switching
+forks off at evaluation costs 0.014.
 
 ## 4. How the objective incentivises depth — the argument in one place
 
