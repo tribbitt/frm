@@ -496,7 +496,8 @@ PRIMITIVES: tuple[Primitive, ...] = (
     Primitive("border", _border, _colour_param, _colour_space),
     Primitive("roll", lambda g, dr, dc: np.roll(g, (dr, dc), axis=(0, 1)), _vector_param, _vector_space, "translate"),
     Primitive("shift", _shift, _vector_param, _vector_space, "translate"),
-    Primitive("extend_rays", lambda g, d: _oriented(g, d, _rays_left), _choice_param(DIRECTIONS), _choice_space(DIRECTIONS)),
+    Primitive("extend_rays", lambda g, d: _oriented(g, d, _rays_left), _choice_param(DIRECTIONS),
+              _choice_space(DIRECTIONS)),
     Primitive("connect", _connect, _choice_param(("h", "v")), _choice_space(("h", "v"))),
     Primitive("symmetrize", _symmetrize, _choice_param(("h", "v")), _choice_space(("h", "v"))),
 )
@@ -655,7 +656,8 @@ def _inputs(rng: np.random.Generator, n: int, min_side: int, max_side: int) -> l
     look = _sample_look(rng)
     bg = 0 if rng.random() < 0.8 else int(rng.integers(1, 10))
     others = [c for c in range(10) if c != bg]
-    palette = [int(c) for c in rng.choice(others, size=1 if style == "two_colour" else int(rng.integers(1, 5)), replace=False)]
+    n_pal = 1 if style == "two_colour" else int(rng.integers(1, 5))
+    palette = [int(c) for c in rng.choice(others, size=n_pal, replace=False)]
     lo = max(min_side, 4) if style in ("panels", "blocky") else min_side
     if look.rect_min >= 3:  # room for rectangles with an interior
         lo = max(lo, min(5, max_side))
@@ -745,7 +747,8 @@ def _pair_reproduces(rng: np.random.Generator, pairs: Sequence[tuple[Grid, Grid]
         z0 = first[0](x0, first[1])
         if z0 is None:
             continue
-        seconds = [settings[int(j)] for j in rng.choice(len(settings), size=min(n_second, len(settings)), replace=False)]
+        picks = rng.choice(len(settings), size=min(n_second, len(settings)), replace=False)
+        seconds = [settings[int(j)] for j in picks]
         hits = [s for s in seconds if (o := s[0](z0, s[1])) is not None and _eq(o, y0)]
         fit_hits = [p for p in fits if p.fit([(z0, y0)])]
         if not hits and not fit_hits:
@@ -894,7 +897,8 @@ def main() -> None:
     ap.add_argument("--detour_frac", type=float, default=0.5)
     args = ap.parse_args()
     t0 = time.perf_counter()
-    tasks = generate(args.n, (args.depth_min, args.depth_max), args.seed, max_side=args.max_side, detour_frac=args.detour_frac)
+    tasks = generate(args.n, (args.depth_min, args.depth_max), args.seed, max_side=args.max_side,
+                     detour_frac=args.detour_frac)
     elapsed = time.perf_counter() - t0
     out = Path(args.out or f"data/raw/composite_s{args.seed}.json")
     out.parent.mkdir(parents=True, exist_ok=True)

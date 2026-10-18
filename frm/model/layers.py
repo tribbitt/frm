@@ -38,7 +38,8 @@ class CastedLinear(nn.Module):
 
     def __init__(self, fan_in: int, fan_out: int, bias: bool = False, std: float | None = None):
         super().__init__()
-        self.weight = nn.Parameter(trunc_normal_(torch.empty(fan_out, fan_in), std=fan_in**-0.5 if std is None else std))
+        std = fan_in**-0.5 if std is None else std
+        self.weight = nn.Parameter(trunc_normal_(torch.empty(fan_out, fan_in), std=std))
         self.bias = nn.Parameter(torch.zeros(fan_out)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

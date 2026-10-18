@@ -60,10 +60,10 @@ if sys.platform != "darwin":         # macOS refuses RLIMIT_AS; there the parent
     resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
 sys.path[:0] = [LIB, BARC_DIR]
 
-import numpy as np
-import policy
-import scipy.ndimage
-from scipy import ndimage  # noqa: F401
+import numpy as np  # noqa: E402  (after the rlimits, which must bind before any library loads)
+import policy  # noqa: E402
+import scipy.ndimage  # noqa: E402
+from scipy import ndimage  # noqa: E402, F401
 
 _OUT = os.fdopen(OUT_FD, "w", buffering=1)
 _IN = sys.stdin

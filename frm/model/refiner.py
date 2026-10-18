@@ -38,7 +38,7 @@ class RoundOut:
     join_entropy: torch.Tensor | None  # [B] mean per-cell entropy of the join weights
     carry: Carry | None  # detached; None in outputs kept for instruments
     pre_logits: torch.Tensor | None = None  # [B, S*S, V] pre-fork parent readout (detached)
-    # Child fields keep full-B shapes; on rows with fork=False join stats are NaN and child logits/q zeros: mask by fork.
+    # Child fields keep full-B shapes; rows with fork=False have NaN join stats and zero child logits/q: mask by fork.
     fork: torch.Tensor | None = None  # [B] bool rows that forked this round (None for K = 0)
     fork_logit: torch.Tensor | None = None  # [B] float32 gate logit (None without fork_gate)
     cf_logits: torch.Tensor | None = None  # [B, S*S, V] no-fork continuation readout (detached); zeros off gate_rows
@@ -91,7 +91,8 @@ class Refiner(nn.Module):
         back to eager). With the gate, batch dim is dynamic since fork/decline subset sizes vary per step."""
         import torch._dynamo
 
-        for name in ("recompile_limit", "cache_size_limit", "accumulated_recompile_limit", "accumulated_cache_size_limit"):
+        limits = ("recompile_limit", "cache_size_limit", "accumulated_recompile_limit", "accumulated_cache_size_limit")
+        for name in limits:
             if hasattr(torch._dynamo.config, name):
                 setattr(torch._dynamo.config, name, max(getattr(torch._dynamo.config, name), 512))
         if self.gate is None:
@@ -396,5 +397,6 @@ class Refiner(nn.Module):
             return nograd + 3 * grad + recompute if train else nograd + grad
 
         cont = 2 * (self.cfg.L_cycles + 1)
-        total = (rows - fork_rows) * units(self.passes_per_round(fork=False)) + fork_rows * units(self.passes_per_round())
+        total = (rows - fork_rows) * units(self.passes_per_round(fork=False))
+        total += fork_rows * units(self.passes_per_round())
         return (total + cf_rows * cont) * self.flops_per_row_pass(S)

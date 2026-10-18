@@ -1,4 +1,6 @@
-"""Size buckets: predicted test-output size from a demo-verified rule, and the task's canvas size. Never reads test outputs."""
+"""Size buckets: predicted test-output size from a demo-verified rule, and the task's canvas size.
+
+Never reads test outputs."""
 
 from __future__ import annotations
 

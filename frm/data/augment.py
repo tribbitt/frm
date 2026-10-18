@@ -79,7 +79,8 @@ def _puzzle_hash(pairs: list[tuple[np.ndarray, np.ndarray | None]]) -> str:
 def make_versions(task: Task, n: int, rng: np.random.Generator) -> list[Version]:
     """Identity + up to ``n`` random distinct versions (TRM `dataset/build_arc_dataset.py`); dedup ignores test
     outputs."""
-    pairs = [(np.asarray(ex["input"], dtype=np.uint8), np.asarray(ex["output"], dtype=np.uint8)) for ex in task["train"]]
+    pairs = [(np.asarray(ex["input"], dtype=np.uint8), np.asarray(ex["output"], dtype=np.uint8))
+             for ex in task["train"]]
     pairs += [(np.asarray(ex["input"], dtype=np.uint8), None) for ex in task["test"]]
     versions = [Version.identity()]
     if n <= 0:

@@ -458,7 +458,8 @@ class Trainer:
         self.step += 1
         if self.model.gate is not None and not forced and tc.fork_rate_target > 0:
             self.price = max(0.0, self.price + tc.fork_price_lr * (n_fork / st.rows - tc.fork_rate_target))
-        info = {"loss": loss_val, "gnorm": gnorm_val, "S": S, "rows": st.rows, "tau": tau_at(self.cfg.objective, progress)}
+        tau = tau_at(self.cfg.objective, progress)
+        info = {"loss": loss_val, "gnorm": gnorm_val, "S": S, "rows": st.rows, "tau": tau}
         if self.model.gate is not None:
             info["price"] = price
         return info

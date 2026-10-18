@@ -112,7 +112,8 @@ def main() -> int:
                 se = math.sqrt(((y - a - b * x) ** 2).sum() / (len(x) - 2) / ((x - x.mean()) ** 2).sum())
                 fits.append((b, se))
             (ba, sa), (bb, sb) = fits
-            print(f"  {name:12s} A {ba:+.4f} ± {sa:.4f}  B {bb:+.4f} ± {sb:.4f}  A−B {ba - bb:+.4f} ± {math.hypot(sa, sb):.4f}")
+            print(f"  {name:12s} A {ba:+.4f} ± {sa:.4f}  B {bb:+.4f} ± {sb:.4f}  "
+                  f"A−B {ba - bb:+.4f} ± {math.hypot(sa, sb):.4f}")
     ta, tb = train_rows(args.a), train_rows(args.b)
     print("training CE / exact at matched steps, then at matched PF (±5% windows)")
     for key, points in (("step", (1000, 4000, 16000, 64000, 128000)), ("pflops", (1000, 4000, 12000, 24000, 36000))):

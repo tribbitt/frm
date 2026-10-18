@@ -231,7 +231,9 @@ def collect(args: argparse.Namespace) -> tuple[list[Record], list[str], dict]:
         recs += external_records(source, path, need)
     # RE-ARC generators of dropped (copied) training tasks go too
     copied = set(info["arc_tasks_dropped"])
-    info["generator_tasks_dropped"] = sorted(r.task_id for r in recs if r.source in GENERATOR_SOURCES and _base_id(r) in copied)
+    info["generator_tasks_dropped"] = sorted(
+        r.task_id for r in recs if r.source in GENERATOR_SOURCES and _base_id(r) in copied
+    )
     recs = [r for r in recs if not (r.source in GENERATOR_SOURCES and _base_id(r) in copied)]
     seen: set[str] = set()
     for r in recs:

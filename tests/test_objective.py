@@ -5,10 +5,18 @@ import math
 import torch
 
 from frm.config import ObjectiveCfg
-from frm.objective import (
-    IGNORE, Objective, _assignment_table, _distinct, log_stablemax, row_ce, row_exact, set_match, tau_at,
-)
 from frm.model.refiner import Carry, RoundOut
+from frm.objective import (
+    IGNORE,
+    Objective,
+    _assignment_table,
+    _distinct,
+    log_stablemax,
+    row_ce,
+    row_exact,
+    set_match,
+    tau_at,
+)
 
 
 def test_stablemax_normalised():

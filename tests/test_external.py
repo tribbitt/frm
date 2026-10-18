@@ -302,7 +302,8 @@ def test_content_filter_drops_planted(env, tmp_path):
     comp = tmp_path / "comp.json"
     comp.write_text(json.dumps(comps))
     # RE-ARC-style generators: one for the dropped (rule-copying) task, one unrelated
-    held_ids = np.array(sorted(set(load_subset(env["raw"], "evaluation")) | set(load_subset(env["raw"], "evaluation2"))))
+    held = set(load_subset(env["raw"], "evaluation")) | set(load_subset(env["raw"], "evaluation2"))
+    held_ids = np.array(sorted(held))
     _write_pool(str(tmp_path / "rearc.npz"), [("planted0", _pairs(rng, 4)), ("cleangen", _pairs(rng, 4))],
                 source=np.array("rearc"), heldout_ids=held_ids)
     args = _build_args(env, str(tmp_path / "b"), "--external", f"rearc={tmp_path}/rearc.npz")

@@ -379,7 +379,7 @@ $$
 with $\mathrm{CE}_i$ the stablemax CE of token $i$. It replaces $\mathrm{CE}(\hat y_{bk}, y_b)$ inside $c_{b\pi}$ and
 the $\varepsilon$ share of term (2). The motive is boosting inside one round: after a warm start from a finished TRM,
 a child that repeats TRM's round earns most of its loss on cells TRM already gets right (`DESIGN.md` §4.10). Sub-goal
-targets and `child_ce_min` stay unweighted (`test_child_focus_sends_the_childrens_loss_to_cells_trm_gets_wrong`).
+targets and `child_ce_min` stay unweighted.
 
 ### 3.8 Around the loss: what else shapes training
 

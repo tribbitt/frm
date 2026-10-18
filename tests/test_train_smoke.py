@@ -1,4 +1,4 @@
-"""End-to-end CPU smoke (DESIGN.md §10): build -> train -> SIGTERM -> resume -> DONE -> evaluate -> adapt -> submission."""
+"""End-to-end CPU smoke (DESIGN.md §10): build, train, SIGTERM, resume, DONE, evaluate, adapt, submission."""
 
 import json
 import os

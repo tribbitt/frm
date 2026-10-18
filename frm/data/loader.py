@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from frm.data.build import M, SOURCE_CODES
+from frm.data.build import SOURCE_CODES, M
 from frm.data.encode import IGNORE, augmented_dims, labels_from, render
 
 
@@ -151,7 +151,9 @@ class TrainStream:
         else:
             w = np.array([float(source_weights.get(s, 0.0)) for s in self.sources])
         if w.sum() <= 0:
-            raise ValueError(f"source_weights {source_weights} give no weight to sources {self.sources} of bucket {bucket}")
+            raise ValueError(
+                f"source_weights {source_weights} give no weight to sources {self.sources} of bucket {bucket}"
+            )
         p = (w / w.sum()) / mean_rows  # per-draw probability so that row fractions match w
         self.p = p / p.sum()
         self.rows_per_draw = float(self.p @ mean_rows)
