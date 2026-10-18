@@ -23,14 +23,14 @@ forking. With `K=0` it is exactly TRM. It changes three things:
 ## Layout
 
 ```
-frm/config.py        dataclass configs, JSON + dot-path overrides (train.lr=3e-4)
-frm/model/           layers (2-D RoPE, TRM's 1-D RoPE), puzzle embedding, the forking refiner
-frm/objective.py     the objective
-frm/train.py         trainer: per-bucket ACT carries, EMA, FLOP budget, cooldown, resumable, SIGTERM-safe
-frm/evaluate.py      per-round voting, pass@k, fork and depth instruments
-frm/adapt.py         test-time adaptation on new tasks -> Kaggle submission.json
-frm/data/            ARC loading, augmentation, encoding, size rule, composite generator, dataset build, loader
-frm/external/        builders of the external pools: RE-ARC and a2_new (corpus.py), BARC ARC-Heavy (barc/)
+frm/config.py           dataclass configs, JSON + dot-path overrides (train.lr=3e-4)
+frm/model/              layers (2-D RoPE, TRM's 1-D RoPE), puzzle embedding, the forking refiner
+frm/objective.py        the objective
+frm/train.py            trainer: per-bucket ACT carries, EMA, FLOP budget, cooldown, resumable, SIGTERM-safe
+frm/evaluate.py         per-round voting, pass@k, fork and depth instruments
+frm/adapt.py            test-time adaptation on new tasks -> Kaggle submission.json
+frm/data/               ARC loading, augmentation, encoding, size rule, composite generator, dataset build, loader
+frm/external/           builders of the external pools: RE-ARC and a2_new (corpus.py), BARC ARC-Heavy (barc/)
 scripts/                fetch_data, ingest_external (BARC/RE-ARC filter), import_trm (TRM checkpoint import),
                         arm_curves (paired FRM-vs-TRM comparison of two runs)
 configs/                final_frm_a2tn.json (FRM) and final_trm_a2tn.json (its K=0 TRM control)

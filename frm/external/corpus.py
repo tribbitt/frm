@@ -9,8 +9,8 @@ Regenerating the pools ``scripts/ingest_external.py`` consumes, in order (from t
     python scripts/fetch_data.py                                  # data/raw
     git clone --depth 1 https://github.com/michaelhodel/re-arc data/external/re-arc
     unzip -q data/external/re-arc/re_arc.zip -d data/external     # data/external/re_arc/tasks
-    python -m frm.external.corpus                              # data/pools/{rearc,a2_new}.npz
-    (BARC: the commands in frm/external/barc/__init__.py)      # data/pools/barc.npz
+    python -m frm.external.corpus                                 # data/pools/{rearc,a2_new}.npz
+    (BARC: the commands in frm/external/barc/__init__.py)         # data/pools/barc.npz
     python scripts/ingest_external.py --src data/pools --pools a2_new
     python scripts/ingest_external.py --src data/pools --pools barc rearc \
         --heldout_pools data/raw/external/a2_new.npz
