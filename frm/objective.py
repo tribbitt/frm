@@ -1,4 +1,4 @@
-"""FRM objective (OBJECTIVE.md §3). Per round and row b, averaged over rows:
+"""FRM objective (OBJECTIVE.md §1). Per round and row b, averaged over rows:
 
     L_b = CE(parent, y*)
         + lambda_wta * [(1 - eps) * sum_pi w_pi * cost_pi + eps * mean_k CE(child_k, y*)]   (set matching)

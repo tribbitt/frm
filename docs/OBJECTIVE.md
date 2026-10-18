@@ -1,113 +1,15 @@
 # The frm objective
 
-Deliverable 3: research on loss design for recursive refiners with branches, and the objective frm trains with
-(`frm/objective.py`). Read `DEPTH.md` first — every term below answers a mechanism listed there.
+The objective frm trains with (`frm/objective.py`). §1 states the objective; §2–3 give the requirements and the research behind it, §4–7 the argument,
+alternatives, defaults and failure signatures. `DEPTH.md` lists the mechanisms each term answers.
 
 Tags: **[M]** measured, **[L]** literature, **[I]** inference. All arXiv IDs below were checked against the arXiv API.
 
 ---
 
-## 1. Requirements
+## 1. The objective
 
-An objective for frm has to:
-
-| # | requirement | why (evidence) |
-|---|---|---|
-| R1 | match the metric: whole-grid exact match, two attempts | ARC scores exact pass@2; cell metrics are dominated by copy cells [M: tinyabstractor] |
-| R2 | stay dense: grade every round | deep supervision is what makes recursion pay *in training* (+13pp 1→2 loops [L: ARC Prize HRM analysis]); frmv1's final-only grading lost [M] |
-| R3 | pay for detours | the greedy optimum of per-round CE is an idempotent solver (DEPTH.md M1) |
-| R4 | make forks useful *and* different | forks collapsed (tiny, w₀=0.993), became irrelevant (tinyabstractor), or learned a schedule (frmv1) [M] |
-| R5 | contain no term that rewards a difference between two model-controlled quantities | such terms are gamed by making the subtrahend worse (a discounted-early-segment "gain" was segment 1 getting worse [M: frmv2]) |
-| R6 | add no forward passes | compute is the binding constraint (`DESIGN.md` §9) |
-| R7 | not reward early exit | geometric/decaying priors starve deep steps of credit [L: Ouro 2510.25741; CGAR 2511.08653] |
-| R8 | leave no parameter reachable only through a no-grad path | tinyv2.2's init states and warm-up step embeddings, ARM's latent tokens and H-level never trained [M] |
-
-## 2. Research
-
-### 2.1 Deep supervision in recursive models
-
-- **TRM** ([2510.04871](https://arxiv.org/abs/2510.04871)): stablemax CE on every supervision step against y*, one optimizer
-  step per supervision step, detached carry, gradient through the last full cycle; halting = BCE(q, current answer
-  exactly correct), weight 0.5; the Q-learning "continue" loss was dropped (86.1 → 87.4%). Ablations: 1-step gradient
-  56.5% vs 87.4%; no EMA 79.9%. → The backbone of the objective; change only what depth and forks need.
-- **Progressive loss** (Bansal et al., [2202.05826](https://arxiv.org/abs/2202.05826)): n ~ U{0..m−1} iterations
-  without gradient, then k with gradient, graded at the end; with input re-injection ("recall") this stops
-  "overthinking" and extrapolates to far more iterations. → TRM's detached carry is already a progressive loss with
-  k = one cycle: it buys path independence, not multi-step strategies [I].
-- **Random depth with truncated backprop** (Huginn, [2502.05171](https://arxiv.org/abs/2502.05171)): sample the recurrence
-  count per batch, backprop through the last 8; step-index conditioning breaks extrapolation. → No step inputs.
-- **Intermediate gradient horizon** (Shakhvalieva et al., [2609.39967](https://arxiv.org/abs/2609.39967)): neither 1-step nor
-  full BPTT, plus large physical batches and controlled state updates; 59.5% pass@2 ARC-AGI-1. → Extend the horizon
-  modestly; keep physical batches large.
-- **Deep Improvement Supervision** ([2511.16886](https://arxiv.org/abs/2511.16886)): each step gets its own target
-  contracting toward y* (a corruption schedule of y*): 24% ARC-AGI-1 at 0.8M params, 18× fewer forward passes. →
-  Per-step targets make every step work, but corruption targets *force monotone* progress — the opposite of detours.
-  Use only targets from real decompositions (§3.2).
-- **Continuous Thought Machines** ([2505.05522](https://arxiv.org/abs/2505.05522)): loss = ½(L at the min-loss tick + L at
-  the max-certainty tick); intermediate ticks are free. → WTA over time is incompatible with one optimizer step per
-  round, but the principle (grade the best, not every) transfers to WTA over children.
-
-### 2.2 Multi-hypothesis objectives
-
-- **Multiple Choice Learning** (Guzman-Rivera et al., NeurIPS 2012): loss = min_k L(ŷ_k, y); only the best hypothesis
-  is trained and the set learns to cover the modes. **sMCL** (Lee et al., [1606.07839](https://arxiv.org/abs/1606.07839)):
-  the same with SGD and shared parameters — hypotheses may share everything except a head or a code.
-- **Relaxed WTA** (Rupprecht et al., [1612.00197](https://arxiv.org/abs/1612.00197)): winner weight 1−ε, others share ε,
-  so hypotheses that never win still train. **Evolving WTA** (Makansi et al.,
-  [1906.03631](https://arxiv.org/abs/1906.03631)): top-k winners with k shrinking. **Annealed MCL** (Perera et al.,
-  [2407.15580](https://arxiv.org/abs/2407.15580)): softmin assignment with a temperature schedule — from "all hypotheses
-  equal" to WTA, escaping WTA's bad local minima.
-- **Resilient MCL** (Letzelter et al., [2311.01052](https://arxiv.org/abs/2311.01052)): a score head per hypothesis
-  predicts whether it wins, giving a probabilistic reading and a ranking. → frm's per-child q head.
-- **Pass@k training** (Chen et al., [2508.10751](https://arxiv.org/abs/2508.10751)): optimising pass@k instead of pass@1
-  improves exploration. ARC scores pass@2, so a set objective is metric-aligned.
-- **Collapse** is the default without these: two children with zero-init codes, zero-init arbitration and the same
-  target collapsed onto child 0 [M: tiny]. A diversity bonus would be R5-gameable (produce garbage to differ);
-  MCL-family objectives create diversity only where it lowers the best loss.
-- **WTA's blind spot.** With one deterministic target per row, min-over-children pulls the winner to y* and leaves the
-  losers where they are; nothing moves them *apart*. Two answers apply. **IMLE** (Li & Malik,
-  [1809.09087](https://arxiv.org/abs/1809.09087)): fresh noise for every sample at every step, pull only the sample
-  nearest the target — maximum likelihood under conditions, and it cannot drop modes, because every data point keeps
-  pulling its nearest sample. **Set prediction with bipartite matching** (DETR, Carion et al.,
-  [2005.12872](https://arxiv.org/abs/2005.12872)): match several distinct targets one-to-one to the predictions, which
-  "forces unique predictions". frm uses both (§3.2).
-- **Noise as escape from fixed points.** PTRM (Sghaier, Parviz & Jolicoeur-Martineau — TRM's author —
-  [2605.19943](https://arxiv.org/abs/2605.19943)): TRM's "deterministic recursion can lead to convergence at suboptimal
-  solutions, without escape mechanism"; Gaussian noise at each recursion step, parallel trajectories and selection by
-  the Q head lift Sudoku-Extreme 87.4% → 98.75% *without retraining*. frm trains the noise in instead.
-
-### 2.3 Credit for detours
-
-- **Potential-based shaping** (Ng, Harada, Russell 1999): F = γΦ(s′) − Φ(s) leaves the optimum unchanged; with Φ = −CE
-  of the canvas the per-round terms telescope to final − initial loss [I]. Canvas improvement rewards add no signal
-  (and, without a stop-gradient, invite R5 gaming).
-- **Learned values** (TD-trained V(state) ≈ P(eventual solve)) can credit detours, but backpropagating a critic into
-  the state it scores is DDPG-like and unstable at this scale; "outcome-trained heads read detached inputs" is right
-  for halting and selection [I].
-- **Gradient paths through ungraded intermediates**: the cleanest credit for a detour is a gradient that reaches the
-  detour's computation from a later graded readout *without* grading the detour. Fork → join → post cycle provides
-  this inside one round (§3.1).
-- **Intermediate targets in a fixed order** failed (−2.9σ: 66.6% of tasks admit other orderings) [M: frmv1]; an
-  order-free *set* of sub-goals does not have that problem (§3.2).
-
-### 2.4 Halting
-
-ACT ponder cost ([1603.08983](https://arxiv.org/abs/1603.08983)) and PonderNet's KL to a geometric prior
-([2107.05407](https://arxiv.org/abs/2107.05407)) both reward stopping early; Ouro found a uniform prior better and an
-improvement-gated exit (trained on detached I_t = max(0, L_{t−1} − L_t)) +2–3pp [L: 2510.25741]. TRM's correctness BCE
-is simple and, with evaluation always running 16 rounds, only controls *training-time row turnover*; it never
-truncates inference. → Keep TRM's halting; feed q into the join detached.
-
-### 2.5 Stability and ARC practice
-
-Stablemax CE (TRM) avoids softmax collapse on long training; EMA 0.999 (−7.5pp on Sudoku without it [L: TRM]); large
-physical batches (a TRM reproduction at batch 80 reached 20.75% vs the paper's 44.6% [M: ARM]); augmentation voting
-adds ~11pp to TRM [L: 2512.11847]; test-time training was the only neural lever with measured gains in predecessors
-[M: frmv1, decomposition-solver].
-
-## 3. The objective
-
-### 3.0 Written out
+### 1.0 Written out
 
 One optimizer step runs one round on the $`B`$ rows of one canvas bucket. Every row is at its own round
 $`r_b \in \lbrace 1, \dots, 16 \rbrace`$, and its carry $`(y, z)`$ comes from the previous round with the gradient cut (TRM's
@@ -190,31 +92,31 @@ Settings:
 | $`\varepsilon`$ | 0.05 | 0.05 |
 | $`\tau_0 \to \tau_1`$ over $`u_\tau`$ | $`1 \to 0.02`$ over $`u_\tau = 0.3`$ | $`1 \to 0.02`$ over $`u_\tau = 0.048`$ of 100,000 PF, i.e. the first 4,800 PF |
 | $`\lambda_{\mathrm{gate}}`$ | 0.1 | 0.1 |
-| $`p`$ | 0, fixed | a controller holding the fork rate at 0.4 (§3.6): 0 at the start, ≈ 0.002 at 45k PF |
-| `child_focus` $`\varphi`$ (§3.7) | 0 | 0 |
+| $`p`$ | 0, fixed | a controller holding the fork rate at 0.4 (§1.6): 0 at the start, ≈ 0.002 at 45k PF |
+| `child_focus` $`\varphi`$ (§1.7) | 0 | 0 |
 
-With no intermediates, term (2) reduces exactly to annealed relaxed winner-takes-all (§3.2). A declined row has
+With no intermediates, term (2) reduces exactly to annealed relaxed winner-takes-all (§1.2). A declined row has
 $`f_b = 0`$, so its loss is exactly the $`K = 0`$ (TRM) loss.
 
 Where each term lives:
 
 | term | code | what it computes |
 |---|---|---|
-| (1) | `Objective.__call__`: `row_ce(out.logits, labels)` | $`\hat y_b`$ comes from `Refiner.round` (§3.1) |
+| (1) | `Objective.__call__`: `row_ce(out.logits, labels)` | $`\hat y_b`$ comes from `Refiner.round` (§1.1) |
 | (2) | `set_match(ce_final, ce_sub, mask, tau, λ_sub/λ_wta)`, then `set_term` masked by `out.fork` | assignments from the cached `_assignment_table(K, M)`: 4 on plain rows, 136 at $`K = 4`$, $`M = 3`$, evaluated as one gather per step |
 | (3) | `F.binary_cross_entropy_with_logits` on `out.q` and `out.child_q` | the children's mean is masked by `out.fork` |
 | (4) | `benefit = (row_ce(out.cf_logits) − ce_parent).detach()`, BCE over `out.gate_rows` | $`\tilde y_b`$ = `cf_logits`, from `Refiner._trm_tail` under `torch.no_grad` |
 | $`\tau`$, $`p`$ | `tau_at(cfg, progress)`; `Trainer.price` | the price controller runs in `Trainer.train_step` |
 
-### 3.1 Term 1 — parent deep supervision (R1, R2, R3)
+### 1.1 Term 1 — parent deep supervision (R1, R2, R3)
 
 **What.** TRM's stablemax cross-entropy of the parent's readout against the final answer, at every round.
 
 **Why.** Unchanged from TRM in form, changed in what it trains. Because the graded readout comes *after* the join and a
 full post-join cycle, its gradient runs post cycle → join → child cycles → fork codes and shared weights. A child that
 turns the canvas into something the parent can finish — a detour — is paid for by this term even though nothing grades
-the detour itself. The credit horizon is two cycles along the fork path (TRM: one), an intermediate horizon (§2.1).
-It is also the only term that trains the join's $`W_q`$, $`W_k`$ and $`\beta`$ (§3.4).
+the detour itself. The credit horizon is two cycles along the fork path (TRM: one), an intermediate horizon (§3.1).
+It is also the only term that trains the join's $`W_q`$, $`W_k`$ and $`\beta`$ (§1.4).
 
 Uniform weight across rounds: reweighting changed nothing in three predecessor attempts and decaying weights push toward
 early exit (DEPTH.md §4). No term multiplies the CE by a round-dependent factor.
@@ -227,7 +129,7 @@ declined row runs `_trm_tail` (one cycle without gradient, one with), so its ter
 $`n = 4`$ updates $`z \leftarrow f(z,  y + x + c)`$ then one $`y \leftarrow f(y,  z)`$, with the same two blocks $`f`$
 everywhere ($`c = 0`$ for the parent, the fork code $`c_k`$ for child $`k`$).
 
-### 3.2 Term 2 — children: annealed set matching (R3, R4, R7)
+### 1.2 Term 2 — children: annealed set matching (R3, R4, R7)
 
 **What.** Each child is scored against the row's targets. The assignment of targets to children that fits best takes
 almost all the weight $`w_{b\pi}`$ (a soft-min computed without gradient), and $`\varepsilon`$ spreads a small share evenly
@@ -242,7 +144,7 @@ over every child.
 3. **Fresh noise every round** (model, not loss): $`c_k \mathrel{+}= W_\xi \xi_k`$, $`\xi_k \sim \mathcal N(0, I_{16})`$
    drawn per row, child and round (`ModelCfg.noise_dim`; $`W_\xi`$ learned, initial output RMS 0.25; seeded at
    evaluation). Children become samples of a learned proposal distribution instead of fixed functions of the parent
-   state. So min-over-children training is IMLE, which cannot collapse modes (§2.2), and a parent stuck at a fixed
+   state. So min-over-children training is IMLE, which cannot collapse modes (§3.2), and a parent stuck at a fixed
    point still receives *new* proposals each round — without noise the whole round, fork included, is a deterministic
    map with the same fixed point (DEPTH.md M2; PTRM).
 4. **One-to-one matching on composite rows**: the final answer and the intermediates go to *different* children, so
@@ -272,7 +174,7 @@ to adopt it, so gradient concentrates on stuck rows at later rounds without any 
 - $`w`$ = `softmax(-cost.detach() / tau)` over the valid assignments. `set_match` returns
   $`\sum_\pi w_{b\pi} c_{b\pi}`$ and the arg-max assignment, which feeds the win and coverage logs.
 - `set_term = lambda_wta * ((1 - eps) * match + eps * ce_final.mean(-1))`, added only where `out.fork` is true; this
-  is term (2) of §3.0 line for line.
+  is term (2) of §1.0 line for line.
 
 Because $`w`$ carries no gradient, on a plain row child $`k`$ receives its own CE gradient scaled by
 
@@ -283,7 +185,7 @@ Because $`w`$ carries no gradient, on a plain row child $`k`$ receives its own C
 (`tests/test_objective.py::test_children_gradient_is_weighted_ce_gradient`). Once $`\tau = 0.02`$ the weights are nearly
 one-hot: about $`0.481`$ on the winning child and $`0.00625`$ on each other child, against $`1`$ on the parent's term (1).
 
-### 3.3 Term 3 — stop/score heads (R7, R1)
+### 1.3 Term 3 — stop/score heads (R7, R1)
 
 **What.** $`\mathrm{BCE}(q_b, e_b)`$ for the parent (TRM) and $`\frac{1}{K}\sum_k \mathrm{BCE}(q_{bk}, e_{bk})`$ for the
 children of a forked row, both weighted by $`\lambda_q`$.
@@ -303,9 +205,9 @@ m_b \;=\; \begin{cases} \text{uniform on } \lbrace 2, \dots, 16 \rbrace & \text{
 ```
 
 and refills it with a fresh row (`Trainer._refill`). The children's $`q_{bk}`$ enter the join only as
-$`\beta \mathrm{sg}(q_{bk})`$ (§3.8), so the join cannot bend the score heads.
+$`\beta \mathrm{sg}(q_{bk})`$ (§1.8), so the join cannot bend the score heads.
 
-### 3.4 Gradient-flow table
+### 1.4 Gradient-flow table
 
 | parameter | term 1 | term 2 | term 3 | term 4 (gate) |
 |---|---|---|---|---|
@@ -322,14 +224,14 @@ On declined rows terms 2 and 3's child half are absent, so their loss trains exa
 `tests/test_model.py::test_fork_gate` asserts the first column from term 1 alone; `test_every_param_gets_grad` that
 no parameter is left out; `tests/test_gate.py` the last column and the declined rows' isolation.
 
-### 3.5 Normalisation
+### 1.5 Normalisation
 
 Token-mean CE per row makes rows of different sizes comparable; the per-step mean over rows makes step gradients
 comparable across buckets whose row counts differ by 10×. TRM sums per-row means and divides by the global batch
 size, the same thing at a fixed batch. In $`c_{b\pi}`$ the intermediates are averaged, so a depth-4 composite row
 weighs the same as a depth-2 one.
 
-### 3.6 Term 4 — fork gate (only with `model.fork_gate`)
+### 1.6 Term 4 — fork gate (only with `model.fork_gate`)
 
 The gate decides per row and round whether the round forks (`DESIGN.md` §4.8). It is trained as a classifier on
 measured outcomes, never through the loss it influences:
@@ -364,7 +266,7 @@ measured outcomes, never through the loss it influences:
   forced-fork phase (every row forks, every state is labelled), the exploration floor and no step-index input are the
   mitigations; `fork.rate_by_round` and `gate_acc` vs `gate_pos` detect a relapse (§7).
 
-### 3.7 Error-focused children (`objective.child_focus`, gated models)
+### 1.7 Error-focused children (`objective.child_focus`, gated models)
 
 Off ($`\varphi = 0`$) by default and in the final configuration. With `child_focus` $`= \varphi > 0`$, on label rows the
 children's final-target CE becomes a weighted token mean: cells the no-fork continuation (`cf_logits`, already computed
@@ -381,7 +283,7 @@ the $`\varepsilon`$ share of term (2). The motive is boosting inside one round: 
 a child that repeats TRM's round earns most of its loss on cells TRM already gets right (`DESIGN.md` §4.10). Sub-goal
 targets and `child_ce_min` stay unweighted.
 
-### 3.8 Around the loss: what else shapes training
+### 1.8 Around the loss: what else shapes training
 
 None of these are loss terms, but every term above depends on them (`DESIGN.md` §4 and §6 have the full design).
 
@@ -389,7 +291,7 @@ None of these are loss terms, but every term above depends on them (`DESIGN.md` 
   between rounds, so a round's loss never reaches earlier rounds. A forked row's gradient window is its $`K`$ child cycles
   plus the post-join cycle: 25 passes of $`f`$ with gradient, against TRM's 5.
 - **Fork codes** (`Refiner._child_codes`). Child $`k`$ adds
-  $`c_k[p] = e_k + A_k B \mathrm{rms}(z[p]) + W_\xi \xi_k`$ to the input of every one of its $`z`$-updates (§3.2).
+  $`c_k[p] = e_k + A_k B \mathrm{rms}(z[p]) + W_\xi \xi_k`$ to the input of every one of its $`z`$-updates (§1.2).
 - **Join** (`Refiner._join`). For every cell $`p`$ and every candidate $`j \in \lbrace 0, 1, \dots, K\rbrace`$
   (0 = the pre-fork parent), with $`W_q, W_k : 512 \to 64`$:
 
@@ -404,7 +306,7 @@ s_j[p] \;=\; \frac{\big\langle W_q\,\mathrm{rms}(z[p]),\; W_k\,\mathrm{rms}(z_j[
 - **Parent-slot dropout.** In training, the parent slot $`j = 0`$ is masked on each forked row with probability 0.25
   (`model.join_drop_parent`), so the post-join cycle must build on the children. Without it, an early run's parent
   slot kept 0.95 of the join mass ("parent ignores children"). These rows give no gate label.
-- **Fork schedule.** Forced forking, then the gate with exploration and the price controller (§3.6).
+- **Fork schedule.** Forced forking, then the gate with exploration and the price controller (§1.6).
 - **Optimizer.** AdamW (betas 0.9 / 0.95, weight decay 0.1; lr $`5 \cdot 10^{-5}`$ in the final, the fork modules at
   $`4\times`$), gradient clip 1.0, SignSGD at lr $`10^{-2}`$ on the puzzle-embedding rows a step touched, EMA 0.999
   (evaluation and the shipped model use the EMA weights). Warm-up 1,000 steps, constant, then a $`(1 - \sqrt{u'})`$
@@ -413,7 +315,7 @@ s_j[p] \;=\; \frac{\big\langle W_q\,\mathrm{rms}(z[p]),\; W_k\,\mathrm{rms}(z_j[
 - **Left out on purpose.** Improvement rewards across rounds, round-dependent weights, diversity bonuses and geometric
   halting priors (§5).
 
-### 3.9 What each term does in the ARC-AGI-2 final
+### 1.9 What each term does in the ARC-AGI-2 final
 
 Measured during training of the final ARC-AGI-2 run (`configs/final_frm_a2tn.json`): training-log readings compare the
 forced phase (0–4,800 PF) with 40,000–47,000 PF. "TRM" is the K = 0 control (`configs/final_trm_a2tn.json`, same warm
@@ -430,6 +332,104 @@ Depth (evaluations pooled over 32,500–45,000 PF): on held-out composites and A
 gain from round 1 to round 4 and nothing after (composites row exact FRM 0.280 → 0.345 → 0.348 at rounds 1 / 4 / 16,
 TRM 0.200 → 0.275 → 0.276). At 45k PF, resetting FRM's carry at round 4 changes composite exact by −0.0005, and
 switching forks off at evaluation costs 0.014.
+
+## 2. Requirements
+
+An objective for frm has to:
+
+| # | requirement | why (evidence) |
+|---|---|---|
+| R1 | match the metric: whole-grid exact match, two attempts | ARC scores exact pass@2; cell metrics are dominated by copy cells [M: tinyabstractor] |
+| R2 | stay dense: grade every round | deep supervision is what makes recursion pay *in training* (+13pp 1→2 loops [L: ARC Prize HRM analysis]); frmv1's final-only grading lost [M] |
+| R3 | pay for detours | the greedy optimum of per-round CE is an idempotent solver (DEPTH.md M1) |
+| R4 | make forks useful *and* different | forks collapsed (tiny, w₀=0.993), became irrelevant (tinyabstractor), or learned a schedule (frmv1) [M] |
+| R5 | contain no term that rewards a difference between two model-controlled quantities | such terms are gamed by making the subtrahend worse (a discounted-early-segment "gain" was segment 1 getting worse [M: frmv2]) |
+| R6 | add no forward passes | compute is the binding constraint (`DESIGN.md` §9) |
+| R7 | not reward early exit | geometric/decaying priors starve deep steps of credit [L: Ouro 2510.25741; CGAR 2511.08653] |
+| R8 | leave no parameter reachable only through a no-grad path | tinyv2.2's init states and warm-up step embeddings, ARM's latent tokens and H-level never trained [M] |
+
+## 3. Research
+
+### 3.1 Deep supervision in recursive models
+
+- **TRM** ([2510.04871](https://arxiv.org/abs/2510.04871)): stablemax CE on every supervision step against y*, one optimizer
+  step per supervision step, detached carry, gradient through the last full cycle; halting = BCE(q, current answer
+  exactly correct), weight 0.5; the Q-learning "continue" loss was dropped (86.1 → 87.4%). Ablations: 1-step gradient
+  56.5% vs 87.4%; no EMA 79.9%. → The backbone of the objective; change only what depth and forks need.
+- **Progressive loss** (Bansal et al., [2202.05826](https://arxiv.org/abs/2202.05826)): n ~ U{0..m−1} iterations
+  without gradient, then k with gradient, graded at the end; with input re-injection ("recall") this stops
+  "overthinking" and extrapolates to far more iterations. → TRM's detached carry is already a progressive loss with
+  k = one cycle: it buys path independence, not multi-step strategies [I].
+- **Random depth with truncated backprop** (Huginn, [2502.05171](https://arxiv.org/abs/2502.05171)): sample the recurrence
+  count per batch, backprop through the last 8; step-index conditioning breaks extrapolation. → No step inputs.
+- **Intermediate gradient horizon** (Shakhvalieva et al., [2609.39967](https://arxiv.org/abs/2609.39967)): neither 1-step nor
+  full BPTT, plus large physical batches and controlled state updates; 59.5% pass@2 ARC-AGI-1. → Extend the horizon
+  modestly; keep physical batches large.
+- **Deep Improvement Supervision** ([2511.16886](https://arxiv.org/abs/2511.16886)): each step gets its own target
+  contracting toward y* (a corruption schedule of y*): 24% ARC-AGI-1 at 0.8M params, 18× fewer forward passes. →
+  Per-step targets make every step work, but corruption targets *force monotone* progress — the opposite of detours.
+  Use only targets from real decompositions (§1.2).
+- **Continuous Thought Machines** ([2505.05522](https://arxiv.org/abs/2505.05522)): loss = ½(L at the min-loss tick + L at
+  the max-certainty tick); intermediate ticks are free. → WTA over time is incompatible with one optimizer step per
+  round, but the principle (grade the best, not every) transfers to WTA over children.
+
+### 3.2 Multi-hypothesis objectives
+
+- **Multiple Choice Learning** (Guzman-Rivera et al., NeurIPS 2012): loss = min_k L(ŷ_k, y); only the best hypothesis
+  is trained and the set learns to cover the modes. **sMCL** (Lee et al., [1606.07839](https://arxiv.org/abs/1606.07839)):
+  the same with SGD and shared parameters — hypotheses may share everything except a head or a code.
+- **Relaxed WTA** (Rupprecht et al., [1612.00197](https://arxiv.org/abs/1612.00197)): winner weight 1−ε, others share ε,
+  so hypotheses that never win still train. **Evolving WTA** (Makansi et al.,
+  [1906.03631](https://arxiv.org/abs/1906.03631)): top-k winners with k shrinking. **Annealed MCL** (Perera et al.,
+  [2407.15580](https://arxiv.org/abs/2407.15580)): softmin assignment with a temperature schedule — from "all hypotheses
+  equal" to WTA, escaping WTA's bad local minima.
+- **Resilient MCL** (Letzelter et al., [2311.01052](https://arxiv.org/abs/2311.01052)): a score head per hypothesis
+  predicts whether it wins, giving a probabilistic reading and a ranking. → frm's per-child q head.
+- **Pass@k training** (Chen et al., [2508.10751](https://arxiv.org/abs/2508.10751)): optimising pass@k instead of pass@1
+  improves exploration. ARC scores pass@2, so a set objective is metric-aligned.
+- **Collapse** is the default without these: two children with zero-init codes, zero-init arbitration and the same
+  target collapsed onto child 0 [M: tiny]. A diversity bonus would be R5-gameable (produce garbage to differ);
+  MCL-family objectives create diversity only where it lowers the best loss.
+- **WTA's blind spot.** With one deterministic target per row, min-over-children pulls the winner to y* and leaves the
+  losers where they are; nothing moves them *apart*. Two answers apply. **IMLE** (Li & Malik,
+  [1809.09087](https://arxiv.org/abs/1809.09087)): fresh noise for every sample at every step, pull only the sample
+  nearest the target — maximum likelihood under conditions, and it cannot drop modes, because every data point keeps
+  pulling its nearest sample. **Set prediction with bipartite matching** (DETR, Carion et al.,
+  [2005.12872](https://arxiv.org/abs/2005.12872)): match several distinct targets one-to-one to the predictions, which
+  "forces unique predictions". frm uses both (§1.2).
+- **Noise as escape from fixed points.** PTRM (Sghaier, Parviz & Jolicoeur-Martineau — TRM's author —
+  [2605.19943](https://arxiv.org/abs/2605.19943)): TRM's "deterministic recursion can lead to convergence at suboptimal
+  solutions, without escape mechanism"; Gaussian noise at each recursion step, parallel trajectories and selection by
+  the Q head lift Sudoku-Extreme 87.4% → 98.75% *without retraining*. frm trains the noise in instead.
+
+### 3.3 Credit for detours
+
+- **Potential-based shaping** (Ng, Harada, Russell 1999): F = γΦ(s′) − Φ(s) leaves the optimum unchanged; with Φ = −CE
+  of the canvas the per-round terms telescope to final − initial loss [I]. Canvas improvement rewards add no signal
+  (and, without a stop-gradient, invite R5 gaming).
+- **Learned values** (TD-trained V(state) ≈ P(eventual solve)) can credit detours, but backpropagating a critic into
+  the state it scores is DDPG-like and unstable at this scale; "outcome-trained heads read detached inputs" is right
+  for halting and selection [I].
+- **Gradient paths through ungraded intermediates**: the cleanest credit for a detour is a gradient that reaches the
+  detour's computation from a later graded readout *without* grading the detour. Fork → join → post cycle provides
+  this inside one round (§1.1).
+- **Intermediate targets in a fixed order** failed (−2.9σ: 66.6% of tasks admit other orderings) [M: frmv1]; an
+  order-free *set* of sub-goals does not have that problem (§1.2).
+
+### 3.4 Halting
+
+ACT ponder cost ([1603.08983](https://arxiv.org/abs/1603.08983)) and PonderNet's KL to a geometric prior
+([2107.05407](https://arxiv.org/abs/2107.05407)) both reward stopping early; Ouro found a uniform prior better and an
+improvement-gated exit (trained on detached I_t = max(0, L_{t−1} − L_t)) +2–3pp [L: 2510.25741]. TRM's correctness BCE
+is simple and, with evaluation always running 16 rounds, only controls *training-time row turnover*; it never
+truncates inference. → Keep TRM's halting; feed q into the join detached.
+
+### 3.5 Stability and ARC practice
+
+Stablemax CE (TRM) avoids softmax collapse on long training; EMA 0.999 (−7.5pp on Sudoku without it [L: TRM]); large
+physical batches (a TRM reproduction at batch 80 reached 20.75% vs the paper's 44.6% [M: ARM]); augmentation voting
+adds ~11pp to TRM [L: 2512.11847]; test-time training was the only neural lever with measured gains in predecessors
+[M: frmv1, decomposition-solver].
 
 ## 4. How the objective incentivises depth — the argument in one place
 
@@ -456,7 +456,7 @@ detached CEs) trains only the gate, which cannot move either CE.
 | load balancing across children (MoE-style) | forces equal use when one child is legitimately better; ε already prevents dead children |
 | per-target independent softmin for intermediates (this repo's first version) | one child could claim the final answer *and* every intermediate, leaving the others identical — replaced by one-to-one matching |
 | noise only at test time (PTRM) | trained-in noise lets the codes learn *how* to use it; test-time-only noise perturbs a model that never saw it |
-| learned "whether to fork" gate trained end to end (soft) or by REINFORCE/Gumbel (discrete) | frmv1's soft gate learned the cycle index (98.9% of its variance) [M]; discrete decisions need REINFORCE-style variance on top of a weak signal. The adopted gate (§3.6) is instead a classifier on measured counterfactual benefit, with a forced-fork phase and an exploration floor |
+| learned "whether to fork" gate trained end to end (soft) or by REINFORCE/Gumbel (discrete) | frmv1's soft gate learned the cycle index (98.9% of its variance) [M]; discrete decisions need REINFORCE-style variance on top of a weak signal. The adopted gate (§1.6) is instead a classifier on measured counterfactual benefit, with a forced-fork phase and an exploration floor |
 | TD value potential with gradient into the state | unstable critic exploitation at this scale [I]; revisit only if the fork path's credit proves too short |
 | canvas-improvement reward or hinge | telescopes (no signal) or reweights stalled rows (already done by set matching without a round-dependent factor) |
 | final-round-only grading | frmv1: detours appear but are never rewarded; loses TRM's training-time benefit of dense grading |

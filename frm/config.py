@@ -52,7 +52,7 @@ class ObjectiveCfg:
     tau_start: float = 1.0
     tau_end: float = 0.02
     tau_anneal_frac: float = 0.3
-    # Fork gate BCE (OBJECTIVE.md §3.6); fork_price in nats per supervised token.
+    # Fork gate BCE (OBJECTIVE.md §1.6); fork_price in nats per supervised token.
     lambda_gate: float = 0.1
     fork_price: float = 0.0
     # Gated models: weight 1 - child_focus on cells the no-fork continuation gets right in child CE; 0 = uniform.

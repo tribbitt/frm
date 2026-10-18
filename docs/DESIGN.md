@@ -238,7 +238,7 @@ intermediate state is what TRM lacks (§1 claim 2).
 - **Noise.** `ξ_k ~ N(0, I₁₆)` per row, child and round, mapped by a learned `W_ξ: 16→512` (initial output RMS 0.25,
   `ModelCfg.noise_dim`/`noise_init`), broadcast over cells. Training uses the global RNG; evaluation seeds a generator
   per batch (reproducible; counterfactual reruns see the same noise). IMLE-style min-over-samples training cannot
-  collapse modes, and a parent at a fixed point still gets new proposals (`OBJECTIVE.md` §3.2; PTRM 2605.19943).
+  collapse modes, and a parent at a fixed point still gets new proposals (`OBJECTIVE.md` §1.2; PTRM 2605.19943).
 - **Injection.** c_k is added to the z-update input at **every** child z-update, always inside the gradient window.
 - **Batching.** Children are a batch expansion [B, K, L, D] → [B·K, L, D]: no separate buckets or episodes (frmv2's
   failure mode). `grad_ckpt_children` checkpoints every child pass individually (stores pass inputs, recomputes one
@@ -313,7 +313,7 @@ label rows (forked, own join, slot not dropped): no_grad, the declined rows' con
   on declined rows; `RoundOut.fork` masks them), except that the `sham` counterfactual runs every row's children. With
   `compile` the cycle's batch dimension is dynamic; ungated models keep static graphs.
 - **Training signal.** The gate's inputs are detached; it is trained by BCE against "this fork beat the no-fork
-  continuation by more than the price" (`OBJECTIVE.md` §3.6) on the label rows. Trunk and gate losses never cross.
+  continuation by more than the price" (`OBJECTIVE.md` §1.6) on the label rows. Trunk and gate losses never cross.
 - **Collapse mitigations.** frmv1's learned gate became a schedule (98.9% of its variance was the cycle index [M]).
   Here: (1) labels are the *measured* counterfactual benefit, not gradients through the decision; (2) a **forced-fork
   phase**: for the first `train.fork_force_frac` (default 0.3) of training every row-round forks, so children and join
@@ -372,7 +372,7 @@ hurts most where steps are scarce: adapting to unseen ARC-AGI-2 tasks in 2.5 h g
 - **Compute targeting** (`train.fork_rate_target`, §4.8): hold the fork rate at ρ, keep the forks the gate ranks
   highest, run every declined row as a TRM round. Cost per row-round ≈ 25 + 65ρ units at K = 4 without checkpointing
   (§9): ρ = 0.94 → 3.4×, ρ = 0.4 → 2.0× (measured in the final: 547 vs 275 GFLOP), ρ = 0.25 → 1.65×.
-- **Error-focused children** (`objective.child_focus`, `OBJECTIVE.md` §3.7): the children's final-target loss is
+- **Error-focused children** (`objective.child_focus`, `OBJECTIVE.md` §1.7): the children's final-target loss is
   concentrated on the cells TRM's own round gets wrong.
 
 Measured in the same comparison [M]: at a held 0.4 fork rate (`fork_top` 0.4) FRM beats dense-forking FRM on
@@ -387,7 +387,7 @@ with dense forks (continued TRM 0.252, CI ∋ 0).
 ## 5. Objective (summary — derivation in `OBJECTIVE.md`)
 
 Per round, per row $`b`$, averaged over the step's rows. Every symbol, the code behind each term and its measured
-behaviour are in `OBJECTIVE.md` §3.
+behaviour are in `OBJECTIVE.md` §1.
 
 ```math
 \mathcal{L}_b \;=\; \mathrm{CE}(\hat y_b, y_b) \;+\; \lambda_q\,\mathrm{BCE}(q_b, e_b)
@@ -406,7 +406,7 @@ children. $`w`$ is a soft-min, without gradient, over one-to-one assignments $`\
 composite intermediates $`g_{bt}`$ to distinct children. $`f_b = 1`$ if row $`b`$ forked, so a declined row's loss is exactly
 the $`K = 0`$ loss. With `fork_gate` the gate adds
 $`\lambda_{\mathrm{gate}} \frac{1}{\lvert G\rvert}\sum_{b\in G}\mathrm{BCE}\big(\gamma_b, \mathbb{1}[\mathrm{CE}(\tilde y_b, y_b) - \mathrm{CE}(\hat y_b, y_b) > p]\big)`$
-over its label rows $`G`$, with $`\tilde y_b`$ TRM's own round from the same pre-fork state (`OBJECTIVE.md` §3.6).
+over its label rows $`G`$, with $`\tilde y_b`$ TRM's own round from the same pre-fork state (`OBJECTIVE.md` §1.6).
 
 CE is TRM's stablemax cross-entropy, a token mean per row over non-PAD labels. Defaults:
 $`\lambda_{\mathrm{wta}} = \lambda_{\mathrm{sub}} = \lambda_q = 0.5`$, $`\varepsilon = 0.05`$, $`\tau`$ annealed log-linearly $`1 \to 0.02`$ over the first
